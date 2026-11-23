@@ -1,0 +1,23 @@
+[package]
+name = "vhs-next"
+description = "VHS / NTSC signal simulator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+# Windows で bin 名と衝突しないよう `_lib` を付ける
+name = "vhs_next_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+vhs-core = { path = "../crates/vhs-core" }
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde.workspace = true
+serde_json.workspace = true
+tauri-plugin-dialog = "2"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp"] }
