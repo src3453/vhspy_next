@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Params {
+    /// 撮像管カメラ (入力映像の直後)
+    pub camera: CameraParams,
     pub encoder: EncoderParams,
     pub tape: TapeParams,
     pub transport: TransportParams,
@@ -20,6 +22,126 @@ pub struct Params {
     pub osd: OsdParams,
     /// 乱数シード (同じシードなら同じ劣化パターン)
     pub seed: u64,
+}
+
+/// 撮像管 (ビジコン・プランビコン・サチコンなど) を使ったカラーカメラ。
+/// 入力画像を「被写体の光」とみなし、3 管式カメラの光学系 → 光導電ターゲット → 電子ビーム読み出し →
+/// 映像増幅・プロセス回路を通す。モデルの詳細は `camera` モジュールを参照。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CameraParams {
+    pub enabled: bool,
+
+    // --- 光学系 ---
+    /// 露出 (アイリス) [EV]
+    pub exposure_ev: f32,
+    /// 色分解プリズムの混色 (隣の色の漏れ込み, 0..0.3)
+    pub crosstalk: f32,
+    /// レンズ・プリズムのフレア (画面平均の光が全体にかぶる量)。赤管は 2 倍
+    pub flare: f32,
+    /// レジストレーション誤差 [画素] (RGB 3 管の像の重ね合わせずれ)
+    pub registration_px: f32,
+    /// 周辺の感度低下 (シェーディング) 0..0.5
+    pub shading: f32,
+    /// レンズ・ターゲット・ビームスポットによるぼけ [画素]
+    pub resolution_px: f32,
+
+    // --- 光導電ターゲット ---
+    /// ターゲットの γ (光量 → 信号電流)。ビジコン ≒ 0.65、プランビコン ≒ 0.95、サチコン ≒ 1.0
+    pub target_gamma: f32,
+    /// 暗電流 (白レベル比)
+    pub dark_current: f32,
+    /// 光導電性残像の量 (0..1)。トラップによる遅い応答
+    pub photo_lag: f32,
+    /// 光導電性残像の減衰時定数 [フィールド] (立ち上がりはこの半分)
+    pub photo_lag_fields: f32,
+    /// 容量性 (ビーム) 残像の強さ。低照度ほど読み残しが増える
+    pub capacitive_lag: f32,
+    /// バイアス光 (白レベル比)。残像を減らす
+    pub bias_light: f32,
+    /// ビーム電流の上限 (白レベル比)。超えた電荷は読み残されてコメットテールになる
+    pub beam_current: f32,
+    /// ターゲットに蓄えられる電荷の上限 (白レベル比)
+    pub target_saturation: f32,
+    /// ACT (アンチコメットテール): 帰線期間に過大な電荷を放電する
+    pub act: bool,
+    /// ACT が働き始めるレベル (白レベル比)
+    pub act_level: f32,
+    /// ターゲットのヒステリシス幅 (白レベル比)。明→暗と暗→明で残る像が変わる
+    pub hysteresis: f32,
+    /// ヒステリシスが解ける時定数 [フィールド]
+    pub hysteresis_fields: f32,
+    /// 焼き付きの進む速さ [/秒] (白を超えた部分の感度が落ちる)
+    pub burn_rate: f32,
+    /// 焼き付きが回復する速さ [/秒]
+    pub burn_recovery: f32,
+    /// ターゲットのしみ・きず (ブレミッシュ) の数
+    pub blemishes: u32,
+
+    // --- 映像増幅 (真空管プリアンプ) ---
+    /// 非線形性の強さ (0 = 線形)
+    pub amp_drive: f32,
+    /// 正負の非対称性 (-1..1)。正で白側、負で黒側がより圧縮される
+    pub amp_asymmetry: f32,
+    /// プリアンプ雑音 (rms) [%]。周波数が高いほど大きい三角雑音
+    pub noise_pct: f32,
+
+    // --- 3 管のばらつき・劣化 ---
+    /// RGB 各撮像管の特性のばらつき (0..1)。γ・残像・感度・黒レベルなどがずれる
+    pub mismatch: f32,
+    /// 撮像管の劣化 (0..1)。感度低下・ビーム電流低下・残像増加・焼き付き・しみ・雑音
+    pub aging: f32,
+
+    // --- プロセス回路 ---
+    /// 輪郭補償 (アパーチャ補正) の量
+    pub aperture: f32,
+    /// ニーの開始レベル (白レベル比)
+    pub knee: f32,
+    /// ニーより上の傾き
+    pub knee_slope: f32,
+    /// ホワイトクリップ (白レベル比)
+    pub white_clip: f32,
+    /// ガンマ補正 (出力 = 入力^γ)。受像管 γ=2.2 の逆数 ≒ 0.45
+    pub camera_gamma: f32,
+}
+
+impl Default for CameraParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            exposure_ev: 0.0,
+            crosstalk: 0.03,
+            flare: 0.02,
+            registration_px: 0.4,
+            shading: 0.08,
+            resolution_px: 0.7,
+            target_gamma: 0.95,
+            dark_current: 0.005,
+            photo_lag: 0.05,
+            photo_lag_fields: 6.0,
+            capacitive_lag: 0.08,
+            bias_light: 0.0,
+            beam_current: 2.0,
+            target_saturation: 12.0,
+            act: false,
+            act_level: 1.5,
+            hysteresis: 0.0,
+            hysteresis_fields: 30.0,
+            burn_rate: 0.02,
+            burn_recovery: 0.05,
+            blemishes: 0,
+            amp_drive: 0.3,
+            amp_asymmetry: 0.4,
+            noise_pct: 0.8,
+            mismatch: 0.2,
+            aging: 0.0,
+            aperture: 0.5,
+            knee: 0.9,
+            knee_slope: 0.3,
+            white_clip: 1.08,
+            camera_gamma: 0.45,
+        }
+    }
 }
 
 /// 放送/カメラ側の NTSC エンコーダ
@@ -269,6 +391,12 @@ pub struct OsdParams {
     pub opacity: f32,
     /// `{date}` `{time}` などの起点となる日時 ("YYYY-MM-DD HH:MM:SS")
     pub start_datetime: String,
+    /// フォントファイル (.ttf / .otf / .ttc) のパス。空なら内蔵の 5×7 ドットフォント
+    pub font: String,
+    /// .ttc 内のフォント番号
+    pub font_index: u32,
+    /// 外部フォントを 1 em あたり何ドットで表示するか (0 = なめらかに描く)
+    pub font_dots: u32,
 }
 
 impl Default for OsdParams {
@@ -282,6 +410,9 @@ impl Default for OsdParams {
             scale: 2,
             opacity: 1.0,
             start_datetime: "1995-08-12 14:30:00".into(),
+            font: String::new(),
+            font_index: 0,
+            font_dots: 16,
         }
     }
 }

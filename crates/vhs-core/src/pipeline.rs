@@ -1,5 +1,6 @@
 //! 全体のパイプライン: RGB → コンポジット → テープ → 受像機 → RGBA。
 
+use crate::camera::CameraSim;
 use crate::capture::{CaptureSim, CodecStats};
 use crate::decoder::Decoder;
 use crate::encoder::encode_field;
@@ -20,6 +21,7 @@ pub const OUTPUT_HEIGHT: usize = FRAME_LINES;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StageTimings {
+    pub camera: Duration,
     pub encode: Duration,
     pub tape: Duration,
     pub rf: Duration,
@@ -29,12 +31,13 @@ pub struct StageTimings {
 
 impl StageTimings {
     pub fn total(&self) -> Duration {
-        self.encode + self.tape + self.rf + self.decode + self.capture
+        self.camera + self.encode + self.tape + self.rf + self.decode + self.capture
     }
 }
 
 pub struct Pipeline {
     params: Params,
+    camera: CameraSim,
     field: Field,
     tape: TapeSim,
     rf: RfSim,
@@ -52,6 +55,7 @@ impl Pipeline {
     pub fn new(params: Params) -> Self {
         Self {
             params,
+            camera: CameraSim::default(),
             field: Field::default(),
             tape: TapeSim::default(),
             rf: RfSim::default(),
@@ -105,6 +109,13 @@ impl Pipeline {
         let osd = (p.osd.enabled && self.osd.update(&p.osd, self.field_index)).then_some(p.osd.mode);
         let opacity = p.osd.opacity.clamp(0.0, 1.0);
 
+        let tc = Instant::now();
+        // 撮像管カメラ (OSD の日付などはカメラの後段で焼き込まれる)
+        let input = if p.camera.enabled {
+            self.camera.process(input, &p.camera, p.seed, self.field_index)
+        } else {
+            input
+        };
         let t0 = Instant::now();
         let input = if osd == Some(OsdMode::Tape) {
             let buf = self.burned.get_or_insert_with(|| RgbFrame::new(INPUT_WIDTH, INPUT_HEIGHT));
@@ -135,7 +146,7 @@ impl Pipeline {
         let t5 = Instant::now();
 
         self.timings =
-            StageTimings { encode: t1 - t0, tape: t2 - t1, rf: t3 - t2, decode: t4 - t3, capture: t5 - t4 };
+            StageTimings { camera: t0 - tc, encode: t1 - t0, tape: t2 - t1, rf: t3 - t2, decode: t4 - t3, capture: t5 - t4 };
         self.field_index += 1;
         self.output()
     }

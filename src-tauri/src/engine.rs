@@ -23,6 +23,7 @@ pub struct FrameSlot {
 pub struct Stats {
     pub source: String,
     pub fields_per_sec: f32,
+    pub camera_ms: f32,
     pub encode_ms: f32,
     pub tape_ms: f32,
     pub rf_ms: f32,
@@ -334,6 +335,7 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
             let t = pipeline.timings;
             let mut st = shared.stats.lock().unwrap();
             st.fields_per_sec = window_count as f32 / el.as_secs_f32();
+            st.camera_ms = t.camera.as_secs_f32() * 1e3;
             st.encode_ms = t.encode.as_secs_f32() * 1e3;
             st.tape_ms = t.tape.as_secs_f32() * 1e3;
             st.rf_ms = t.rf.as_secs_f32() * 1e3;

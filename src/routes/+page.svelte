@@ -8,6 +8,7 @@
   type Stats = {
     source: string;
     fields_per_sec: number;
+    camera_ms: number;
     encode_ms: number;
     tape_ms: number;
     rf_ms: number;
@@ -112,6 +113,34 @@
     if (defaults) params = applyDiff(defaults, presets[i].diff);
   }
 
+  async function pickFont(path: string) {
+    const file = await open({
+      filters: [
+        { name: "フォント", extensions: ["ttf", "otf", "ttc", "otc"] },
+        { name: "すべて", extensions: ["*"] },
+      ],
+    });
+    if (typeof file === "string" && params) setPath(params, path, file);
+  }
+
+  // 選んだフォントが読めるか確認して名前を表示する
+  let fontStatus = $state<{ text: string; error: boolean } | null>(null);
+  $effect(() => {
+    const font = params?.osd.font ?? "";
+    const index = params?.osd.font_index ?? 0;
+    if (!font) {
+      fontStatus = null;
+      return;
+    }
+    let stale = false;
+    invoke<string>("check_font", { path: font, index })
+      .then((name) => !stale && (fontStatus = { text: `読み込み OK: ${name}`, error: false }))
+      .catch((e) => !stale && (fontStatus = { text: `${e} (内蔵フォントで表示中)`, error: true }));
+    return () => {
+      stale = true;
+    };
+  });
+
   function newSeed() {
     if (params) params.seed = Math.floor(Math.random() * 2 ** 31);
   }
@@ -202,8 +231,8 @@
       {#if stats}
         <span>{stats.fields_per_sec.toFixed(1)} fields/s</span>
         <span>
-          処理 {(stats.encode_ms + stats.tape_ms + stats.rf_ms + stats.decode_ms + stats.capture_ms).toFixed(2)} ms
-          (enc {stats.encode_ms.toFixed(2)} / tape {stats.tape_ms.toFixed(2)}{stats.rf_ms > 0.01
+          処理 {(stats.camera_ms + stats.encode_ms + stats.tape_ms + stats.rf_ms + stats.decode_ms + stats.capture_ms).toFixed(2)} ms
+          ({stats.camera_ms > 0.01 ? `cam ${stats.camera_ms.toFixed(2)} / ` : ""}enc {stats.encode_ms.toFixed(2)} / tape {stats.tape_ms.toFixed(2)}{stats.rf_ms > 0.01
             ? ` / rf ${stats.rf_ms.toFixed(2)}`
             : ""} / dec {stats.decode_ms.toFixed(2)}{stats.capture_ms > 0.01 ? ` / cap ${stats.capture_ms.toFixed(2)}` : ""})
         </span>
@@ -281,6 +310,23 @@
                   onchange={(e) => setPath(params, c.path, (e.target as HTMLInputElement).value)}
                 />
               </label>
+            {:else if c.kind === "font"}
+              <div class="row" title={help[c.path]}>
+                <span class="name">{c.label}</span>
+                <input
+                  type="text"
+                  placeholder="内蔵 5×7 ドット"
+                  value={getPath(params, c.path)}
+                  onchange={(e) => setPath(params, c.path, (e.target as HTMLInputElement).value.trim())}
+                />
+                <span class="btns">
+                  <button class="small" onclick={() => pickFont(c.path)} title="フォントファイルを選ぶ">…</button>
+                  <button class="small" onclick={() => setPath(params, c.path, "")} title="内蔵フォントに戻す">内蔵</button>
+                </span>
+              </div>
+              {#if fontStatus}
+                <p class="note" class:err={fontStatus.error}>{fontStatus.text}</p>
+              {/if}
             {:else if c.kind === "markup"}
               <label class="stack" title={help[c.path]}>
                 <span class="name">{c.label}</span>
@@ -416,6 +462,10 @@
   }
   .row.check {
     grid-template-columns: auto 1fr;
+  }
+  .btns {
+    display: flex;
+    gap: 4px;
   }
   .row select,
   .row .wide {

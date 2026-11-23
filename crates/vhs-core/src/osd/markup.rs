@@ -28,7 +28,6 @@
 //!
 //! `\<` `\{` `\\` で記号そのものを書ける。解釈できないタグや置換はそのまま表示する。
 
-use super::font::{GLYPH_H, GLYPH_W};
 use crate::timing::FIELD_RATE;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -102,6 +101,28 @@ pub struct Glyph {
     pub y: i32,
     pub ch: char,
     pub style: Style,
+    /// 送り幅 (字間込み) [サンプル]
+    pub advance: i32,
+    /// 送り幅のうち字間の分 [サンプル]
+    pub spacing: i32,
+    /// セルの高さ [ライン]
+    pub height: i32,
+}
+
+/// 書体の寸法。単位は横がサンプル、縦がライン。
+pub trait Metrics {
+    /// 文字送り (字間込み)
+    fn advance(&self, ch: char, size: u32) -> i32;
+    /// 文字送りに含まれる字間 (行末では幅に数えない)
+    fn spacing(&self, ch: char, size: u32) -> i32;
+    /// セル上端からベースラインまで
+    fn baseline(&self, size: u32) -> i32;
+    /// セルの高さ
+    fn cell_height(&self, size: u32) -> i32;
+    /// 行送り
+    fn line_height(&self, size: u32) -> i32 {
+        self.cell_height(size) + 6 * size as i32
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -208,48 +229,49 @@ struct Line {
     chars: Vec<(char, Style)>,
 }
 
-struct Layout {
+struct Layout<'a> {
     out: Vec<Glyph>,
     line: Line,
+    m: &'a dyn Metrics,
 }
 
-impl Layout {
-    fn advance(size: u32) -> i32 {
-        (GLYPH_W as i32 + 1) * 2 * size as i32
-    }
-
-    fn line_height(size: u32) -> i32 {
-        (GLYPH_H as i32 + 3) * 2 * size as i32
-    }
-
+impl Layout<'_> {
     /// 現在の行を確定して配置する
     fn flush(&mut self) {
-        let line = &mut self.line;
-        let width: i32 = line.chars.iter().map(|(_, s)| Self::advance(s.size)).sum::<i32>()
-            - line.chars.last().map_or(0, |(_, s)| 2 * s.size as i32);
+        let (line, m) = (&mut self.line, self.m);
+        let width: i32 = line.chars.iter().map(|&(c, s)| m.advance(c, s.size)).sum::<i32>()
+            - line.chars.last().map_or(0, |&(c, s)| m.spacing(c, s.size));
         let mut x = match line.align {
             Align::Left => line.x,
             Align::Center => line.x - width / 2,
             Align::Right => line.x - width,
         };
-        // 大きさの違う文字はベースライン (下端) を揃える
-        let max_h = line.chars.iter().map(|(_, s)| s.size).max().unwrap_or(0) as i32 * 2 * GLYPH_H as i32;
+        // 大きさの違う文字はベースラインを揃える
+        let max_base = line.chars.iter().map(|(_, s)| m.baseline(s.size)).max().unwrap_or(0);
         for (ch, style) in line.chars.drain(..) {
-            let h = style.size as i32 * 2 * GLYPH_H as i32;
-            self.out.push(Glyph { x, y: line.y + max_h - h, ch, style });
-            x += Self::advance(style.size);
+            let advance = m.advance(ch, style.size);
+            self.out.push(Glyph {
+                x,
+                y: line.y + max_base - m.baseline(style.size),
+                ch,
+                style,
+                advance,
+                spacing: m.spacing(ch, style.size),
+                height: m.cell_height(style.size),
+            });
+            x += advance;
         }
     }
 
     fn newline(&mut self, cur_size: u32) {
         let size = self.line.chars.iter().map(|(_, s)| s.size).max().unwrap_or(cur_size);
         self.flush();
-        self.line.y += Self::line_height(size);
+        self.line.y += self.m.line_height(size);
     }
 }
 
 /// マークアップを解釈して配置済みの文字列を返す
-pub fn layout(src: &str, default_size: u32, ctx: &Context) -> Vec<Glyph> {
+pub fn layout(src: &str, default_size: u32, ctx: &Context, metrics: &dyn Metrics) -> Vec<Glyph> {
     let base = Style { color: Rgba::WHITE, bg: None, edge: None, shadow: None, blink: false, size: default_size };
     let mut colors = vec![base.color];
     let mut bgs = vec![base.bg];
@@ -257,7 +279,8 @@ pub fn layout(src: &str, default_size: u32, ctx: &Context) -> Vec<Glyph> {
     let mut shadows = vec![base.shadow];
     let mut sizes = vec![base.size];
     let mut blink = 0u32;
-    let mut lay = Layout { out: Vec::new(), line: Line { x: 48, y: 40, align: Align::Left, chars: Vec::new() } };
+    let mut lay =
+        Layout { out: Vec::new(), line: Line { x: 48, y: 40, align: Align::Left, chars: Vec::new() }, m: metrics };
 
     let chars: Vec<char> = src.chars().collect();
     let mut i = 0;
@@ -387,6 +410,7 @@ pub fn layout(src: &str, default_size: u32, ctx: &Context) -> Vec<Glyph> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::osd::face::Face;
 
     #[test]
     fn date_roundtrip() {
@@ -404,7 +428,7 @@ mod tests {
     #[test]
     fn tags_and_layout() {
         let ctx = Context::new("2000-01-01", 0);
-        let g = layout("<pos=100,50><color=red>AB</color>C\n<size=3>D</size>\\<x<bogus>", 2, &ctx);
+        let g = layout("<pos=100,50><color=red>AB</color>C\n<size=3>D</size>\\<x<bogus>", 2, &ctx, &Face::Builtin);
         let s: String = g.iter().map(|g| g.ch).collect();
         assert_eq!(s, "ABCD<x<bogus>");
         assert_eq!((g[0].x, g[0].y), (100, 50));
@@ -420,7 +444,7 @@ mod tests {
     #[test]
     fn align_right() {
         let ctx = Context::new("2000-01-01", 0);
-        let g = layout("<pos=700,0><align=right>AB", 2, &ctx);
+        let g = layout("<pos=700,0><align=right>AB", 2, &ctx, &Face::Builtin);
         // 幅 = 2 文字 * 24 - 字間 4 = 44
         assert_eq!(g[0].x, 700 - 44);
     }

@@ -103,6 +103,12 @@ async fn load_preset(path: PathBuf) -> Result<Params, String> {
     serde_json::from_str(&s).map_err(|e| e.to_string())
 }
 
+/// フォントファイルを読めるか確かめ、フォント名を返す
+#[tauri::command]
+async fn check_font(path: String, index: u32) -> Result<String, String> {
+    vhs_core::osd::face::describe(&path, index)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -123,6 +129,7 @@ pub fn run() {
             cancel_export,
             save_preset,
             load_preset,
+            check_font,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

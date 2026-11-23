@@ -8,6 +8,7 @@
 //!   キャラクタジェネレータが出力に重畳する表示を再現する。文字はくっきりしているが、
 //!   再生信号の水平同期に追従するので時間軸の揺れは画面と一緒に受ける。
 
+pub mod face;
 mod font;
 pub mod markup;
 
@@ -15,8 +16,10 @@ use crate::decoder::find_sync_edge;
 use crate::frame::{Field, RgbFrame};
 use crate::params::OsdParams;
 use crate::timing::*;
-use font::{GLYPH_H, GLYPH_W, glyph};
+use face::{Face, Mask};
 use markup::{Context, Glyph, Rgba};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 const W: usize = ACTIVE_WIDTH;
 const H: usize = FRAME_LINES;
@@ -29,27 +32,80 @@ pub struct Osd {
     last: Vec<Glyph>,
     /// 描画済み範囲 (行) — 空なら None
     rows: Option<(usize, usize)>,
+    face: Face,
+    /// 読み込み済みフォントの設定 (パス, 番号, ドット数)
+    face_key: Option<(String, u32, u32)>,
+    face_error: Option<String>,
+    /// (文字, サイズ) → (文字マスク, 縁取りマスク)
+    cache: HashMap<(char, u32), Arc<(Mask, Mask)>>,
 }
 
 impl Default for Osd {
     fn default() -> Self {
-        Self { overlay: vec![[0.0; 4]; W * H], last: Vec::new(), rows: None }
+        Self {
+            overlay: vec![[0.0; 4]; W * H],
+            last: Vec::new(),
+            rows: None,
+            face: Face::Builtin,
+            face_key: None,
+            face_error: None,
+            cache: HashMap::new(),
+        }
     }
 }
 
 impl Osd {
     /// 表示内容を更新する。戻り値は何か描画すべきものがあるか。
     pub fn update(&mut self, p: &OsdParams, field_index: u64) -> bool {
+        let font_changed = self.update_face(p);
         let ctx = Context::new(&p.start_datetime, field_index);
-        let glyphs: Vec<Glyph> = markup::layout(&p.markup, p.scale.clamp(1, 8), &ctx)
+        let glyphs: Vec<Glyph> = markup::layout(&p.markup, p.scale.clamp(1, 8), &ctx, &self.face)
             .into_iter()
             .filter(|g| !g.style.blink || ctx.blink_on())
             .collect();
-        if glyphs != self.last || (self.rows.is_none() && !glyphs.is_empty()) {
+        if font_changed || glyphs != self.last || (self.rows.is_none() && !glyphs.is_empty()) {
             self.render(&glyphs);
             self.last = glyphs;
         }
         self.rows.is_some()
+    }
+
+    /// 外部フォントの読み込みに失敗していればその理由 (内蔵フォントで代用中)
+    pub fn font_error(&self) -> Option<&str> {
+        self.face_error.as_deref()
+    }
+
+    /// フォント設定が変わっていれば読み直す
+    fn update_face(&mut self, p: &OsdParams) -> bool {
+        let path = p.font.trim();
+        let key = (path.to_string(), p.font_index, p.font_dots.min(64));
+        if self.face_key.as_ref() == Some(&key) {
+            return false;
+        }
+        (self.face, self.face_error) = if path.is_empty() {
+            (Face::Builtin, None)
+        } else {
+            match face::load(path, key.1, key.2) {
+                Ok(f) => (f, None),
+                Err(e) => (Face::Builtin, Some(e)),
+            }
+        };
+        self.face_key = Some(key);
+        self.cache.clear();
+        true
+    }
+
+    fn glyph_masks(&mut self, ch: char, size: u32) -> Arc<(Mask, Mask)> {
+        let face = &self.face;
+        self.cache
+            .entry((ch, size))
+            .or_insert_with(|| {
+                let m = face.mask(ch, size);
+                // 縁取りは横 2 サンプル、縦 2 ライン (= 1 フィールドライン) 太らせる
+                let e = m.dilate(2, 2);
+                Arc::new((m, e))
+            })
+            .clone()
     }
 
     fn render(&mut self, glyphs: &[Glyph]) {
@@ -60,43 +116,54 @@ impl Osd {
         // 背景 → 影 → 縁取り → 文字 の順に重ねる
         for g in glyphs {
             if let Some(bg) = g.style.bg {
-                let (dw, dh) = dot_size(g.style.size);
-                let x0 = g.x - dw / 2;
-                let y0 = g.y - dh;
-                self.fill(x0, y0, x0 + dw * (GLYPH_W as i32 + 1), y0 + dh * (GLYPH_H as i32 + 2), bg, &mut bounds);
+                let pad = 2 * g.style.size as i32;
+                let x0 = g.x - g.spacing / 2;
+                self.fill(x0, g.y - pad, x0 + g.advance, g.y + g.height + pad, bg, &mut bounds);
             }
         }
-        for g in glyphs {
+        let masks: Vec<_> = glyphs.iter().map(|g| self.glyph_masks(g.ch, g.style.size)).collect();
+        for (g, m) in glyphs.iter().zip(&masks) {
             if let Some(c) = g.style.shadow {
-                let (dw, dh) = dot_size(g.style.size);
-                self.dots(g, dw, dh, 0, c, &mut bounds);
+                let d = 2 * g.style.size as i32;
+                self.blit(&m.0, g.x + d, g.y + d, c, &mut bounds);
             }
         }
-        for g in glyphs {
+        for (g, m) in glyphs.iter().zip(&masks) {
             if let Some(c) = g.style.edge {
-                self.dots(g, 0, 0, 1, c, &mut bounds);
+                self.blit(&m.1, g.x, g.y, c, &mut bounds);
             }
         }
-        for g in glyphs {
-            self.dots(g, 0, 0, 0, g.style.color, &mut bounds);
+        for (g, m) in glyphs.iter().zip(&masks) {
+            self.blit(&m.0, g.x, g.y, g.style.color, &mut bounds);
         }
         self.rows = bounds.rows();
     }
 
-    /// グリフのドットを描く。`grow` > 0 で各ドットを膨らませる (縁取り)。
-    fn dots(&mut self, g: &Glyph, ox: i32, oy: i32, grow: i32, c: Rgba, b: &mut Bounds) {
-        let (dw, dh) = dot_size(g.style.size);
-        // 縁取りは横 2 サンプル、縦 2 ライン (= 1 フィールドライン) 単位で太らせる
-        let (gx, gy) = (grow * 2, grow * 2);
-        let bits = glyph(g.ch);
-        for (r, row) in bits.iter().enumerate() {
-            for col in 0..GLYPH_W {
-                if row & (1 << (GLYPH_W - 1 - col)) == 0 {
+    /// カバレッジマスクを (x, y) を原点として色 c で重ねる
+    fn blit(&mut self, m: &Mask, x: i32, y: i32, c: Rgba, b: &mut Bounds) {
+        if c.a <= 0.0 || m.w == 0 {
+            return;
+        }
+        let (mx, my) = (x + m.x, y + m.y);
+        let ys = my.max(0)..(my + m.h as i32).min(H as i32);
+        let xs = mx.max(0)..(mx + m.w as i32).min(W as i32);
+        if ys.is_empty() || xs.is_empty() {
+            return;
+        }
+        b.add(ys.start as usize, ys.end as usize);
+        let ca = c.a.min(1.0);
+        for py in ys {
+            let mrow = &m.data[(py - my) as usize * m.w..][..m.w];
+            for px in xs.clone() {
+                let a = ca * mrow[(px - mx) as usize];
+                if a <= 0.0 {
                     continue;
                 }
-                let x0 = g.x + ox + col as i32 * dw;
-                let y0 = g.y + oy + r as i32 * dh;
-                self.fill(x0 - gx, y0 - gy, x0 + dw + gx, y0 + dh + gy, c, b);
+                let o = &mut self.overlay[py as usize * W + px as usize];
+                let src = [c.r * a, c.g * a, c.b * a, a];
+                for k in 0..4 {
+                    o[k] = src[k] + o[k] * (1.0 - a);
+                }
             }
         }
     }
@@ -197,11 +264,6 @@ fn burst_phase(line: &[f32], d: f32) -> f32 {
         zi -= line[n] * SIN4[n & 3];
     }
     zi.atan2(zr) - std::f32::consts::FRAC_PI_2
-}
-
-/// サイズ 1 あたりのドット: 横 2 サンプル × 縦 2 ライン (1 フィールドライン)
-fn dot_size(size: u32) -> (i32, i32) {
-    (2 * size as i32, 2 * size as i32)
 }
 
 #[derive(Default)]

@@ -2,6 +2,40 @@
 // Rust 側 (crates/vhs-core/src/params.rs) を変更したらここも合わせる。
 
 export type Params = {
+  camera: {
+    enabled: boolean;
+    exposure_ev: number;
+    crosstalk: number;
+    flare: number;
+    registration_px: number;
+    shading: number;
+    resolution_px: number;
+    target_gamma: number;
+    dark_current: number;
+    photo_lag: number;
+    photo_lag_fields: number;
+    capacitive_lag: number;
+    bias_light: number;
+    beam_current: number;
+    target_saturation: number;
+    act: boolean;
+    act_level: number;
+    hysteresis: number;
+    hysteresis_fields: number;
+    burn_rate: number;
+    burn_recovery: number;
+    blemishes: number;
+    amp_drive: number;
+    amp_asymmetry: number;
+    noise_pct: number;
+    mismatch: number;
+    aging: number;
+    aperture: number;
+    knee: number;
+    knee_slope: number;
+    white_clip: number;
+    camera_gamma: number;
+  };
   encoder: { luma_bw_mhz: number; i_bw_mhz: number; q_bw_mhz: number; chroma_gain: number };
   tape: {
     enabled: boolean;
@@ -98,6 +132,9 @@ export type Params = {
     scale: number;
     opacity: number;
     start_datetime: string;
+    font: string;
+    font_index: number;
+    font_dots: number;
   };
   seed: number;
 };
@@ -107,7 +144,8 @@ export type Control =
   | { kind: "bool"; path: string; label: string }
   | { kind: "select"; path: string; label: string; options: { value: string; label: string }[] }
   | { kind: "text"; path: string; label: string; placeholder?: string }
-  | { kind: "markup"; path: string; label: string };
+  | { kind: "markup"; path: string; label: string }
+  | { kind: "font"; path: string; label: string };
 
 export type Group = { title: string; note?: string; controls: Control[] };
 
@@ -117,6 +155,55 @@ const r = (path: string, label: string, min: number, max: number, step: number, 
 const b = (path: string, label: string): Control => ({ kind: "bool", path, label });
 
 export const groups: Group[] = [
+  {
+    title: "撮像管カメラ: 光学系",
+    note: "入力映像を被写体とみなし、RGB 3 管式の撮像管カメラで撮影した映像にする (パイプラインの先頭)。",
+    controls: [
+      b("camera.enabled", "撮像管カメラを通す"),
+      r("camera.exposure_ev", "露出 (アイリス)", -4, 4, 0.1, "EV"),
+      r("camera.crosstalk", "プリズムの混色", 0, 0.3, 0.005),
+      r("camera.flare", "フレア", 0, 0.2, 0.005),
+      r("camera.registration_px", "レジストレーションずれ", 0, 6, 0.05, "px"),
+      r("camera.shading", "シェーディング", 0, 0.5, 0.01),
+      r("camera.resolution_px", "ぼけ (ビームスポット)", 0, 4, 0.05, "px"),
+    ],
+  },
+  {
+    title: "撮像管カメラ: ターゲット・ビーム",
+    note: "ビジコン: γ≒0.65・残像大・焼き付きやすい。プランビコン: γ≒0.95・残像小。サチコン: γ≒1.0。",
+    controls: [
+      r("camera.target_gamma", "ターゲット γ", 0.4, 1.2, 0.01),
+      r("camera.dark_current", "暗電流", 0, 0.1, 0.001),
+      r("camera.capacitive_lag", "容量性残像", 0, 2, 0.01),
+      r("camera.photo_lag", "光導電性残像", 0, 0.9, 0.01),
+      r("camera.photo_lag_fields", "残像の時定数", 0.5, 60, 0.5, "field"),
+      r("camera.bias_light", "バイアス光", 0, 0.2, 0.002),
+      r("camera.beam_current", "ビーム電流", 0.5, 6, 0.05, "×白"),
+      r("camera.target_saturation", "ターゲット飽和", 1, 40, 0.5, "×白"),
+      b("camera.act", "ACT (アンチコメットテール)"),
+      r("camera.act_level", "ACT レベル", 0.5, 5, 0.05, "×白"),
+      r("camera.hysteresis", "ヒステリシス幅", 0, 0.2, 0.002),
+      r("camera.hysteresis_fields", "ヒステリシス緩和", 1, 300, 1, "field"),
+      r("camera.burn_rate", "焼き付き速度", 0, 1, 0.005, "/s"),
+      r("camera.burn_recovery", "焼き付き回復", 0, 0.5, 0.005, "/s"),
+      r("camera.blemishes", "しみ・きず", 0, 200, 1),
+    ],
+  },
+  {
+    title: "撮像管カメラ: 増幅・プロセス",
+    controls: [
+      r("camera.amp_drive", "プリアンプ非線形", 0, 3, 0.01),
+      r("camera.amp_asymmetry", "正負の非対称", -1, 1, 0.01),
+      r("camera.noise_pct", "プリアンプ雑音", 0, 10, 0.05, "%"),
+      r("camera.mismatch", "RGB 管のばらつき", 0, 1, 0.01),
+      r("camera.aging", "撮像管の劣化", 0, 1, 0.01),
+      r("camera.aperture", "輪郭補償", 0, 2, 0.01),
+      r("camera.knee", "ニー開始", 0.5, 1.2, 0.01),
+      r("camera.knee_slope", "ニー傾き", 0, 1, 0.01),
+      r("camera.white_clip", "ホワイトクリップ", 0.8, 1.5, 0.01),
+      r("camera.camera_gamma", "ガンマ補正", 0.3, 1, 0.01),
+    ],
+  },
   {
     title: "OSD (画面表示)",
     note:
@@ -135,6 +222,9 @@ export const groups: Group[] = [
         ],
       },
       { kind: "markup", path: "osd.markup", label: "表示内容" },
+      { kind: "font", path: "osd.font", label: "フォント" },
+      r("osd.font_index", "TTC 内の番号", 0, 7, 1),
+      r("osd.font_dots", "ドット数 (0=なめらか)", 0, 32, 1, "dot"),
       r("osd.scale", "文字サイズ", 1, 8, 1),
       r("osd.opacity", "不透明度", 0, 1, 0.01),
       { kind: "text", path: "osd.start_datetime", label: "開始日時", placeholder: "1995-08-12 14:30:00" },
@@ -308,6 +398,40 @@ export const groups: Group[] = [
 
 // ツールチップ用の説明 (path → 説明文)。
 export const help: Record<string, string> = {
+  // 撮像管カメラ
+  "camera.enabled": "入力映像を撮像管カメラで撮影した映像にする。テープ・OSD の焼き込みより前に入る。",
+  "camera.exposure_ev": "アイリスによる露出。上げると白を超えるハイライトが増え、コメットテールや焼き付きが起きやすい。",
+  "camera.crosstalk": "色分解プリズムの分光特性の裾による隣の色の漏れ込み。色が浅くなる。",
+  "camera.flare": "レンズ・プリズム内の散乱光が画面全体にかぶる量。暗部が浮き、赤管は特に多く暗部の色が赤に転ぶ。",
+  "camera.registration_px": "RGB 3 管の像の重ね合わせのずれ。G 管を基準に R/B がずれて輪郭に色がにじむ。画面端ほど大きくなる。",
+  "camera.shading": "画面周辺の感度低下と、管ごとに異なる傾き (色むら)。",
+  "camera.resolution_px": "レンズ・ターゲット・電子ビームのスポット径によるぼけ。",
+  "camera.target_gamma": "光導電ターゲットの光電変換特性。ビジコン ≒ 0.65、プランビコン ≒ 0.95、サチコン ≒ 1.0。ガンマ補正と組み合わせて全体の階調が決まる。",
+  "camera.dark_current": "光がなくても流れる電流。オートブラックで平均は差し引かれるが、むらや白きずが残る。",
+  "camera.capacitive_lag": "ビームが 1 回で電荷を読み切れないことによる残像。暗い部分ほど尾を引く。",
+  "camera.photo_lag": "光導電体のトラップによる遅い残像の割合。動く被写体が尾を引き、消えるまで時間がかかる。",
+  "camera.photo_lag_fields": "光導電性残像の減衰の時定数 (立ち上がりはこの半分)。60 で約 1 秒。",
+  "camera.bias_light": "ターゲットに一様な光を当てて暗部の残像を減らす (バイアス光)。黒レベルは差し引かれる。",
+  "camera.beam_current": "1 回の走査で読み出せる電荷の上限 (白レベル比)。これを超える明るい部分は読み残され、動くと彗星のような尾 (コメットテール) を引く。",
+  "camera.target_saturation": "ターゲットに溜められる電荷の上限。大きいほど強いハイライトの尾が長くなる。",
+  "camera.act": "ACT 管: 帰線期間に過大な電荷を放電してコメットテールを短くする。",
+  "camera.act_level": "ACT が放電を始める電荷のレベル。",
+  "camera.hysteresis": "ターゲットのヒステリシス。明→暗と暗→明で残る値が異なり、動いた後に薄い像が残る。",
+  "camera.hysteresis_fields": "ヒステリシスの残りが解ける時定数。",
+  "camera.burn_rate": "明るい部分の感度が落ちて像が焼き付く速さ。カメラを動かすと前の像が暗く残る。",
+  "camera.burn_recovery": "焼き付きが回復する速さ。",
+  "camera.blemishes": "ターゲットのしみ (黒い点) と白きず。管ごとに別の場所に出るので色が付く。",
+  "camera.amp_drive": "初段の真空管プリアンプの非線形性の強さ。0 で線形。",
+  "camera.amp_asymmetry": "正側と負側の飽和の非対称性。正で明部、負で暗部がより圧縮される (偶数次ひずみ)。",
+  "camera.noise_pct": "プリアンプの雑音。入力容量のため高域ほど大きい (三角雑音)。ガンマ補正で暗部ほど目立つ。",
+  "camera.mismatch": "RGB 3 本の撮像管の特性のばらつき。γ・感度・残像・暗電流・ビーム電流などが管ごとにずれ、残像や暗部に色が付く。",
+  "camera.aging": "撮像管の劣化をまとめて進める。感度とビーム電流の低下、残像・焼き付き・暗電流・しみ・雑音・ばらつきの増加。",
+  "camera.aperture": "輪郭補償 (アパーチャ補正)。撮像管の解像度不足を電気的に補う。上げると輪郭に縁取りが出る。",
+  "camera.knee": "ハイライト圧縮 (ニー) を始めるレベル。",
+  "camera.knee_slope": "ニーより上の傾き。小さいほどハイライトが強く圧縮される。",
+  "camera.white_clip": "ホワイトクリップのレベル。",
+  "camera.camera_gamma": "カメラのガンマ補正。ターゲット γ × ガンマ補正 ≒ 0.45 で元の階調になる。",
+
   // OSD
   "osd.enabled": "デッキやカメラの画面表示 (PLAY、カウンタ、日付など) を重ねる。",
   "osd.mode":
@@ -316,6 +440,12 @@ export const help: Record<string, string> = {
   "osd.markup": "表示内容のマークアップ。書式はグループ上部の説明を参照。",
   "osd.scale": "既定の文字サイズ。1 = 1 ドットが 2×2 画素。<size=> タグで部分的に変更できる。",
   "osd.opacity": "OSD 全体の不透明度。0 で透明、1 で不透明。",
+  "osd.font":
+    "表示に使うフォントファイル (.ttf / .otf / .ttc)。空なら内蔵の 5×7 ドットフォント。\n" +
+    "例: C:\\Windows\\Fonts\\msgothic.ttc (日本語も表示できる)。フォントにない文字は内蔵フォントで代用する。",
+  "osd.font_index": ".ttc (フォントコレクション) の中のどのフォントを使うか。msgothic.ttc なら 0 = MS ゴシック、2 = MS P ゴシック。",
+  "osd.font_dots":
+    "外部フォントを 1 文字の高さあたり何ドットで描くか。16 で漢字 ROM 風のドット文字になる。0 はなめらかに描く。内蔵フォントには効かない。",
   "osd.start_datetime": "{date} {time} などの起点となる日時 (YYYY-MM-DD HH:MM:SS)。再生時間に合わせて進む。",
 
   // テープ: 輝度
@@ -441,6 +571,33 @@ type DeepPartial<T> = { [K in keyof T]?: T[K] extends object ? DeepPartial<T[K]>
 // 組み込みプリセット (既定値からの差分)
 export const presets: { name: string; diff: DeepPartial<Params> }[] = [
   { name: "VHS 標準 (SP)", diff: {} },
+  {
+    name: "放送用プランビコン 3 管カメラ",
+    diff: { camera: { enabled: true, act: true } },
+  },
+  {
+    name: "家庭用ビジコンカメラ",
+    diff: {
+      camera: {
+        enabled: true, target_gamma: 0.65, camera_gamma: 0.68, capacitive_lag: 0.35, photo_lag: 0.3, photo_lag_fields: 12,
+        beam_current: 1.4, dark_current: 0.02, burn_rate: 0.15, burn_recovery: 0.03, registration_px: 1.2, mismatch: 0.45,
+        resolution_px: 1.2, noise_pct: 2, amp_drive: 0.7, crosstalk: 0.06, flare: 0.04, shading: 0.15,
+      },
+    },
+  },
+  {
+    name: "サチコンカメラ",
+    diff: { camera: { enabled: true, target_gamma: 1.0, camera_gamma: 0.43, capacitive_lag: 0.05, photo_lag: 0.03, burn_rate: 0.04 } },
+  },
+  {
+    name: "劣化した撮像管カメラ",
+    diff: {
+      camera: {
+        enabled: true, target_gamma: 0.7, camera_gamma: 0.65, aging: 0.75, blemishes: 25, hysteresis: 0.03, burn_rate: 0.2,
+        burn_recovery: 0.02, mismatch: 0.6, registration_px: 2.5, amp_drive: 1.2, amp_asymmetry: 0.6,
+      },
+    },
+  },
   {
     name: "VHS 3倍 (EP)",
     diff: {
