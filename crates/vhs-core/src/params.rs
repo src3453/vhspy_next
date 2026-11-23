@@ -3,9 +3,13 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::timing::TvStandard;
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Params {
+    /// テレビ方式 (信号のタイミング・色の符号化)
+    pub standard: TvStandard,
     /// 撮像管カメラ (入力映像の直後)
     pub camera: CameraParams,
     pub encoder: EncoderParams,

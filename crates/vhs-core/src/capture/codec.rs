@@ -33,8 +33,6 @@ const ZIGZAG: [usize; 64] = [
 
 const Q_MIN: f32 = 1.0;
 const Q_MAX: f32 = 112.0;
-/// 29.97 fps (1 出力フレーム = 2 フィールドを織り込んだ 1 フレーム) として符号量を割り当てる
-const FRAME_RATE: f32 = 30000.0 / 1001.0;
 
 fn dct_matrix() -> &'static [[f32; 8]; 8] {
     static M: OnceLock<[[f32; 8]; 8]> = OnceLock::new();
@@ -219,7 +217,9 @@ impl Codec {
         self.gop_pos = 0;
     }
 
-    pub fn encode(&mut self, planes: &mut [Plane; 3], p: &CaptureParams) {
+    /// `frame_rate`: 符号量を割り当てるフレーム周波数 [Hz]
+    /// (1 出力フレーム = 2 フィールドを織り込んだ 1 フレーム。NTSC なら 29.97)
+    pub fn encode(&mut self, planes: &mut [Plane; 3], p: &CaptureParams, frame_rate: f32) {
         let dims_ok = self.reference.as_ref().is_some_and(|r| (0..3).all(|i| r[i].w == planes[i].w && r[i].h == planes[i].h));
         let gop = p.gop.max(1);
         if !dims_ok || self.gop_pos >= gop {
@@ -379,7 +379,7 @@ impl Codec {
 
         // VLC 長の近似は実際より長めに出るので補正する。300 bit はヘッダ類
         let bits = ((luma_bits + chroma_bits) as f32 * 0.7) as u64 + 300;
-        self.rate_control(bits, intra_frame, p, gop);
+        self.rate_control(bits, intra_frame, p, gop, frame_rate);
         self.stats = CodecStats { bits, q, intra_frame };
 
         // 再構成画像を出力し、次のフレームの参照にする
@@ -397,8 +397,8 @@ impl Codec {
         self.gop_pos += 1;
     }
 
-    fn rate_control(&mut self, bits: u64, intra: bool, p: &CaptureParams, gop: u32) {
-        let target = p.bitrate_kbps.max(50.0) * 1000.0 / FRAME_RATE;
+    fn rate_control(&mut self, bits: u64, intra: bool, p: &CaptureParams, gop: u32, frame_rate: f32) {
+        let target = p.bitrate_kbps.max(50.0) * 1000.0 / frame_rate;
         // GOP 内で I に 3 倍の符号量を割り当てる
         let g = gop as f32;
         let tp = if gop > 1 { g * target / (g + 2.0) } else { target };

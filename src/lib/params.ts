@@ -2,6 +2,8 @@
 // Rust 側 (crates/vhs-core/src/params.rs) を変更したらここも合わせる。
 
 export type Params = {
+  /** テレビ方式 (今は NTSC のみ) */
+  standard: "ntsc";
   camera: {
     enabled: boolean;
     exposure_ev: number;

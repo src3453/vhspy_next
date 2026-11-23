@@ -9,9 +9,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 use vhs_core::audio::AudioProcessor;
-use vhs_core::{INPUT_HEIGHT, INPUT_WIDTH, Params, Pipeline, RgbFrame};
+use vhs_core::{Params, Pipeline, RgbFrame, Standard};
 
-const FIELD_PERIOD: Duration = Duration::from_nanos(16_683_350); // 1001/60000 s
+/// 1 フィールドの時間 (NTSC なら 1001/60000 s)
+fn field_period(tv: &Standard) -> Duration {
+    let (n, d) = tv.field_rate_ratio;
+    Duration::from_nanos(1_000_000_000 * d as u64 / n as u64)
+}
 
 /// フロントエンドへ渡すフレーム。先頭 16 バイトがヘッダ (id: u64, w: u32, h: u32)、以降 RGBA。
 pub struct FrameSlot {
@@ -52,7 +56,7 @@ pub struct Shared {
     export_cancel: Mutex<Option<Arc<AtomicBool>>>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum SourceSpec {
     Pattern,
     Image(PathBuf),
@@ -75,10 +79,11 @@ enum Source {
     Stream(FrameStream),
 }
 
-fn load_image(path: &Path) -> Result<RgbFrame, String> {
+fn load_image(path: &Path, tv: &Standard) -> Result<RgbFrame, String> {
+    let (w, h) = tv.image_size();
     let img = image::open(path).map_err(|e| format!("画像を開けません: {e}"))?.to_rgb8();
-    let img = image::imageops::resize(&img, INPUT_WIDTH as u32, INPUT_HEIGHT as u32, image::imageops::FilterType::CatmullRom);
-    Ok(RgbFrame::from_raw(INPUT_WIDTH, INPUT_HEIGHT, img.into_raw()).unwrap())
+    let img = image::imageops::resize(&img, w as u32, h as u32, image::imageops::FilterType::CatmullRom);
+    Ok(RgbFrame::from_raw(w, h, img.into_raw()).unwrap())
 }
 
 fn source_name(spec: &SourceSpec) -> String {
@@ -92,11 +97,12 @@ fn source_name(spec: &SourceSpec) -> String {
     }
 }
 
-fn open_source(spec: &SourceSpec) -> Result<Source, String> {
+/// 入力を開く。画像サイズ・フィールド周波数はテレビ方式 `tv` に合わせる
+fn open_source(spec: &SourceSpec, tv: &Standard) -> Result<Source, String> {
     Ok(match spec {
-        SourceSpec::Pattern => Source::Still(vhs_core::pattern::color_bars()),
-        SourceSpec::Image(p) => Source::Still(load_image(p)?),
-        SourceSpec::Stream(s) => Source::Stream(FrameStream::open(s, true)?),
+        SourceSpec::Pattern => Source::Still(vhs_core::pattern::color_bars(tv)),
+        SourceSpec::Image(p) => Source::Still(load_image(p, tv)?),
+        SourceSpec::Stream(s) => Source::Stream(FrameStream::open(s, true, tv)?),
     })
 }
 
@@ -179,7 +185,8 @@ impl Drop for TempFile {
 }
 
 fn export(app: &AppHandle, input: &Path, output: &Path, params: Params, cancel: &AtomicBool) -> Result<(), String> {
-    let total = probe_duration(input).map(|d| (d * 60000.0 / 1001.0) as u64);
+    let tv = params.standard.spec();
+    let total = probe_duration(input).map(|d| (d * tv.field_rate_ratio.0 as f64 / tv.field_rate_ratio.1 as f64) as u64);
 
     // 音声は先に全部処理して一時 WAV にする (映像より桁違いに軽い)
     let mut audio_tmp = None;
@@ -200,8 +207,8 @@ fn export(app: &AppHandle, input: &Path, output: &Path, params: Params, cancel: 
     };
 
     let stream =
-        FrameStream::open(&StreamSpec::File { path: input.to_path_buf(), looped: false, realtime: false }, false)?;
-    let rec = Recorder::start(output, audio)?;
+        FrameStream::open(&StreamSpec::File { path: input.to_path_buf(), looped: false, realtime: false }, false, tv)?;
+    let rec = Recorder::start(output, audio, tv)?;
     let mut pipeline = Pipeline::new(params);
     let mut done = 0u64;
     for frame in stream.rx.iter() {
@@ -226,7 +233,10 @@ fn export(app: &AppHandle, input: &Path, output: &Path, params: Params, cancel: 
 fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
     let mut pipeline = Pipeline::new(shared.params.lock().unwrap().clone());
     let mut seen_version = 0;
-    let mut source = Source::Still(vhs_core::pattern::color_bars());
+    let mut tv = pipeline.standard();
+    // 方式が変わったときに開き直すため、今の入力の指定を覚えておく
+    let mut spec = SourceSpec::Pattern;
+    let mut source = Source::Still(vhs_core::pattern::color_bars(tv));
     shared.stats.lock().unwrap().source = source_name(&SourceSpec::Pattern);
     let mut recorder: Option<Recorder> = None;
     let mut next_deadline = Instant::now();
@@ -242,14 +252,16 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
             };
             match cmd {
-                Cmd::Open(spec, reply) => {
+                Cmd::Open(new_spec, reply) => {
                     // 先に古いソースを閉じる (同じカメラを開き直す場合のため)
-                    source = Source::Still(vhs_core::pattern::color_bars());
-                    let r = open_source(&spec).map(|s| {
+                    source = Source::Still(vhs_core::pattern::color_bars(tv));
+                    spec = SourceSpec::Pattern;
+                    let r = open_source(&new_spec, tv).map(|s| {
                         source = s;
                         let mut st = shared.stats.lock().unwrap();
-                        st.source = source_name(&spec);
+                        st.source = source_name(&new_spec);
                         st.error = None;
+                        spec = new_spec;
                     });
                     let _ = reply.send(r);
                 }
@@ -257,7 +269,7 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     if let Some(r) = recorder.take() {
                         let _ = r.finish();
                     }
-                    let r = Recorder::start(&path, None).map(|r| {
+                    let r = Recorder::start(&path, None, tv).map(|r| {
                         shared.stats.lock().unwrap().recording = Some(r.path.display().to_string());
                         recorder = Some(r);
                     });
@@ -271,16 +283,46 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
             }
         }
 
+        // ---- パラメータ反映 ----
+        let v = shared.params_version.load(Ordering::Acquire);
+        if v != seen_version {
+            seen_version = v;
+            pipeline.set_params(shared.params.lock().unwrap().clone());
+            if !std::ptr::eq(pipeline.standard(), tv) {
+                // テレビ方式が変わった: 画像サイズ・フィールド周波数が変わるので入力を開き直す。
+                // 録画中のファイルは途中でサイズを変えられないので止める
+                tv = pipeline.standard();
+                let mut st = shared.stats.lock().unwrap();
+                if let Some(r) = recorder.take() {
+                    let _ = r.finish();
+                    st.recording = None;
+                    st.error = Some("テレビ方式が変わったため録画を停止しました".into());
+                }
+                drop(st);
+                source = Source::Still(vhs_core::pattern::color_bars(tv));
+                match open_source(&spec, tv) {
+                    Ok(s) => source = s,
+                    Err(e) => {
+                        let mut st = shared.stats.lock().unwrap();
+                        st.error = Some(e);
+                        st.source = source_name(&SourceSpec::Pattern);
+                        spec = SourceSpec::Pattern;
+                    }
+                }
+            }
+        }
+
         // ---- 入力 ----
         let streamed;
         let input: &RgbFrame = match &source {
             Source::Still(f) => {
-                // 静止画は 59.94 Hz で同じ画像を流す
+                // 静止画はフィールド周波数 (NTSC なら 59.94 Hz) で同じ画像を流す
                 let now = Instant::now();
                 if next_deadline > now {
                     std::thread::sleep(next_deadline - now);
                 }
-                next_deadline = (next_deadline + FIELD_PERIOD).max(Instant::now() - FIELD_PERIOD);
+                let period = field_period(tv);
+                next_deadline = (next_deadline + period).max(Instant::now() - period);
                 f
             }
             Source::Stream(s) => match s.rx.recv_timeout(Duration::from_millis(100)) {
@@ -294,18 +336,12 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     st.error = Some("入力が終了しました (ffmpeg のログを確認してください)".into());
                     st.source = source_name(&SourceSpec::Pattern);
                     drop(st);
-                    source = Source::Still(vhs_core::pattern::color_bars());
+                    source = Source::Still(vhs_core::pattern::color_bars(tv));
+                    spec = SourceSpec::Pattern;
                     continue;
                 }
             },
         };
-
-        // ---- パラメータ反映 ----
-        let v = shared.params_version.load(Ordering::Acquire);
-        if v != seen_version {
-            seen_version = v;
-            pipeline.set_params(shared.params.lock().unwrap().clone());
-        }
 
         // ---- 処理 ----
         let out = pipeline.process_field(input);

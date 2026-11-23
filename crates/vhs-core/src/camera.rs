@@ -29,12 +29,20 @@
 //! 3 本の撮像管はシードから決まる個体差 (γ・感度・残像・暗電流・ビーム電流・焼き付きやすさ・
 //! レジストレーション・シェーディングの傾き) を持つ。`aging` はそれらをまとめて悪化させる。
 
-use crate::frame::RgbFrame;
+use crate::frame::{LinearFrame, RgbFrame, VideoFrame, sanitize};
 use crate::params::CameraParams;
 use crate::rng::Rng;
 use rayon::prelude::*;
 
-const FIELD_RATE: f32 = 59.94;
+/// フィールド周波数 [Hz] (既定は NTSC)
+#[derive(Clone, Copy, Debug)]
+struct FieldRate(f32);
+
+impl Default for FieldRate {
+    fn default() -> Self {
+        Self(crate::timing::NTSC.field_rate)
+    }
+}
 /// 真空管プリアンプの動作点 (白レベル比)
 const AMP_BIAS: f32 = 0.35;
 
@@ -122,8 +130,27 @@ impl MapKey {
     }
 }
 
+/// カメラに入る光
+#[derive(Clone, Copy)]
+pub enum CameraInput<'a> {
+    /// 8 bit の映像。表示ガンマ 2.2 として線形化する (白を超える光は表せない)
+    Rgb(&'a RgbFrame),
+    /// シーンリニアな HDR 映像 (`LinearFrame` の説明を参照)
+    Linear(&'a LinearFrame),
+}
+
+impl CameraInput<'_> {
+    fn size(&self) -> (usize, usize) {
+        match self {
+            CameraInput::Rgb(f) => (f.width, f.height),
+            CameraInput::Linear(f) => (f.width, f.height),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct CameraSim {
+    field_rate: FieldRate,
     w: usize,
     h: usize,
     lin: [Vec<f32>; 3],
@@ -144,12 +171,12 @@ pub struct CameraSim {
     tubes: Option<[Tube; 3]>,
     key: Option<MapKey>,
     last_field: Option<u64>,
-    out: Option<RgbFrame>,
+    out: Option<VideoFrame>,
 }
 
 impl CameraSim {
     /// 直前の出力
-    pub fn output(&self) -> Option<&RgbFrame> {
+    pub fn output(&self) -> Option<&VideoFrame> {
         self.out.as_ref()
     }
 
@@ -172,7 +199,7 @@ impl CameraSim {
             *v = vec![0.0; n];
         }
         self.tmp = vec![0.0; n];
-        self.out = Some(RgbFrame::new(w, h));
+        self.out = Some(VideoFrame::new(w, h));
         self.key = None;
         self.last_field = None;
     }
@@ -225,9 +252,14 @@ impl CameraSim {
         }
     }
 
-    /// 1 フィールドぶん処理する。返す画像のうち、このフィールドの走査線 (`field_index` の偶奇) が更新される。
-    pub fn process(&mut self, input: &RgbFrame, p: &CameraParams, seed: u64, field_index: u64) -> &RgbFrame {
-        let (w, h) = (input.width, input.height);
+    /// フィールド周波数 [Hz] を設定する (焼き付きの時定数に使う)。既定は NTSC
+    pub fn set_field_rate(&mut self, field_rate: f32) {
+        self.field_rate = FieldRate(field_rate);
+    }
+
+    /// 1 フィールドぶん処理する。返す映像信号のうち、このフィールドの走査線 (`field_index` の偶奇) が更新される。
+    pub fn process(&mut self, input: CameraInput, p: &CameraParams, seed: u64, field_index: u64) -> &VideoFrame {
+        let (w, h) = input.size();
         if self.w != w || self.h != h || self.out.is_none() {
             self.allocate(w, h);
         }
@@ -254,7 +286,7 @@ impl CameraSim {
     }
 
     /// 光学系: 線形化・露出・混色・フレア・レジストレーション・ぼけ
-    fn optics(&mut self, input: &RgbFrame, p: &CameraParams, tubes: &[Tube; 3]) {
+    fn optics(&mut self, input: CameraInput, p: &CameraParams, tubes: &[Tube; 3]) {
         let (w, h) = (self.w, self.h);
         let gain = 2f32.powf(p.exposure_ev);
         let lut: [f32; 256] = std::array::from_fn(|i| (i as f32 / 255.0).powf(2.2) * gain);
@@ -264,10 +296,19 @@ impl CameraSim {
             l0.par_chunks_mut(w)
                 .zip(l1.par_chunks_mut(w))
                 .zip(l2.par_chunks_mut(w))
-                .zip(input.data.par_chunks(w * 3))
-                .for_each(|(((r0, r1), r2), src)| {
+                .enumerate()
+                .for_each(|(y, ((r0, r1), r2))| {
                     for i in 0..w {
-                        let (r, g, b) = (lut[src[i * 3] as usize], lut[src[i * 3 + 1] as usize], lut[src[i * 3 + 2] as usize]);
+                        let (r, g, b) = match input {
+                            CameraInput::Rgb(f) => {
+                                let px = &f.data[(y * w + i) * 3..][..3];
+                                (lut[px[0] as usize], lut[px[1] as usize], lut[px[2] as usize])
+                            }
+                            CameraInput::Linear(f) => {
+                                let px = &f.data[(y * w + i) * 3..][..3];
+                                (sanitize(px[0]) * gain, sanitize(px[1]) * gain, sanitize(px[2]) * gain)
+                            }
+                        };
                         // ダイクロイックプリズムの分光特性の裾で隣の色が漏れ込む
                         r0[i] = r * (1.0 - x) + g * x;
                         r1[i] = g * (1.0 - 2.0 * x) + (r + b) * x;
@@ -281,7 +322,9 @@ impl CameraSim {
             let t = tubes[c];
             let lin = &self.lin[c];
             // フレア: 画面全体の光がかぶる (赤管は特に多い)
-            let mean = lin.par_iter().sum::<f32>() / lin.len() as f32;
+            // 加算順を固定する (rayon の par_iter().sum() は分割が実行ごとに変わり、結果が揺れる)
+            let row_sums: Vec<f32> = lin.par_chunks(w).map(|r| r.iter().sum::<f32>()).collect();
+            let mean = row_sums.iter().sum::<f32>() / lin.len() as f32;
             let flare = p.flare.max(0.0) * if c == 0 { 2.0 } else { 1.0 } * mean;
             let (cx, cy) = (w as f32 * 0.5, h as f32 * 0.5);
             let shifted = t.dx.abs() > 1e-3 || t.dy.abs() > 1e-3 || (t.scale - 1.0).abs() > 1e-6;
@@ -326,8 +369,9 @@ impl CameraSim {
         let bias = p.bias_light.max(0.0);
         // オートブラックが差し引く黒レベル (暗電流の平均とバイアス光)。むら・個体差は残る
         let black = p.dark_current.max(0.0) * (1.0 + 5.0 * a) + bias - t.black;
-        let burn_rate = p.burn_rate.max(0.0) * t.burn / FIELD_RATE;
-        let burn_rec = p.burn_recovery.max(0.0) / FIELD_RATE;
+        let field_rate = self.field_rate.0;
+        let burn_rate = p.burn_rate.max(0.0) * t.burn / field_rate;
+        let burn_rec = p.burn_recovery.max(0.0) / field_rate;
         let hw = p.hysteresis.max(0.0);
         let h_relax = 1.0 - (-1.0 / p.hysteresis_fields.max(0.1)).exp();
         let amp = Amp::new(p.amp_drive, p.amp_asymmetry);
@@ -396,12 +440,6 @@ impl CameraSim {
         let ap = p.aperture;
         let (knee, slope, clip) = (p.knee, p.knee_slope.max(0.0), p.white_clip);
         let cg = p.camera_gamma.max(0.05);
-        // ガンマ補正の表 (0..clip)
-        const N: usize = 4096;
-        let top = clip.max(1e-3);
-        let lut: Vec<u8> =
-            (0..=N).map(|i| ((i as f32 / N as f32 * top).powf(cg) * 255.0 + 0.5).clamp(0.0, 255.0) as u8).collect();
-        let lut = &lut;
         let sig = &self.sig;
         let out = self.out.as_mut().unwrap();
         out.data.par_chunks_mut(w * 3).enumerate().filter(|(y, _)| y & 1 == parity).for_each(|(y, row)| {
@@ -429,8 +467,8 @@ impl CameraSim {
                     if v > knee {
                         v = knee + (v - knee) * slope;
                     }
-                    let v = v.min(clip).max(0.0);
-                    row[x * 3 + c] = lut[((v / top * N as f32 + 0.5) as usize).min(N)];
+                    // スーパーホワイト (白 = 1.0 を超える分) はそのまま信号に残す
+                    row[x * 3 + c] = v.min(clip).max(0.0).powf(cg);
                 }
             }
         });
@@ -537,11 +575,11 @@ mod tests {
         let p = quiet();
         let input = flat(64, 48, 128);
         for f in 0..4 {
-            cam.process(&input, &p, 1, f);
+            cam.process(CameraInput::Rgb(&input), &p, 1, f);
         }
         let out = cam.output().unwrap();
         for &v in &out.data[64 * 3 * 10..64 * 3 * 12] {
-            assert!((v as i32 - 128).abs() <= 3, "got {v}");
+            assert!((v * 255.0 - 128.0).abs() <= 3.0, "got {v}");
         }
     }
 
@@ -557,14 +595,14 @@ mod tests {
             let on = flat(32, 8, level);
             let off = flat(32, 8, 0);
             for f in 0..20 {
-                cam.process(&on, &p, 1, f);
+                cam.process(CameraInput::Rgb(&on), &p, 1, f);
             }
             let lit = cam.output().unwrap().data[16 * 3] as f32;
             // 消灯直後のフレームは前フィールドの光も読むので、その次のフレーム (行 0 = 偶数フィールド) を見る
             for f in 20..23 {
-                cam.process(&off, &p, 1, f);
+                cam.process(CameraInput::Rgb(&off), &p, 1, f);
             }
-            cam.output().unwrap().data[16 * 3] as f32 / lit.max(1.0)
+            cam.output().unwrap().data[16 * 3] as f32 / lit.max(1e-6)
         };
         let hi = residual(255);
         let lo = residual(90);
@@ -586,12 +624,12 @@ mod tests {
             let on = flat(16, 8, 255);
             let off = flat(16, 8, 0);
             for f in 0..10 {
-                cam.process(&on, &p, 1, f);
+                cam.process(CameraInput::Rgb(&on), &p, 1, f);
             }
             let mut n = 0;
             for f in 10..40 {
-                cam.process(&off, &p, 1, f);
-                if f & 1 == 0 && cam.output().unwrap().data[0] > 20 {
+                cam.process(CameraInput::Rgb(&off), &p, 1, f);
+                if f & 1 == 0 && cam.output().unwrap().data[0] > 0.08 {
                     n += 1;
                 }
             }
@@ -600,6 +638,58 @@ mod tests {
         let plain = tail(false);
         let with_act = tail(true);
         assert!(plain >= 2 && with_act < plain, "plain {plain} act {with_act}");
+    }
+
+    /// 8 bit 入力と、それを線形化した HDR 入力は同じ結果になる
+    #[test]
+    fn linear_input_matches_rgb() {
+        let p = CameraParams { enabled: true, ..Default::default() };
+        let rgb = RgbFrame { width: 40, height: 20, data: (0..40 * 20 * 3).map(|i| (i * 7 % 256) as u8).collect() };
+        let lin = LinearFrame::from_rgb(&rgb);
+        let (mut a, mut b) = (CameraSim::default(), CameraSim::default());
+        for f in 0..4 {
+            a.process(CameraInput::Rgb(&rgb), &p, 3, f);
+            b.process(CameraInput::Linear(&lin), &p, 3, f);
+        }
+        assert_eq!(a.output().unwrap().data, b.output().unwrap().data);
+    }
+
+    /// HDR なら白を超える光源が 8 bit (白で頭打ち) より長いコメットテールを引く
+    #[test]
+    fn hdr_highlight_has_longer_tail() {
+        let tail = |level: f32| {
+            let mut cam = CameraSim::default();
+            let mut p = quiet();
+            p.beam_current = 1.5;
+            p.target_saturation = 20.0;
+            p.camera_gamma = 1.0;
+            let mut on = LinearFrame::new(16, 8);
+            on.data.fill(level);
+            let off = LinearFrame::new(16, 8);
+            for f in 0..10 {
+                cam.process(CameraInput::Linear(&on), &p, 1, f);
+            }
+            (10..60u64)
+                .filter(|&f| {
+                    cam.process(CameraInput::Linear(&off), &p, 1, f);
+                    f & 1 == 0 && cam.output().unwrap().data[0] > 0.08
+                })
+                .count()
+        };
+        let clipped = tail(1.0);
+        let hdr = tail(8.0);
+        assert!(hdr >= clipped + 3, "clipped {clipped} hdr {hdr}");
+    }
+
+    /// 縮小しても光量 (画素値 × 面積) が保たれる
+    #[test]
+    fn linear_resize_preserves_energy() {
+        let mut f = LinearFrame::new(400, 300);
+        // 1 画素だけの強い光源
+        f.data[(150 * 400 + 200) * 3] = 1000.0;
+        let small = f.resized(100, 75);
+        let total: f32 = small.data.iter().step_by(3).sum::<f32>() * 16.0;
+        assert!((total - 1000.0).abs() < 1.0, "total {total}");
     }
 
     #[test]

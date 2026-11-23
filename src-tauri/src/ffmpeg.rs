@@ -8,9 +8,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::thread::JoinHandle;
-use vhs_core::{INPUT_HEIGHT, INPUT_WIDTH, OUTPUT_HEIGHT, OUTPUT_WIDTH, RgbFrame};
+use vhs_core::{RgbFrame, Standard};
 
-pub const FIELD_RATE: &str = "60000/1001";
+/// ffmpeg に渡すフィールド周波数 (例: NTSC は "60000/1001")
+fn field_rate_arg(tv: &Standard) -> String {
+    let (n, d) = tv.field_rate_ratio;
+    format!("{n}/{d}")
+}
 
 pub fn ffmpeg_path() -> PathBuf {
     std::env::var_os("VHS_FFMPEG").map(PathBuf::from).unwrap_or_else(|| "ffmpeg".into())
@@ -82,8 +86,10 @@ pub struct FrameStream {
 }
 
 impl FrameStream {
-    /// `lossy` = true なら処理が追いつかないとき古いフレームを捨てる (ライブ向け)
-    pub fn open(spec: &StreamSpec, lossy: bool) -> Result<Self, String> {
+    /// `lossy` = true なら処理が追いつかないとき古いフレームを捨てる (ライブ向け)。
+    /// フレームはテレビ方式 `tv` のフィールド周波数・画像サイズに変換して読み出す。
+    pub fn open(spec: &StreamSpec, lossy: bool, tv: &Standard) -> Result<Self, String> {
+        let (iw, ih) = tv.image_size();
         let mut cmd = command(&ffmpeg_path());
         cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
         match spec {
@@ -107,7 +113,7 @@ impl FrameStream {
                 cmd.arg("-i").arg(path);
             }
         }
-        let vf = format!("fps={FIELD_RATE},scale={INPUT_WIDTH}:{INPUT_HEIGHT}:flags=area");
+        let vf = format!("fps={},scale={iw}:{ih}:flags=area", field_rate_arg(tv));
         cmd.args(["-an", "-vf", &vf, "-pix_fmt", "rgb24", "-f", "rawvideo", "-"]);
         cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -125,13 +131,13 @@ impl FrameStream {
 
         let (tx, rx) = sync_channel::<RgbFrame>(2);
         let reader = std::thread::spawn(move || {
-            let size = INPUT_WIDTH * INPUT_HEIGHT * 3;
+            let size = iw * ih * 3;
             loop {
                 let mut buf = vec![0u8; size];
                 if stdout.read_exact(&mut buf).is_err() {
                     break;
                 }
-                let frame = RgbFrame::from_raw(INPUT_WIDTH, INPUT_HEIGHT, buf).unwrap();
+                let frame = RgbFrame::from_raw(iw, ih, buf).unwrap();
                 let r = if lossy {
                     match tx.try_send(frame) {
                         Err(TrySendError::Disconnected(_)) => Err(()),
@@ -283,12 +289,14 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    /// `audio` を指定するとその音声トラックを多重化する
-    pub fn start(path: &Path, audio: Option<AudioTrack<'_>>) -> Result<Self, String> {
+    /// `audio` を指定するとその音声トラックを多重化する。
+    /// 入力はテレビ方式 `tv` の画像サイズ・フィールド周波数の RGBA
+    pub fn start(path: &Path, audio: Option<AudioTrack<'_>>, tv: &Standard) -> Result<Self, String> {
+        let (ow, oh) = tv.image_size();
         let mut cmd = command(&ffmpeg_path());
         cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
-        cmd.args(["-f", "rawvideo", "-pix_fmt", "rgba", "-s", &format!("{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}")]);
-        cmd.args(["-framerate", FIELD_RATE, "-i", "-"]);
+        cmd.args(["-f", "rawvideo", "-pix_fmt", "rgba", "-s", &format!("{ow}x{oh}")]);
+        cmd.args(["-framerate", &field_rate_arg(tv), "-i", "-"]);
         if let Some(a) = audio {
             cmd.arg("-i").arg(a.path);
             let kbps = format!("{}k", a.kbps.clamp(8, 512));
@@ -297,8 +305,9 @@ impl Recorder {
                 cmd.args(["-ac", "1"]);
             }
         }
-        // 4:3 の正方画素 640x480 にして書き出す
-        cmd.args(["-vf", "scale=640:480:flags=bicubic,setsar=1"]);
+        // 4:3 の正方画素 (NTSC なら 640x480) にして書き出す
+        let dw = (oh * 4 / 3 + 1) & !1;
+        cmd.args(["-vf", &format!("scale={dw}:{oh}:flags=bicubic,setsar=1")]);
         cmd.args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p"]);
         cmd.arg(path);
         cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
@@ -368,8 +377,10 @@ mod tests {
         let latency = proc.latency();
         let has = process_audio(&input, &wav, latency, &AtomicBool::new(false), |b| proc.process(b)).unwrap();
         assert!(has);
-        let rec = Recorder::start(&out, Some(AudioTrack { path: &wav, kbps: 64, mono: true })).unwrap();
-        let frame = vec![128u8; OUTPUT_WIDTH * OUTPUT_HEIGHT * 4];
+        let tv = params.standard.spec();
+        let rec = Recorder::start(&out, Some(AudioTrack { path: &wav, kbps: 64, mono: true }), tv).unwrap();
+        let (ow, oh) = tv.image_size();
+        let frame = vec![128u8; ow * oh * 4];
         for _ in 0..120 {
             assert!(rec.push(&frame));
         }

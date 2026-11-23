@@ -1,23 +1,16 @@
 //! 全体のパイプライン: RGB → コンポジット → テープ → 受像機 → RGBA。
 
-use crate::camera::CameraSim;
+use crate::camera::{CameraInput, CameraSim};
 use crate::capture::{CaptureSim, CodecStats};
 use crate::decoder::Decoder;
 use crate::encoder::encode_field;
-use crate::frame::{Field, RgbFrame, RgbaFrame};
+use crate::frame::{Field, LinearFrame, RgbFrame, RgbaFrame, VideoFrame};
 use crate::osd::Osd;
 use crate::params::{OsdMode, Params};
 use crate::rf::RfSim;
 use crate::tape::TapeSim;
-use crate::timing::{ACTIVE_WIDTH, FRAME_LINES};
+use crate::timing::Standard;
 use std::time::{Duration, Instant};
-
-/// 入力画像はこの解像度に合わせると内部リサイズが不要になる
-pub const INPUT_WIDTH: usize = ACTIVE_WIDTH;
-pub const INPUT_HEIGHT: usize = FRAME_LINES;
-/// 出力画像の解像度 (表示時に 4:3 へ引き伸ばす。ピクセルアスペクト比 ≒ 0.849)
-pub const OUTPUT_WIDTH: usize = ACTIVE_WIDTH;
-pub const OUTPUT_HEIGHT: usize = FRAME_LINES;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StageTimings {
@@ -44,8 +37,8 @@ pub struct Pipeline {
     decoder: Decoder,
     capture: CaptureSim,
     osd: Osd,
-    /// OSD を焼き込んだ入力画像の作業領域
-    burned: Option<RgbFrame>,
+    /// エンコーダに渡す映像信号の作業領域 (カメラなしの入力、OSD の焼き込み)
+    video: VideoFrame,
     output: RgbaFrame,
     field_index: u64,
     pub timings: StageTimings,
@@ -53,17 +46,21 @@ pub struct Pipeline {
 
 impl Pipeline {
     pub fn new(params: Params) -> Self {
+        let std = params.standard.spec();
+        let (w, h) = std.image_size();
+        let mut camera = CameraSim::default();
+        camera.set_field_rate(std.field_rate);
         Self {
             params,
-            camera: CameraSim::default(),
-            field: Field::default(),
-            tape: TapeSim::default(),
+            camera,
+            field: Field::new(std),
+            tape: TapeSim::new(std),
             rf: RfSim::default(),
-            decoder: Decoder::default(),
+            decoder: Decoder::new(std),
             capture: CaptureSim::default(),
-            osd: Osd::default(),
-            burned: None,
-            output: RgbaFrame::new(OUTPUT_WIDTH, OUTPUT_HEIGHT),
+            osd: Osd::new(std),
+            video: VideoFrame::new(w, h),
+            output: RgbaFrame::new(w, h),
             field_index: 0,
             timings: StageTimings::default(),
         }
@@ -73,8 +70,31 @@ impl Pipeline {
         &self.params
     }
 
+    /// パラメータを差し替える。テレビ方式が変わったときは内部状態を作り直す
+    /// (画像サイズが変わるので、入力も [`Pipeline::input_size`] に合わせ直すこと)。
     pub fn set_params(&mut self, params: Params) {
-        self.params = params;
+        if params.standard != self.params.standard {
+            let index = self.field_index;
+            *self = Self::new(params);
+            self.field_index = index;
+        } else {
+            self.params = params;
+        }
+    }
+
+    /// 現在のテレビ方式
+    pub fn standard(&self) -> &'static Standard {
+        self.field.std
+    }
+
+    /// 入力画像の解像度 (幅, 高さ)。これに合わせておくと内部リサイズが不要になる
+    pub fn input_size(&self) -> (usize, usize) {
+        self.standard().image_size()
+    }
+
+    /// 出力画像の解像度 (幅, 高さ)。表示時に 4:3 へ引き伸ばす (NTSC のピクセルアスペクト比 ≒ 0.849)
+    pub fn output_size(&self) -> (usize, usize) {
+        self.standard().image_size()
     }
 
     /// 最終出力 (キャプチャが有効ならキャプチャ後の画像)
@@ -94,16 +114,35 @@ impl Pipeline {
         self.field_index
     }
 
-    /// 1 フィールドぶん処理する。入力 1 枚 = 1 フィールド (59.94 Hz 想定)。
+    /// 1 フィールドぶん処理する。入力 1 枚 = 1 フィールド (NTSC なら 59.94 Hz)。
     pub fn process_field(&mut self, input: &RgbFrame) -> &RgbaFrame {
+        let (w, h) = self.input_size();
         let resized;
-        let input = if input.width == INPUT_WIDTH && input.height == INPUT_HEIGHT {
+        let input = if input.width == w && input.height == h {
             input
         } else {
-            resized = input.resized(INPUT_WIDTH, INPUT_HEIGHT);
+            resized = input.resized(w, h);
             &resized
         };
+        self.run(CameraInput::Rgb(input))
+    }
 
+    /// シーンリニアな HDR 映像 (3DCG のレンダリング結果など) を 1 フィールドぶん処理する。
+    /// 白を超える光も撮像管カメラ (コメットテール・焼き付き・ニー) にそのまま届く。
+    /// カメラが無効なときは 0..1 で切ってガンマ 1/2.2 の 8 bit にしてから流す。
+    pub fn process_field_linear(&mut self, input: &LinearFrame) -> &RgbaFrame {
+        let (w, h) = self.input_size();
+        let resized;
+        let input = if input.width == w && input.height == h {
+            input
+        } else {
+            resized = input.resized(w, h);
+            &resized
+        };
+        self.run(CameraInput::Linear(input))
+    }
+
+    fn run(&mut self, src: CameraInput) -> &RgbaFrame {
         self.field.set_index(self.field_index);
         let p = &self.params;
         let osd = (p.osd.enabled && self.osd.update(&p.osd, self.field_index)).then_some(p.osd.mode);
@@ -111,20 +150,26 @@ impl Pipeline {
 
         let tc = Instant::now();
         // 撮像管カメラ (OSD の日付などはカメラの後段で焼き込まれる)
-        let input = if p.camera.enabled {
-            self.camera.process(input, &p.camera, p.seed, self.field_index)
+        let burn = osd == Some(OsdMode::Tape);
+        if p.camera.enabled {
+            let cam = self.camera.process(src, &p.camera, p.seed, self.field_index);
+            if burn {
+                self.video.data.copy_from_slice(&cam.data);
+            }
         } else {
-            input
+            match src {
+                CameraInput::Rgb(f) => self.video.copy_from_rgb(f),
+                CameraInput::Linear(f) => self.video.copy_from_linear(f),
+            }
+        }
+        if burn {
+            self.osd.burn_into(&mut self.video, opacity);
+        }
+        let input = match self.camera.output() {
+            Some(cam) if p.camera.enabled && !burn => cam,
+            _ => &self.video,
         };
         let t0 = Instant::now();
-        let input = if osd == Some(OsdMode::Tape) {
-            let buf = self.burned.get_or_insert_with(|| RgbFrame::new(INPUT_WIDTH, INPUT_HEIGHT));
-            buf.data.copy_from_slice(&input.data);
-            self.osd.burn_into(buf, opacity);
-            &*buf
-        } else {
-            input
-        };
         encode_field(input, &mut self.field, &p.encoder);
         let t1 = Instant::now();
         if p.tape.enabled {
@@ -141,7 +186,7 @@ impl Pipeline {
         self.decoder.decode_field(&self.field, &p.decoder, p.output.deinterlace, &mut self.output);
         let t4 = Instant::now();
         if p.capture.enabled {
-            self.capture.process(&self.output, &p.capture, p.seed, self.field_index);
+            self.capture.process(&self.output, &p.capture, p.seed, self.field_index, self.field.std.frame_rate());
         }
         let t5 = Instant::now();
 

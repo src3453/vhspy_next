@@ -46,12 +46,18 @@ pub struct TapeSim {
 
 impl Default for TapeSim {
     fn default() -> Self {
-        let n = FIELD_LINES * LINE_SAMPLES;
+        Self::new(&NTSC)
+    }
+}
+
+impl TapeSim {
+    pub fn new(s: &Standard) -> Self {
+        let n = s.field_lines * s.line_samples;
         Self {
             y_buf: vec![0.0; n],
             c_buf: vec![0.0; n],
-            rf_level: vec![1.0; FIELD_LINES],
-            offsets: vec![0.0; FIELD_LINES],
+            rf_level: vec![1.0; s.field_lines],
+            offsets: vec![0.0; s.field_lines],
             jitter_state: 0.0,
             switch_wander: 0.0,
             v_state: 0.0,
@@ -63,6 +69,9 @@ impl Default for TapeSim {
 
 impl TapeSim {
     pub fn process(&mut self, field: &mut Field, tp: &TapeParams, tr: &TransportParams, seed: u64) {
+        if self.y_buf.len() != field.data.len() {
+            *self = Self::new(field.std);
+        }
         self.compute_rf_level(field, tp, tr, seed);
         self.signal_path(field, tp, seed);
         self.dropouts(field, tp, seed);
@@ -73,7 +82,7 @@ impl TapeSim {
     fn compute_rf_level(&mut self, field: &Field, tp: &TapeParams, tr: &TransportParams, seed: u64) {
         let te = tr.tracking_error.clamp(0.0, 1.0);
         let band_h = 24.0;
-        let period = FIELD_LINES as f32 + 2.0 * band_h;
+        let period = field.std.field_lines as f32 + 2.0 * band_h;
         let center = (field.index as f32 * tr.tracking_speed).rem_euclid(period) - band_h;
         for (l, rf) in self.rf_level.iter_mut().enumerate() {
             let d = (l as f32 - center) / band_h;
@@ -87,11 +96,12 @@ impl TapeSim {
     /// しわ・ヘッド目詰まりのイベントを進め、RF レベルに反映する
     fn damage(&mut self, field: &Field, tp: &TapeParams, seed: u64) {
         let mut rng = Rng::derive(seed, field.index, 0, STREAM_DAMAGE);
-        let per_field = |per_min: f32| (per_min / 60.0 / FIELD_RATE).clamp(0.0, 1.0);
+        let s = field.std;
+        let per_field = |per_min: f32| (per_min / 60.0 / s.field_rate).clamp(0.0, 1.0);
 
         if self.crease.is_none() && rng.uniform() < per_field(tp.crease_rate) {
             let len = tp.crease_fields.max(1.0) * (0.5 + rng.uniform());
-            let center = rng.uniform() * FIELD_LINES as f32;
+            let center = rng.uniform() * s.field_lines as f32;
             // しわはテープを斜めに横切るので、再生中は画面上をゆっくり上下に流れる
             let drift = (rng.uniform() - 0.5) * 3.0;
             let height = 4.0 + rng.uniform() * 14.0;
@@ -128,33 +138,36 @@ impl TapeSim {
     }
 
     fn signal_path(&mut self, field: &Field, tp: &TapeParams, seed: u64) {
-        let rec_notch = Biquad::notch(FSC, 1.2);
-        let rec_lp = Cascade::butter_lowpass(4, tp.luma_bw_mhz * 1e6);
-        let pre = Biquad::high_shelf(tp.emphasis_mhz * 1e6, tp.emphasis_db);
-        let de = Biquad::high_shelf(tp.emphasis_mhz * 1e6, -tp.emphasis_db);
-        let noise_lp = Cascade::butter_lowpass(2, tp.luma_bw_mhz * 1e6);
-        let sharp = Biquad::high_shelf(2.0e6, tp.sharpness_db);
-        let c_bp = Cascade::new(&[Biquad::bandpass(FSC, 2.5)]);
-        let c_lp = Cascade::butter_lowpass(2, tp.chroma_bw_khz * 1e3);
-        let cn_lp = Cascade::butter_lowpass(2, tp.chroma_bw_khz * 1e3);
+        let s = field.std;
+        let (fs, ls) = (s.fs, s.line_samples);
+        let lv = s.ire;
+        let rec_notch = Biquad::notch_at(s.fsc, 1.2, fs);
+        let rec_lp = Cascade::butter_lowpass_at(4, tp.luma_bw_mhz * 1e6, fs);
+        let pre = Biquad::high_shelf_at(tp.emphasis_mhz * 1e6, tp.emphasis_db, fs);
+        let de = Biquad::high_shelf_at(tp.emphasis_mhz * 1e6, -tp.emphasis_db, fs);
+        let noise_lp = Cascade::butter_lowpass_at(2, tp.luma_bw_mhz * 1e6, fs);
+        let sharp = Biquad::high_shelf_at(2.0e6, tp.sharpness_db, fs);
+        let c_bp = Cascade::new(&[Biquad::bandpass_at(s.fsc, 2.5, fs)]);
+        let c_lp = Cascade::butter_lowpass_at(2, tp.chroma_bw_khz * 1e3, fs);
+        let cn_lp = Cascade::butter_lowpass_at(2, tp.chroma_bw_khz * 1e3, fs);
         let mag = MagneticTransfer::new(tp.magnetic_model, tp.saturation_ire);
 
         // 帯域制限した白色雑音の rms を 1 に戻す係数
-        let luma_noise_norm = (0.5 * FS / (tp.luma_bw_mhz * 1e6)).sqrt();
-        let chroma_noise_norm = (0.5 * FS / (tp.chroma_bw_khz * 1e3)).sqrt();
+        let luma_noise_norm = (0.5 * fs / (tp.luma_bw_mhz * 1e6)).sqrt();
+        let chroma_noise_norm = (0.5 * fs / (tp.chroma_bw_khz * 1e3)).sqrt();
         let phase_noise = tp.chroma_phase_noise_deg.to_radians();
         let delay = tp.chroma_delay_samples;
         let (parity, frame, index) = (field.parity, field.frame, field.index);
         let rf_level = &self.rf_level;
 
         self.y_buf
-            .par_chunks_mut(LINE_SAMPLES)
-            .zip(self.c_buf.par_chunks_mut(LINE_SAMPLES))
+            .par_chunks_mut(ls)
+            .zip(self.c_buf.par_chunks_mut(ls))
             .enumerate()
             .for_each(|(l, (yo, co))| {
                 let x = field.line(l);
                 let mut rng = Rng::derive(seed, index, l as u64, STREAM_PATH);
-                let base = line_phase_base(l, frame, parity);
+                let base = s.line_phase_base(l, frame, parity);
                 let noise_gain = 1.0 / rf_level[l];
                 let (mut rec_notch, mut rec_lp, mut pre, mut de, mut noise_lp, mut sharp) =
                     (rec_notch, rec_lp, pre, de, noise_lp, sharp);
@@ -166,12 +179,12 @@ impl TapeSim {
                 let mut beard_left = 0u32;
 
                 co.fill(0.0);
-                for n in 0..LINE_SAMPLES {
+                for n in 0..ls {
                     let xv = x[n];
 
                     // ---- 輝度 (FM) ----
                     let yr = rec_lp.process(rec_notch.process(xv));
-                    let pe = pre.process(yr).clamp(ire::SYNC - 20.0, tp.white_clip_ire);
+                    let pe = pre.process(yr).clamp(lv.sync - 20.0, tp.white_clip_ire);
                     if beard_left == 0
                         && pe > tp.bearding_threshold_ire
                         && rng.uniform() < 0.25 * tp.bearding_strength
@@ -203,7 +216,7 @@ impl TapeSim {
                     bq += n_q.process(rng.normal()) * cn;
                     let (ri, rq) = (bi * cd - bq * sd, bi * sd + bq * cd);
                     let out_n = n as i32 + delay;
-                    if (0..LINE_SAMPLES as i32).contains(&out_n) {
+                    if (0..ls as i32).contains(&out_n) {
                         let m = out_n as usize;
                         let km = (m + base) & 3;
                         co[m] = ri * COS4[km] + rq * SIN4[km];
@@ -216,20 +229,21 @@ impl TapeSim {
         if tp.dropout_rate <= 0.0 {
             return;
         }
-        for l in 0..FIELD_LINES {
+        let ls = field.std.line_samples;
+        for l in 0..field.std.field_lines {
             let mut rng = Rng::derive(seed, field.index, l as u64, STREAM_DROPOUT);
             let rf = self.rf_level[l];
             let prob = (tp.dropout_rate * (1.0 + 30.0 * (1.0 - rf))).min(1.0);
             let mut events = 0;
             while events < 3 && rng.uniform() < prob {
                 events += 1;
-                let start = (rng.uniform() * LINE_SAMPLES as f32) as usize;
+                let start = (rng.uniform() * ls as f32) as usize;
                 let len = rng.exponential(tp.dropout_length * (1.0 + 2.0 * (1.0 - rf))) as usize + 2;
-                let end = (start + len).min(LINE_SAMPLES);
+                let end = (start + len).min(ls);
                 for n in start..end {
-                    let i = l * LINE_SAMPLES + n;
+                    let i = l * ls + n;
                     if tp.dropout_compensation && l > 0 {
-                        self.y_buf[i] = self.y_buf[i - LINE_SAMPLES];
+                        self.y_buf[i] = self.y_buf[i - ls];
                     } else {
                         // RF が途切れると FM 復調器はリミッタ雑音を出す (白っぽいスパークル)
                         self.y_buf[i] = 75.0 + 30.0 * rng.normal();
@@ -242,23 +256,25 @@ impl TapeSim {
 
     fn transport(&mut self, field: &mut Field, tr: &TransportParams, seed: u64) {
         let mut rng = Rng::derive(seed, field.index, 0, STREAM_TRANSPORT);
+        let s = field.std;
+        let (fl, ls, lv) = (s.field_lines, s.line_samples, s.ire);
         let rho = tr.jitter_correlation.clamp(0.0, 0.999);
         let innov = tr.jitter_samples * (1.0 - rho * rho).sqrt();
         // ヘッド切替位置はフィールドごとに少しふらつく
         self.switch_wander = 0.8 * self.switch_wander + rng.normal() * 0.6;
-        let hs_lines = tr.head_switch_lines.min(FIELD_LINES) as f32 + self.switch_wander.max(-(tr.head_switch_lines as f32));
-        let hs_start = (FIELD_LINES as f32 - hs_lines.max(0.0)).round() as usize;
+        let hs_lines = tr.head_switch_lines.min(fl) as f32 + self.switch_wander.max(-(tr.head_switch_lines as f32));
+        let hs_start = (fl as f32 - hs_lines.max(0.0)).round() as usize;
         // 垂直揺れ: フィールド単位でライン全体が上下にずれる (整数ライン)
         self.v_state = 0.7 * self.v_state + rng.normal() * tr.vertical_jitter * 0.714;
         let v_shift = self.v_state.round() as isize;
 
-        for l in 0..FIELD_LINES {
+        for l in 0..fl {
             self.jitter_state = rho * self.jitter_state + innov * rng.normal();
-            let t = (field.index as f32 / FIELD_RATE) + l as f32 * LINE_TIME;
+            let t = (field.index as f32 / s.field_rate) + l as f32 * s.line_time();
             let mut off = self.jitter_state + tr.wow_samples * (2.0 * std::f32::consts::PI * tr.wow_hz * t).sin();
             off += tr.skew_samples * (-(l as f32) / 10.0).exp();
             if l >= hs_start {
-                let f = (l - hs_start + 1) as f32 / (FIELD_LINES - hs_start).max(1) as f32;
+                let f = (l - hs_start + 1) as f32 / (fl - hs_start).max(1) as f32;
                 off += tr.head_switch_offset * f * f;
             }
             let rf = self.rf_level[l];
@@ -270,35 +286,36 @@ impl TapeSim {
         let (y_buf, c_buf) = (&self.y_buf, &self.c_buf);
         let hs_noise = tr.head_switch_noise;
         let index = field.index;
-        field.data.par_chunks_mut(LINE_SAMPLES).enumerate().for_each(|(l, out)| {
-            let mut comp = [0f32; LINE_SAMPLES];
+        field.data.par_chunks_mut(ls).enumerate().for_each(|(l, out)| {
+            let mut comp_buf = [0f32; MAX_LINE_SAMPLES];
+            let comp = &mut comp_buf[..ls];
             let src = l as isize - v_shift;
-            if (0..FIELD_LINES as isize).contains(&src) {
-                let base = src as usize * LINE_SAMPLES;
-                for n in 0..LINE_SAMPLES {
+            if (0..fl as isize).contains(&src) {
+                let base = src as usize * ls;
+                for n in 0..ls {
                     comp[n] = y_buf[base + n] + c_buf[base + n];
                 }
             } else {
                 // 垂直帰線区間が見えている: 同期だけの黒いライン
                 for (n, v) in comp.iter_mut().enumerate() {
-                    *v = if n < SYNC_END {
-                        ire::SYNC
-                    } else if n >= ACTIVE_START {
-                        ire::BLACK
+                    *v = if n < s.sync_end {
+                        lv.sync
+                    } else if n >= s.active_start {
+                        lv.black
                     } else {
-                        ire::BLANK
+                        lv.blank
                     };
                 }
             }
-            if l == hs_start && hs_noise > 0.0 && hs_start < FIELD_LINES {
+            if l == hs_start && hs_noise > 0.0 && hs_start < fl {
                 // ヘッド切替の瞬間: ライン途中から乱れる
                 let mut rng = Rng::derive(seed, index, l as u64, STREAM_TRANSPORT + 1);
-                let from = (rng.uniform() * LINE_SAMPLES as f32 * 0.6) as usize;
+                let from = (rng.uniform() * ls as f32 * 0.6) as usize;
                 for v in &mut comp[from..] {
                     *v += rng.normal() * 25.0 * hs_noise;
                 }
             }
-            fractional_shift(&comp, out, offsets[l], ire::BLANK);
+            fractional_shift(comp, out, offsets[l], lv.blank);
         });
     }
 }

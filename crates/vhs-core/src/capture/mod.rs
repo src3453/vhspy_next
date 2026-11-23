@@ -75,7 +75,8 @@ impl CaptureSim {
         self.codec.stats
     }
 
-    pub fn process(&mut self, input: &RgbaFrame, p: &CaptureParams, seed: u64, index: u64) -> &RgbaFrame {
+    /// `frame_rate`: 映像のフレーム周波数 [Hz] (圧縮の符号量の割り当てに使う)
+    pub fn process(&mut self, input: &RgbaFrame, p: &CaptureParams, seed: u64, index: u64, frame_rate: f32) -> &RgbaFrame {
         let mut rng = Rng::derive(seed, index, 0, STREAM_CAPTURE);
         let drop = rng.uniform() < p.frame_drop_rate.clamp(0.0, 1.0);
         if drop && self.out.as_ref().is_some_and(|o| o.width == input.width && o.height == input.height) {
@@ -94,7 +95,7 @@ impl CaptureSim {
         downsample(&self.full_cr, &mut self.planes[2], cw, ch, fx, fy);
 
         if p.codec {
-            self.codec.encode(&mut self.planes, p);
+            self.codec.encode(&mut self.planes, p, frame_rate);
         } else {
             self.codec.reset();
         }

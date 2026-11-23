@@ -10,13 +10,9 @@ use crate::filter::Cascade;
 use crate::frame::Field;
 use crate::params::RfParams;
 use crate::rng::Rng;
-use crate::timing::*;
 use rayon::prelude::*;
 
 const STREAM_RF: u64 = 11;
-/// 1 フィールドの総ライン数 (帰線区間込み)。位相を連続させるのに使う
-const LINES_PER_FIELD: f64 = 262.5;
-const SOUND_BEAT_HZ: f64 = 4.5e6 - FSC as f64;
 
 #[derive(Default)]
 pub struct RfSim {
@@ -30,12 +26,17 @@ impl RfSim {
         self.src.clear();
         self.src.extend_from_slice(&field.data);
         let src = &self.src;
+        let s = field.std;
+        let (fs, ls) = (s.fs, s.line_samples);
+        // 位相をフィールド・ラインをまたいで連続させるのに総ライン数 (帰線区間込み) を使う
+        let lines_per_field = s.total_lines_per_field;
+        let sound_beat_hz = s.sound_carrier_hz - s.fsc as f64;
 
-        let delay = (p.ghost_delay_us.max(0.0) * 1e-6 * FS).max(0.0);
+        let delay = (p.ghost_delay_us.max(0.0) * 1e-6 * fs).max(0.0);
         let (d0, dfrac) = (delay.floor() as usize, delay.fract());
         let gain = p.ghost_gain;
-        let snow_lp = Cascade::butter_lowpass(2, 4.2e6);
-        let snow_norm = (0.5 * FS / 4.2e6).sqrt() * p.snow_ire;
+        let snow_lp = Cascade::butter_lowpass_at(2, s.video_bw_hz, fs);
+        let snow_norm = (0.5 * fs / s.video_bw_hz).sqrt() * p.snow_ire;
         let index = field.index;
 
         // 擬似音声: フィールドごとに変わる (声や音楽の抑揚の代わり)
@@ -43,19 +44,19 @@ impl RfSim {
         self.audio_state = 0.85 * self.audio_state + 0.5 * frng.normal();
         let audio = self.audio_state;
 
-        let interf_w = 2.0 * std::f64::consts::PI * p.interference_mhz as f64 * 1e6 / FS as f64;
-        let beat_w = 2.0 * std::f64::consts::PI * SOUND_BEAT_HZ / FS as f64;
+        let interf_w = 2.0 * std::f64::consts::PI * p.interference_mhz as f64 * 1e6 / fs as f64;
+        let beat_w = 2.0 * std::f64::consts::PI * sound_beat_hz / fs as f64;
 
-        field.data.par_chunks_mut(LINE_SAMPLES).enumerate().for_each(|(l, out)| {
+        field.data.par_chunks_mut(ls).enumerate().for_each(|(l, out)| {
             let mut rng = Rng::derive(seed, index, l as u64, STREAM_RF);
             let mut lp = snow_lp;
             // 通算サンプル位置 (位相をフィールド・ラインをまたいで連続させる)
-            let t0 = ((index as f64 * LINES_PER_FIELD) + l as f64) * LINE_SAMPLES as f64;
+            let t0 = ((index as f64 * lines_per_field) + l as f64) * ls as f64;
             // 音声ビートの位相は音声で FM 変調されるので、ラインごとに揺れる
             let beat_phase = 2.5 * audio as f64 + 0.3 * rng.normal() as f64;
-            let base = l * LINE_SAMPLES;
+            let base = l * ls;
 
-            for n in 0..LINE_SAMPLES {
+            for n in 0..ls {
                 let i = base + n;
                 let mut v = src[i];
                 if gain != 0.0 && i > d0 {

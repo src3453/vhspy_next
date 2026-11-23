@@ -28,7 +28,6 @@
 //!
 //! `\<` `\{` `\\` で記号そのものを書ける。解釈できないタグや置換はそのまま表示する。
 
-use crate::timing::FIELD_RATE;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rgba {
@@ -141,8 +140,9 @@ pub struct Context {
 }
 
 impl Context {
-    pub fn new(start_datetime: &str, field_index: u64) -> Self {
-        let elapsed = field_index as f64 / FIELD_RATE as f64;
+    /// `field_rate`: フィールド周波数 [Hz]
+    pub fn new(start_datetime: &str, field_index: u64, field_rate: f32) -> Self {
+        let elapsed = field_index as f64 / field_rate as f64;
         let start = parse_datetime(start_datetime).unwrap_or(946_684_800); // 2000-01-01
         Self { elapsed, now: start + elapsed as i64 }
     }
@@ -427,7 +427,7 @@ mod tests {
 
     #[test]
     fn tags_and_layout() {
-        let ctx = Context::new("2000-01-01", 0);
+        let ctx = Context::new("2000-01-01", 0, crate::timing::NTSC.field_rate);
         let g = layout("<pos=100,50><color=red>AB</color>C\n<size=3>D</size>\\<x<bogus>", 2, &ctx, &Face::Builtin);
         let s: String = g.iter().map(|g| g.ch).collect();
         assert_eq!(s, "ABCD<x<bogus>");
@@ -443,7 +443,7 @@ mod tests {
 
     #[test]
     fn align_right() {
-        let ctx = Context::new("2000-01-01", 0);
+        let ctx = Context::new("2000-01-01", 0, crate::timing::NTSC.field_rate);
         let g = layout("<pos=700,0><align=right>AB", 2, &ctx, &Face::Builtin);
         // 幅 = 2 文字 * 24 - 字間 4 = 44
         assert_eq!(g[0].x, 700 - 44);

@@ -1,6 +1,6 @@
 //! 画像バッファとコンポジット信号のフィールドバッファ。
 
-use crate::timing::{FIELD_LINES, LINE_SAMPLES};
+use crate::timing::{NTSC, Standard};
 use rayon::prelude::*;
 
 /// RGB24 (R, G, B の順) の画像
@@ -51,6 +51,165 @@ impl RgbFrame {
     }
 }
 
+/// シーンリニアな RGB 画像 (HDR)。3DCG のレンダラなどから直接渡す。
+///
+/// - 原色は Rec.709 / sRGB、値は光量に比例する (ガンマなし)。
+/// - 1.0 が露出 0 EV でのカメラの白 (撮像管の白レベル電流) にあたる。1.0 を超える値も
+///   そのまま扱い、ビーム電流の上限を超えた分がコメットテールやブルーミングになる。
+/// - 負の値と NaN は 0 として扱う。
+#[derive(Clone, Debug)]
+pub struct LinearFrame {
+    pub width: usize,
+    pub height: usize,
+    /// R, G, B の順に並んだ f32
+    pub data: Vec<f32>,
+}
+
+impl LinearFrame {
+    pub fn new(width: usize, height: usize) -> Self {
+        Self { width, height, data: vec![0.0; width * height * 3] }
+    }
+
+    pub fn from_raw(width: usize, height: usize, data: Vec<f32>) -> Option<Self> {
+        (data.len() == width * height * 3).then_some(Self { width, height, data })
+    }
+
+    /// 8 bit の画像を表示ガンマ 2.2 として線形化する (撮像管カメラが 8 bit 入力に使う変換と同じ)
+    pub fn from_rgb(f: &RgbFrame) -> Self {
+        let lut: [f32; 256] = std::array::from_fn(|i| (i as f32 / 255.0).powf(2.2));
+        Self { width: f.width, height: f.height, data: f.data.iter().map(|&v| lut[v as usize]).collect() }
+    }
+
+    /// 表示用の 8 bit 画像にする (0..1 で切り、ガンマ 1/2.2)
+    pub fn to_rgb(&self) -> RgbFrame {
+        let data = self
+            .data
+            .par_iter()
+            .map(|&v| {
+                let v = if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) };
+                (v.powf(1.0 / 2.2) * 255.0 + 0.5) as u8
+            })
+            .collect();
+        RgbFrame { width: self.width, height: self.height, data }
+    }
+
+    /// 光量を保つリサイズ (三角フィルタ。縮小時はフィルタ幅を広げて面積平均に近づける)。
+    /// 小さな光源を縮小しても、明るさが失われずに面積に応じて薄まる。
+    pub fn resized(&self, width: usize, height: usize) -> LinearFrame {
+        if width == self.width && height == self.height {
+            return self.clone();
+        }
+        let horiz = resample_weights(self.width, width);
+        let vert = resample_weights(self.height, height);
+        let sw = self.width;
+        // 横方向
+        let mut tmp = vec![0f32; width * self.height * 3];
+        tmp.par_chunks_mut(width * 3).enumerate().for_each(|(y, row)| {
+            let src = &self.data[y * sw * 3..(y + 1) * sw * 3];
+            for (x, (start, ws)) in horiz.iter().enumerate() {
+                let mut acc = [0f32; 3];
+                for (j, wv) in ws.iter().enumerate() {
+                    let px = &src[(start + j) * 3..][..3];
+                    for c in 0..3 {
+                        acc[c] += sanitize(px[c]) * wv;
+                    }
+                }
+                row[x * 3..x * 3 + 3].copy_from_slice(&acc);
+            }
+        });
+        // 縦方向
+        let mut out = LinearFrame::new(width, height);
+        out.data.par_chunks_mut(width * 3).enumerate().for_each(|(y, row)| {
+            let (start, ws) = &vert[y];
+            for (j, wv) in ws.iter().enumerate() {
+                let src = &tmp[(start + j) * width * 3..][..width * 3];
+                for (o, s) in row.iter_mut().zip(src) {
+                    *o += s * wv;
+                }
+            }
+        });
+        out
+    }
+}
+
+#[inline]
+pub(crate) fn sanitize(v: f32) -> f32 {
+    if v > 0.0 { v } else { 0.0 } // NaN もここで 0 になる
+}
+
+/// 出力画素ごとの (最初の入力画素, 重み列)。重みの和は 1。
+fn resample_weights(src: usize, dst: usize) -> Vec<(usize, Vec<f32>)> {
+    let scale = src as f32 / dst as f32;
+    let support = scale.max(1.0);
+    (0..dst)
+        .map(|i| {
+            let center = (i as f32 + 0.5) * scale;
+            let lo = ((center - support).floor().max(0.0)) as usize;
+            let hi = ((center + support).ceil() as usize).min(src);
+            let mut ws: Vec<f32> =
+                (lo..hi).map(|j| (1.0 - ((j as f32 + 0.5 - center) / support).abs()).max(0.0)).collect();
+            let sum: f32 = ws.iter().sum();
+            if sum > 0.0 {
+                ws.iter_mut().for_each(|w| *w /= sum);
+            } else {
+                // 端の念のため: 最も近い画素
+                let j = (center as usize).min(src - 1);
+                return (j, vec![1.0]);
+            }
+            (lo, ws)
+        })
+        .collect()
+}
+
+/// ガンマ補正済みの映像信号 (エンコーダの入力)。
+///
+/// R, G, B の f32 で 0.0 = 黒 (7.5 IRE)、1.0 = 白 (100 IRE)。カメラのニー・ホワイトクリップを
+/// 通った 1.0 を超える値はスーパーホワイトとしてそのままコンポジット信号になる。
+#[derive(Clone, Debug)]
+pub struct VideoFrame {
+    pub width: usize,
+    pub height: usize,
+    pub data: Vec<f32>,
+}
+
+impl VideoFrame {
+    pub fn new(width: usize, height: usize) -> Self {
+        Self { width, height, data: vec![0.0; width * height * 3] }
+    }
+
+    fn ensure(&mut self, width: usize, height: usize) {
+        if self.width != width || self.height != height {
+            *self = Self::new(width, height);
+        }
+    }
+
+    /// 8 bit の画像 (0..255 → 0..1) を写す
+    pub fn copy_from_rgb(&mut self, f: &RgbFrame) {
+        self.ensure(f.width, f.height);
+        self.data.par_chunks_mut(f.width * 3).zip(f.data.par_chunks(f.width * 3)).for_each(|(o, s)| {
+            for (o, &s) in o.iter_mut().zip(s) {
+                *o = s as f32 * (1.0 / 255.0);
+            }
+        });
+    }
+
+    /// シーンリニアな画像を 0..1 で切ってガンマ 1/2.2 で写す (カメラを通さないとき)
+    pub fn copy_from_linear(&mut self, f: &LinearFrame) {
+        self.ensure(f.width, f.height);
+        self.data.par_chunks_mut(f.width * 3).zip(f.data.par_chunks(f.width * 3)).for_each(|(o, s)| {
+            for (o, &s) in o.iter_mut().zip(s) {
+                *o = sanitize(s).min(1.0).powf(1.0 / 2.2);
+            }
+        });
+    }
+
+    pub fn from_rgb(f: &RgbFrame) -> Self {
+        let mut v = Self::new(f.width, f.height);
+        v.copy_from_rgb(f);
+        v
+    }
+}
+
 /// RGBA32 の画像 (Canvas の ImageData にそのまま渡せる形式)
 #[derive(Clone, Debug)]
 pub struct RgbaFrame {
@@ -69,9 +228,11 @@ impl RgbaFrame {
     }
 }
 
-/// 1 フィールド分のコンポジット信号 (FIELD_LINES × LINE_SAMPLES, 単位 IRE)
+/// 1 フィールド分のコンポジット信号 (field_lines × line_samples, 単位 IRE)
 #[derive(Clone, Debug)]
 pub struct Field {
+    /// この信号のテレビ方式
+    pub std: &'static Standard,
     pub data: Vec<f32>,
     /// 0 = 第 1 (偶数ライン) フィールド, 1 = 第 2 (奇数ライン) フィールド
     pub parity: u8,
@@ -83,11 +244,15 @@ pub struct Field {
 
 impl Default for Field {
     fn default() -> Self {
-        Self { data: vec![0.0; FIELD_LINES * LINE_SAMPLES], parity: 0, frame: 0, index: 0 }
+        Self::new(&NTSC)
     }
 }
 
 impl Field {
+    pub fn new(std: &'static Standard) -> Self {
+        Self { std, data: vec![0.0; std.field_lines * std.line_samples], parity: 0, frame: 0, index: 0 }
+    }
+
     pub fn set_index(&mut self, index: u64) {
         self.index = index;
         self.parity = (index & 1) as u8;
@@ -95,10 +260,10 @@ impl Field {
     }
 
     pub fn line(&self, l: usize) -> &[f32] {
-        &self.data[l * LINE_SAMPLES..(l + 1) * LINE_SAMPLES]
+        &self.data[l * self.std.line_samples..(l + 1) * self.std.line_samples]
     }
 
     pub fn line_mut(&mut self, l: usize) -> &mut [f32] {
-        &mut self.data[l * LINE_SAMPLES..(l + 1) * LINE_SAMPLES]
+        &mut self.data[l * self.std.line_samples..(l + 1) * self.std.line_samples]
     }
 }

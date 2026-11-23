@@ -3,7 +3,6 @@
 //! アナログ回路の因果的な振る舞い (群遅延・リンギング) を再現するため、
 //! ゼロ位相フィルタではなく素直な因果 IIR を使う。
 
-use crate::timing::FS;
 use std::f32::consts::PI;
 
 #[derive(Clone, Copy, Debug)]
@@ -36,31 +35,14 @@ impl Biquad {
         (w.cos(), w.sin())
     }
 
-    pub fn lowpass(fc: f32, q: f32) -> Self {
-        Self::lowpass_at(fc, q, FS)
-    }
-
-    pub fn highpass(fc: f32, q: f32) -> Self {
-        Self::highpass_at(fc, q, FS)
-    }
-
-    /// ピークゲイン 0 dB のバンドパス
-    pub fn bandpass(fc: f32, q: f32) -> Self {
-        Self::bandpass_at(fc, q, FS)
-    }
-
-    pub fn notch(fc: f32, q: f32) -> Self {
-        let (c, s) = Self::w0(fc, FS);
+    /// ノッチ (帯域除去)
+    pub fn notch_at(fc: f32, q: f32, fs: f32) -> Self {
+        let (c, s) = Self::w0(fc, fs);
         let alpha = s / (2.0 * q);
         Self::norm(1.0, -2.0 * c, 1.0, 1.0 + alpha, -2.0 * c, 1.0 - alpha)
     }
 
-    /// 高域シェルフ (スロープ S = 1)。エンファシス / ピーキングに使う。
-    pub fn high_shelf(fc: f32, gain_db: f32) -> Self {
-        Self::high_shelf_at(fc, gain_db, FS)
-    }
-
-    // ---- 任意のサンプリング周波数版 (音声処理用) ----
+    // ---- サンプリング周波数 fs を指定する (映像は Standard::fs、音声はその fs) ----
 
     pub fn lowpass_at(fc: f32, q: f32, fs: f32) -> Self {
         let (c, s) = Self::w0(fc, fs);
@@ -158,20 +140,12 @@ impl Cascade {
     }
 
     /// Butterworth ローパス (偶数次、最大 8 次)
-    pub fn butter_lowpass(order: usize, fc: f32) -> Self {
-        Self::butter_lowpass_at(order, fc, FS)
-    }
-
-    /// Butterworth ハイパス (偶数次、最大 8 次)
-    pub fn butter_highpass(order: usize, fc: f32) -> Self {
-        Self::butter_highpass_at(order, fc, FS)
-    }
-
     pub fn butter_lowpass_at(order: usize, fc: f32, fs: f32) -> Self {
         let v: Vec<Biquad> = Self::butter_qs(order).map(|q| Biquad::lowpass_at(fc, q, fs)).collect();
         Self::new(&v)
     }
 
+    /// Butterworth ハイパス (偶数次、最大 8 次)
     pub fn butter_highpass_at(order: usize, fc: f32, fs: f32) -> Self {
         let v: Vec<Biquad> = Self::butter_qs(order).map(|q| Biquad::highpass_at(fc, q, fs)).collect();
         Self::new(&v)
@@ -220,6 +194,8 @@ pub fn fractional_shift(src: &[f32], dst: &mut [f32], shift: f32, fill: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::timing::NTSC;
+    const FS: f32 = NTSC.fs;
 
     fn gain_at(mut f: Cascade, freq: f32) -> f32 {
         let n = 20000;
@@ -236,7 +212,7 @@ mod tests {
 
     #[test]
     fn butterworth_lowpass_response() {
-        let f = Cascade::butter_lowpass(4, 1.0e6);
+        let f = Cascade::butter_lowpass_at(4, 1.0e6, FS);
         assert!((gain_at(f, 50e3) - 1.0).abs() < 0.02);
         assert!((gain_at(f, 1.0e6) - 0.7071).abs() < 0.03);
         assert!(gain_at(f, 4.0e6) < 0.01);
@@ -244,7 +220,7 @@ mod tests {
 
     #[test]
     fn shelf_inverse_is_flat() {
-        let f = Cascade::new(&[Biquad::high_shelf(0.5e6, 10.0), Biquad::high_shelf(0.5e6, -10.0)]);
+        let f = Cascade::new(&[Biquad::high_shelf_at(0.5e6, 10.0, FS), Biquad::high_shelf_at(0.5e6, -10.0, FS)]);
         for fr in [10e3, 0.5e6, 2e6, 5e6] {
             assert!((gain_at(f, fr) - 1.0).abs() < 0.02, "{fr}");
         }

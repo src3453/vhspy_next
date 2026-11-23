@@ -14,7 +14,6 @@
 use crate::filter::{Biquad, Cascade};
 use crate::params::{AudioMode, AudioParams, Params};
 use crate::rng::Rng;
-use crate::timing::FIELD_RATE;
 use std::f32::consts::TAU;
 
 const DELAY_LEN: usize = 1 << 15;
@@ -48,6 +47,8 @@ struct Channel {
 pub struct AudioProcessor {
     p: AudioParams,
     fs: f32,
+    /// 映像のフィールド周波数 [Hz] (Hi-Fi のヘッド切替の周期)
+    field_rate: f32,
     rng: Rng,
     ch: [Channel; 2],
     t: u64,
@@ -74,6 +75,7 @@ impl AudioProcessor {
     pub fn new(params: &Params, sample_rate: u32) -> Self {
         let p = params.audio.clone();
         let fs = sample_rate as f32;
+        let field_rate = params.standard.spec().field_rate;
         let linear = p.mode == AudioMode::Linear;
         let band = if linear {
             let lo = Cascade::butter_highpass_at(2, p.low_cut_hz.max(5.0), fs);
@@ -118,6 +120,7 @@ impl AudioProcessor {
 
         Self {
             fs,
+            field_rate,
             rng,
             ch: [chan.clone(), chan],
             t: 0,
@@ -128,7 +131,7 @@ impl AudioProcessor {
             flutter_phase,
             wow_phase: 0.0,
             buzz,
-            switch_left: fs / FIELD_RATE,
+            switch_left: fs / field_rate,
             glitch_left: 0,
             glitch_sign: 1.0,
             dropout: (0, 1, 0.0),
@@ -163,7 +166,7 @@ impl AudioProcessor {
         let levels = 2f32.powi(p.bits.clamp(2, 24) as i32 - 1);
         let quantize = p.bits < 24;
         let dropout_prob = p.dropout_rate.max(0.0) / fs;
-        let field_period = fs / FIELD_RATE;
+        let field_period = fs / self.field_rate;
         let glitch_len = (0.0006 * fs) as u32;
 
         for frame in buf.chunks_exact_mut(2) {

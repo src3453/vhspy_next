@@ -9,10 +9,6 @@
 
 use super::font::{GLYPH_H, GLYPH_W, glyph};
 use super::markup::Metrics;
-use crate::timing::{ACTIVE_WIDTH, FRAME_LINES};
-
-/// 画面上の正方形 1 つが何サンプル幅になるか (754 サンプル = 4:3 の 480 ライン相当の幅)
-pub const SAMPLE_ASPECT: f32 = ACTIVE_WIDTH as f32 / (FRAME_LINES as f32 * 4.0 / 3.0);
 
 /// 外部フォントの em の高さ [ライン / サイズ]。大文字の高さが内蔵フォント (14 ライン/サイズ) と同程度になる
 const EM_LINES_PER_SIZE: f32 = 18.0;
@@ -55,7 +51,8 @@ impl Mask {
 
 pub enum Face {
     Builtin,
-    External { font: Box<fontdue::Font>, dots: u32, ascent: f32, descent: f32 },
+    /// `aspect`: 画面上の正方形 1 つが何サンプル幅になるか ([`Standard::sample_aspect`](crate::timing::Standard::sample_aspect))
+    External { font: Box<fontdue::Font>, dots: u32, ascent: f32, descent: f32, aspect: f32 },
 }
 
 impl Default for Face {
@@ -65,7 +62,7 @@ impl Default for Face {
 }
 
 /// フォントファイルを読む。`index` は .ttc 内のフォント番号。
-pub fn load(path: &str, index: u32, dots: u32) -> Result<Face, String> {
+pub fn load(path: &str, index: u32, dots: u32, aspect: f32) -> Result<Face, String> {
     let data = std::fs::read(path).map_err(|e| format!("フォントを読めません: {e}"))?;
     let settings = fontdue::FontSettings { collection_index: index, scale: 64.0, ..Default::default() };
     let font = fontdue::Font::from_bytes(data, settings).map_err(|e| format!("フォントを解釈できません: {e}"))?;
@@ -74,26 +71,26 @@ pub fn load(path: &str, index: u32, dots: u32) -> Result<Face, String> {
         .map(|m| (m.ascent, -m.descent))
         .filter(|(a, d)| *a > 0.0 && *d >= 0.0)
         .unwrap_or((0.8, 0.2));
-    Ok(Face::External { font: Box::new(font), dots, ascent, descent })
+    Ok(Face::External { font: Box::new(font), dots, ascent, descent, aspect })
 }
 
 /// フォント名 (分かれば) を返す。GUI での確認用。
 pub fn describe(path: &str, index: u32) -> Result<String, String> {
-    match load(path, index, 0)? {
+    match load(path, index, 0, 1.0)? {
         Face::External { font, .. } => Ok(font.name().unwrap_or("(名前なし)").to_string()),
         Face::Builtin => unreachable!(),
     }
 }
 
 /// 外部フォントのラスタ 1 画素の大きさ [サンプル, ライン] とラスタライズ時の px
-fn raster_unit(size: u32, dots: u32) -> (f32, f32, f32) {
+fn raster_unit(size: u32, dots: u32, aspect: f32) -> (f32, f32, f32) {
     let em = EM_LINES_PER_SIZE * size as f32;
     if dots == 0 {
         // 横 1 サンプル = 1 画素で描き、縦は後で縮める
-        (1.0, 1.0 / SAMPLE_ASPECT, em * SAMPLE_ASPECT)
+        (1.0, 1.0 / aspect, em * aspect)
     } else {
         let uh = em / dots as f32;
-        (uh * SAMPLE_ASPECT, uh, dots as f32)
+        (uh * aspect, uh, dots as f32)
     }
 }
 
@@ -113,8 +110,8 @@ impl Face {
     /// 文字のマスクを作る (セル左上が原点)
     pub fn mask(&self, ch: char, size: u32) -> Mask {
         match self {
-            Face::External { font, dots, .. } if self.has(ch) => {
-                let (uw, uh, px) = raster_unit(size, *dots);
+            Face::External { font, dots, aspect, .. } if self.has(ch) => {
+                let (uw, uh, px) = raster_unit(size, *dots, *aspect);
                 let (m, bytes) = font.rasterize(ch, px);
                 let raster: Vec<f32> = if *dots > 0 {
                     bytes.iter().map(|&b| if b >= 128 { 1.0 } else { 0.0 }).collect()
@@ -144,8 +141,8 @@ impl Face {
 impl Metrics for Face {
     fn advance(&self, ch: char, size: u32) -> i32 {
         match self {
-            Face::External { font, dots, .. } if self.has(ch) => {
-                let (uw, _, px) = raster_unit(size, *dots);
+            Face::External { font, dots, aspect, .. } if self.has(ch) => {
+                let (uw, _, px) = raster_unit(size, *dots, *aspect);
                 (font.metrics(ch, px).advance_width * uw).round() as i32
             }
             _ => builtin_advance(size),
