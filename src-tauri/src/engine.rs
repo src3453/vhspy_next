@@ -1,6 +1,6 @@
 //! 処理スレッド。入力の取得 → パイプライン → プレビュー/録画への出力を回す。
 
-use crate::ffmpeg::{FrameStream, Recorder, StreamSpec, probe_duration};
+use crate::ffmpeg::{AUDIO_RATE, AudioTrack, FrameStream, Recorder, StreamSpec, probe_duration, process_audio};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -8,6 +8,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
+use vhs_core::audio::AudioProcessor;
 use vhs_core::{INPUT_HEIGHT, INPUT_WIDTH, Params, Pipeline, RgbFrame};
 
 const FIELD_PERIOD: Duration = Duration::from_nanos(16_683_350); // 1001/60000 s
@@ -24,7 +25,12 @@ pub struct Stats {
     pub fields_per_sec: f32,
     pub encode_ms: f32,
     pub tape_ms: f32,
+    pub rf_ms: f32,
     pub decode_ms: f32,
+    pub capture_ms: f32,
+    /// キャプチャ圧縮の量子化スケールと直前フレームの符号量 [kbit]
+    pub codec_q: Option<f32>,
+    pub codec_kbit: Option<f32>,
     pub recording: Option<String>,
     pub error: Option<String>,
 }
@@ -162,11 +168,39 @@ impl Engine {
     }
 }
 
+/// 書き出し後に消す一時ファイル
+struct TempFile(PathBuf);
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 fn export(app: &AppHandle, input: &Path, output: &Path, params: Params, cancel: &AtomicBool) -> Result<(), String> {
     let total = probe_duration(input).map(|d| (d * 60000.0 / 1001.0) as u64);
+
+    // 音声は先に全部処理して一時 WAV にする (映像より桁違いに軽い)
+    let mut audio_tmp = None;
+    if params.audio.enabled {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let tmp = TempFile(std::env::temp_dir().join(format!("vhs_audio_{}_{nanos}.wav", std::process::id())));
+        let mut proc = AudioProcessor::new(&params, AUDIO_RATE);
+        let latency = proc.latency();
+        if process_audio(input, &tmp.0, latency, cancel, |buf| proc.process(buf))? {
+            audio_tmp = Some(tmp);
+        }
+    }
+    let audio = match &audio_tmp {
+        Some(t) => Some(AudioTrack { path: &t.0, kbps: params.audio.codec_kbps, mono: params.audio.mono }),
+        None if params.audio.enabled => None,
+        // 音声処理を切っているときは元の音声をそのまま使う
+        None => Some(AudioTrack { path: input, kbps: params.audio.codec_kbps, mono: false }),
+    };
+
     let stream =
         FrameStream::open(&StreamSpec::File { path: input.to_path_buf(), looped: false, realtime: false }, false)?;
-    let rec = Recorder::start(output, Some(input))?;
+    let rec = Recorder::start(output, audio)?;
     let mut pipeline = Pipeline::new(params);
     let mut done = 0u64;
     for frame in stream.rx.iter() {
@@ -302,7 +336,12 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
             st.fields_per_sec = window_count as f32 / el.as_secs_f32();
             st.encode_ms = t.encode.as_secs_f32() * 1e3;
             st.tape_ms = t.tape.as_secs_f32() * 1e3;
+            st.rf_ms = t.rf.as_secs_f32() * 1e3;
             st.decode_ms = t.decode.as_secs_f32() * 1e3;
+            st.capture_ms = t.capture.as_secs_f32() * 1e3;
+            let cs = pipeline.codec_stats();
+            st.codec_q = cs.map(|c| c.q);
+            st.codec_kbit = cs.map(|c| c.bits as f32 / 1e3);
             window_start = Instant::now();
             window_count = 0;
         }

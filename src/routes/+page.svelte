@@ -3,14 +3,18 @@
   import { listen } from "@tauri-apps/api/event";
   import { open, save } from "@tauri-apps/plugin-dialog";
   import { onMount } from "svelte";
-  import { groups, getPath, setPath, presets, applyDiff, type Params } from "$lib/params";
+  import { groups, help, getPath, setPath, presets, applyDiff, type Params } from "#lib/params.ts";
 
   type Stats = {
     source: string;
     fields_per_sec: number;
     encode_ms: number;
     tape_ms: number;
+    rf_ms: number;
     decode_ms: number;
+    capture_ms: number;
+    codec_q: number | null;
+    codec_kbit: number | null;
     recording: string | null;
     error: string | null;
   };
@@ -198,9 +202,16 @@
       {#if stats}
         <span>{stats.fields_per_sec.toFixed(1)} fields/s</span>
         <span>
-          処理 {(stats.encode_ms + stats.tape_ms + stats.decode_ms).toFixed(2)} ms
-          (enc {stats.encode_ms.toFixed(2)} / tape {stats.tape_ms.toFixed(2)} / dec {stats.decode_ms.toFixed(2)})
+          処理 {(stats.encode_ms + stats.tape_ms + stats.rf_ms + stats.decode_ms + stats.capture_ms).toFixed(2)} ms
+          (enc {stats.encode_ms.toFixed(2)} / tape {stats.tape_ms.toFixed(2)}{stats.rf_ms > 0.01
+            ? ` / rf ${stats.rf_ms.toFixed(2)}`
+            : ""} / dec {stats.decode_ms.toFixed(2)}{stats.capture_ms > 0.01 ? ` / cap ${stats.capture_ms.toFixed(2)}` : ""})
         </span>
+        {#if stats.codec_q != null && stats.codec_kbit != null}
+          <span title="キャプチャ圧縮の量子化スケールと直前フレームの符号量">
+            q {stats.codec_q.toFixed(1)} · {stats.codec_kbit.toFixed(0)} kbit/frame
+          </span>
+        {/if}
         {#if stats.recording}<span class="rec-label">録画中: {stats.recording}</span>{/if}
         {#if stats.error}<span class="err">{stats.error}</span>{/if}
       {/if}
@@ -233,9 +244,10 @@
       {#each groups as g, gi}
         <details open={gi < 2}>
           <summary>{g.title}</summary>
+          {#if g.note}<p class="note">{g.note}</p>{/if}
           {#each g.controls as c}
             {#if c.kind === "range"}
-              <label class="row">
+              <label class="row" title={help[c.path]}>
                 <span class="name">{c.label}</span>
                 <input
                   type="range"
@@ -245,12 +257,12 @@
                   value={getPath(params, c.path)}
                   oninput={(e) => setPath(params, c.path, Number((e.target as HTMLInputElement).value))}
                   ondblclick={() => defaults && setPath(params, c.path, getPath(defaults, c.path))}
-                  title="ダブルクリックで既定値"
+                  title={`${help[c.path] ?? ""}\n(ダブルクリックで既定値)`.trim()}
                 />
                 <span class="val">{fmt(getPath(params, c.path), c.step)}{c.unit ? ` ${c.unit}` : ""}</span>
               </label>
             {:else if c.kind === "bool"}
-              <label class="row check">
+              <label class="row check" title={help[c.path]}>
                 <input
                   type="checkbox"
                   checked={getPath(params, c.path)}
@@ -258,8 +270,33 @@
                 />
                 <span>{c.label}</span>
               </label>
+            {:else if c.kind === "text"}
+              <label class="row" title={help[c.path]}>
+                <span class="name">{c.label}</span>
+                <input
+                  class="wide"
+                  type="text"
+                  placeholder={c.placeholder}
+                  value={getPath(params, c.path)}
+                  onchange={(e) => setPath(params, c.path, (e.target as HTMLInputElement).value)}
+                />
+              </label>
+            {:else if c.kind === "markup"}
+              <label class="stack" title={help[c.path]}>
+                <span class="name">{c.label}</span>
+                <textarea
+                  rows="6"
+                  spellcheck="false"
+                  value={getPath(params, c.path)}
+                  oninput={(e) => setPath(params, c.path, (e.target as HTMLTextAreaElement).value)}
+                  ondblclick={(e) => {
+                    if (e.altKey && defaults) setPath(params, c.path, getPath(defaults, c.path));
+                  }}
+                  title={`${help[c.path] ?? ""}\n(Alt+ダブルクリックで既定の内容に戻す)`.trim()}
+                ></textarea>
+              </label>
             {:else}
-              <label class="row">
+              <label class="row" title={help[c.path]}>
                 <span class="name">{c.label}</span>
                 <select
                   value={getPath(params, c.path)}
@@ -380,8 +417,31 @@
   .row.check {
     grid-template-columns: auto 1fr;
   }
-  .row select {
+  .row select,
+  .row .wide {
     grid-column: 2 / 4;
+  }
+  .stack {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 4px 0;
+  }
+  textarea {
+    background: #101115;
+    color: var(--text);
+    border: 1px solid #3a3e4a;
+    border-radius: 4px;
+    padding: 6px;
+    font: 12px/1.45 "Cascadia Mono", Consolas, "MS Gothic", monospace;
+    resize: vertical;
+    white-space: pre;
+  }
+  .note {
+    margin: 2px 0 6px;
+    color: var(--muted);
+    font-size: 11.5px;
+    line-height: 1.5;
   }
   .name {
     color: var(--muted);
@@ -396,7 +456,8 @@
   }
   button,
   select,
-  input[type="number"] {
+  input[type="number"],
+  input[type="text"] {
     background: #2a2d36;
     color: var(--text);
     border: 1px solid #3a3e4a;

@@ -2,17 +2,23 @@
 //!
 //! 信号の流れ:
 //! ```text
-//! RgbFrame ─ encoder ─▶ Field(コンポジット, 4fsc) ─ tape ─▶ Field ─ decoder ─▶ RgbaFrame
+//! RgbFrame ─ encoder ─▶ Field(コンポジット, 4fsc) ─ tape ─▶ rf ─▶ Field ─ decoder ─▶ RgbaFrame
+//!          ─ capture (YCbCr・色差間引き・DCT 圧縮) ─▶ RgbaFrame
 //! ```
+//! 音声は `audio` (テープ音声トラック → 再生機 → キャプチャ ADC) で別に処理する。
 //! GUI や入出力には依存しない純粋なライブラリ。
 
+pub mod audio;
+pub mod capture;
 pub mod decoder;
 pub mod encoder;
 pub mod filter;
 pub mod frame;
+pub mod osd;
 pub mod params;
 pub mod pattern;
 pub mod pipeline;
+pub mod rf;
 pub mod rng;
 pub mod tape;
 pub mod timing;

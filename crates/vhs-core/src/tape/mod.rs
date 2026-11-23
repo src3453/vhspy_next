@@ -7,9 +7,10 @@
 //!      ベアディング) → ディエンファシス → ピーキング
 //!    - 色: バンドパス → 低域変換 (複素包絡線で等価的に扱う) → 狭帯域化 → 磁気飽和 → AM/位相ノイズ
 //!      → 再生時の高域変換
-//! 2. 媒体の欠陥: ドロップアウトとドロップアウト補償 (DOC)
+//! 2. 媒体の欠陥: ドロップアウトとドロップアウト補償 (DOC)、しわ (クリース)、ヘッド目詰まり
+//!    (しわと目詰まりは再生 RF レベルの低下として扱い、ノイズ・ドロップアウト・時間軸の乱れに波及させる)
 //! 3. 走行系: ジッタ、ワウフラッタ、スキュー、ヘッド切替、トラッキングずれ (時間軸誤差として
-//!    ライン全体 = 同期・バーストごとずらす。補正は受像機の AFC/バースト同期に任せる)
+//!    ライン全体 = 同期・バーストごとずらす。補正は受像機の AFC/バースト同期に任せる)、垂直方向の揺れ
 
 pub mod magnetic;
 
@@ -24,6 +25,7 @@ use rayon::prelude::*;
 const STREAM_PATH: u64 = 1;
 const STREAM_DROPOUT: u64 = 2;
 const STREAM_TRANSPORT: u64 = 3;
+const STREAM_DAMAGE: u64 = 5;
 
 pub struct TapeSim {
     y_buf: Vec<f32>,
@@ -34,6 +36,12 @@ pub struct TapeSim {
     jitter_state: f32,
     /// 画面下端ヘッド切替位置のゆらぎ状態
     switch_wander: f32,
+    /// 垂直揺れの状態 [ライン]
+    v_state: f32,
+    /// 進行中のしわ: (残りフィールド数, 中心ライン, 1 フィールドあたりの移動量, 帯の高さ)
+    crease: Option<(f32, f32, f32, f32)>,
+    /// ヘッド目詰まりの残りフィールド数
+    clog_left: f32,
 }
 
 impl Default for TapeSim {
@@ -46,20 +54,23 @@ impl Default for TapeSim {
             offsets: vec![0.0; FIELD_LINES],
             jitter_state: 0.0,
             switch_wander: 0.0,
+            v_state: 0.0,
+            crease: None,
+            clog_left: 0.0,
         }
     }
 }
 
 impl TapeSim {
     pub fn process(&mut self, field: &mut Field, tp: &TapeParams, tr: &TransportParams, seed: u64) {
-        self.compute_rf_level(field, tr);
+        self.compute_rf_level(field, tp, tr, seed);
         self.signal_path(field, tp, seed);
         self.dropouts(field, tp, seed);
         self.transport(field, tr, seed);
     }
 
     /// トラッキングずれによるライン毎の再生 RF レベル (1 = 正常)
-    fn compute_rf_level(&mut self, field: &Field, tr: &TransportParams) {
+    fn compute_rf_level(&mut self, field: &Field, tp: &TapeParams, tr: &TransportParams, seed: u64) {
         let te = tr.tracking_error.clamp(0.0, 1.0);
         let band_h = 24.0;
         let period = FIELD_LINES as f32 + 2.0 * band_h;
@@ -69,6 +80,50 @@ impl TapeSim {
             let bump = (-d * d * 2.0).exp();
             // トラッキングがずれると全体の RF もいくらか落ちる
             *rf = (1.0 - te * (0.3 + 0.7 * bump)).max(0.02);
+        }
+        self.damage(field, tp, seed);
+    }
+
+    /// しわ・ヘッド目詰まりのイベントを進め、RF レベルに反映する
+    fn damage(&mut self, field: &Field, tp: &TapeParams, seed: u64) {
+        let mut rng = Rng::derive(seed, field.index, 0, STREAM_DAMAGE);
+        let per_field = |per_min: f32| (per_min / 60.0 / FIELD_RATE).clamp(0.0, 1.0);
+
+        if self.crease.is_none() && rng.uniform() < per_field(tp.crease_rate) {
+            let len = tp.crease_fields.max(1.0) * (0.5 + rng.uniform());
+            let center = rng.uniform() * FIELD_LINES as f32;
+            // しわはテープを斜めに横切るので、再生中は画面上をゆっくり上下に流れる
+            let drift = (rng.uniform() - 0.5) * 3.0;
+            let height = 4.0 + rng.uniform() * 14.0;
+            self.crease = Some((len, center, drift, height));
+        }
+        if let Some((left, center, drift, height)) = self.crease.as_mut() {
+            // 出始めと終わりは弱い
+            let env = (*left / 3.0).min(1.0);
+            for (l, rf) in self.rf_level.iter_mut().enumerate() {
+                let d = (l as f32 - *center).abs() / *height;
+                if d < 1.5 {
+                    let depth = env * (1.0 - (d / 1.5).powi(2)) * (0.7 + 0.3 * rng.uniform());
+                    *rf = (*rf * (1.0 - 0.97 * depth)).max(0.02);
+                }
+            }
+            *center += *drift + rng.normal() * 0.7;
+            *left -= 1.0;
+            if *left <= 0.0 {
+                self.crease = None;
+            }
+        }
+
+        if self.clog_left <= 0.0 && rng.uniform() < per_field(tp.head_clog_rate) {
+            self.clog_left = 3.0 + rng.exponential(12.0);
+        }
+        if self.clog_left > 0.0 {
+            // 片側ヘッドだけ詰まることが多いので、フィールドごとに程度が変わる
+            let depth = if field.parity == 0 { 0.98 } else { 0.6 + 0.35 * rng.uniform() };
+            for rf in self.rf_level.iter_mut() {
+                *rf = (*rf * (1.0 - depth)).max(0.02);
+            }
+            self.clog_left -= 1.0;
         }
     }
 
@@ -193,6 +248,9 @@ impl TapeSim {
         self.switch_wander = 0.8 * self.switch_wander + rng.normal() * 0.6;
         let hs_lines = tr.head_switch_lines.min(FIELD_LINES) as f32 + self.switch_wander.max(-(tr.head_switch_lines as f32));
         let hs_start = (FIELD_LINES as f32 - hs_lines.max(0.0)).round() as usize;
+        // 垂直揺れ: フィールド単位でライン全体が上下にずれる (整数ライン)
+        self.v_state = 0.7 * self.v_state + rng.normal() * tr.vertical_jitter * 0.714;
+        let v_shift = self.v_state.round() as isize;
 
         for l in 0..FIELD_LINES {
             self.jitter_state = rho * self.jitter_state + innov * rng.normal();
@@ -214,9 +272,23 @@ impl TapeSim {
         let index = field.index;
         field.data.par_chunks_mut(LINE_SAMPLES).enumerate().for_each(|(l, out)| {
             let mut comp = [0f32; LINE_SAMPLES];
-            let base = l * LINE_SAMPLES;
-            for n in 0..LINE_SAMPLES {
-                comp[n] = y_buf[base + n] + c_buf[base + n];
+            let src = l as isize - v_shift;
+            if (0..FIELD_LINES as isize).contains(&src) {
+                let base = src as usize * LINE_SAMPLES;
+                for n in 0..LINE_SAMPLES {
+                    comp[n] = y_buf[base + n] + c_buf[base + n];
+                }
+            } else {
+                // 垂直帰線区間が見えている: 同期だけの黒いライン
+                for (n, v) in comp.iter_mut().enumerate() {
+                    *v = if n < SYNC_END {
+                        ire::SYNC
+                    } else if n >= ACTIVE_START {
+                        ire::BLACK
+                    } else {
+                        ire::BLANK
+                    };
+                }
             }
             if l == hs_start && hs_noise > 0.0 && hs_start < FIELD_LINES {
                 // ヘッド切替の瞬間: ライン途中から乱れる

@@ -1,12 +1,21 @@
 import { defineConfig } from "vite";
 import { sveltekit } from "@sveltejs/kit/vite";
+import adapter from "@sveltejs/adapter-static";
+import { vitePreprocess } from "@sveltejs/vite-plugin-svelte";
 // @ts-expect-error type error without @types/node package
 import process from "node:process";
 const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
 export default defineConfig(() => ({
-  plugins: [sveltekit()],
+  plugins: [
+    // SvelteKit 3 では svelte.config.js の代わりにここで設定する。
+    // Tauri には SSR 用の Node サーバーがないので、adapter-static の fallback で SPA にする。
+    sveltekit({
+      preprocess: vitePreprocess(),
+      adapter: adapter({ fallback: "index.html" }),
+    }),
+  ],
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
@@ -26,7 +35,9 @@ export default defineConfig(() => ({
       : undefined,
     watch: {
       // 3. tell Vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
+      // ワークスペース構成なので Cargo の出力 (target/) と Rust クレートはリポジトリ直下にある。
+      // ビルド中の .exe / .pdb はロックされていて監視すると EBUSY になるので除外する。
+      ignored: ["**/src-tauri/**", "**/target/**", "**/crates/**"],
     },
   },
 }));

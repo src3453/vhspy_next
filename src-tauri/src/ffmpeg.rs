@@ -156,6 +156,124 @@ impl Drop for FrameStream {
     }
 }
 
+/// 音声処理のサンプリング周波数
+pub const AUDIO_RATE: u32 = 48000;
+
+/// 入力の音声を 48 kHz ステレオ f32 にデコードし、`process` をかけて WAV (IEEE float) に書き出す。
+///
+/// `latency` サンプル (フレーム) ぶん頭を捨てて尻に無音を足し、処理の遅れを打ち消す。
+/// 入力に音声がなければ `Ok(false)`。
+pub fn process_audio(
+    input: &Path,
+    wav: &Path,
+    latency: usize,
+    cancel: &std::sync::atomic::AtomicBool,
+    mut process: impl FnMut(&mut [f32]),
+) -> Result<bool, String> {
+    let mut child = command(&ffmpeg_path())
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
+        .arg(input)
+        .args(["-vn", "-ac", "2", "-ar", &AUDIO_RATE.to_string(), "-f", "f32le", "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("ffmpeg を起動できません: {e}"))?;
+    let mut stdout = child.stdout.take().unwrap();
+    let file = std::fs::File::create(wav).map_err(|e| format!("一時ファイルを作れません: {e}"))?;
+    let mut out = std::io::BufWriter::new(file);
+    write_wav_header(&mut out, 0).map_err(|e| e.to_string())?;
+
+    const CHUNK: usize = 4096; // フレーム
+    let mut bytes = vec![0u8; CHUNK * 8];
+    let mut samples = vec![0f32; CHUNK * 2];
+    let mut skip = latency * 2;
+    let mut written = 0u64;
+    let mut write = |out: &mut std::io::BufWriter<std::fs::File>, s: &[f32], skip: &mut usize| -> std::io::Result<()> {
+        let n = (*skip).min(s.len());
+        *skip -= n;
+        let s = &s[n..];
+        for v in s {
+            out.write_all(&v.to_le_bytes())?;
+        }
+        written += s.len() as u64;
+        Ok(())
+    };
+    let mut total_in = 0u64;
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = child.kill();
+            return Err("キャンセルしました".into());
+        }
+        // 端数が出ないよう、読めた分だけ処理する (フレーム境界に揃える)
+        let mut filled = 0;
+        while filled < bytes.len() {
+            match stdout.read(&mut bytes[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        let frames = filled / 8;
+        if frames == 0 {
+            break;
+        }
+        total_in += frames as u64;
+        let buf = &mut samples[..frames * 2];
+        for (i, v) in buf.iter_mut().enumerate() {
+            *v = f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+        }
+        process(buf);
+        write(&mut out, buf, &mut skip).map_err(|e| e.to_string())?;
+        if filled < bytes.len() {
+            break;
+        }
+    }
+    let _ = child.wait();
+    if total_in == 0 {
+        drop(out);
+        let _ = std::fs::remove_file(wav);
+        return Ok(false);
+    }
+    // 遅延線に残っている分を押し出す
+    let mut tail = vec![0f32; latency * 2];
+    process(&mut tail);
+    write(&mut out, &tail, &mut skip).map_err(|e| e.to_string())?;
+
+    let mut file = out.into_inner().map_err(|e| e.to_string())?;
+    use std::io::Seek;
+    file.seek(std::io::SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    write_wav_header(&mut file, written * 4).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// 2ch / 32 bit float の WAV ヘッダ
+fn write_wav_header(w: &mut impl Write, data_bytes: u64) -> std::io::Result<()> {
+    let data = data_bytes.min(u32::MAX as u64 - 64) as u32;
+    let (ch, bits) = (2u16, 32u16);
+    let block = ch * bits / 8;
+    w.write_all(b"RIFF")?;
+    w.write_all(&(36 + data).to_le_bytes())?;
+    w.write_all(b"WAVEfmt ")?;
+    w.write_all(&16u32.to_le_bytes())?;
+    w.write_all(&3u16.to_le_bytes())?; // IEEE float
+    w.write_all(&ch.to_le_bytes())?;
+    w.write_all(&AUDIO_RATE.to_le_bytes())?;
+    w.write_all(&(AUDIO_RATE * block as u32).to_le_bytes())?;
+    w.write_all(&block.to_le_bytes())?;
+    w.write_all(&bits.to_le_bytes())?;
+    w.write_all(b"data")?;
+    w.write_all(&data.to_le_bytes())
+}
+
+/// 録画ファイルに多重化する音声
+pub struct AudioTrack<'a> {
+    pub path: &'a Path,
+    /// AAC のビットレート [kbps]
+    pub kbps: u32,
+    pub mono: bool,
+}
+
 /// 処理結果を動画ファイルへ書き出す
 pub struct Recorder {
     child: Child,
@@ -165,15 +283,19 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    /// `audio_from` を指定するとその音声トラックを多重化する
-    pub fn start(path: &Path, audio_from: Option<&Path>) -> Result<Self, String> {
+    /// `audio` を指定するとその音声トラックを多重化する
+    pub fn start(path: &Path, audio: Option<AudioTrack<'_>>) -> Result<Self, String> {
         let mut cmd = command(&ffmpeg_path());
         cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
         cmd.args(["-f", "rawvideo", "-pix_fmt", "rgba", "-s", &format!("{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}")]);
         cmd.args(["-framerate", FIELD_RATE, "-i", "-"]);
-        if let Some(a) = audio_from {
-            cmd.arg("-i").arg(a);
-            cmd.args(["-map", "0:v", "-map", "1:a?", "-c:a", "aac", "-b:a", "192k", "-shortest"]);
+        if let Some(a) = audio {
+            cmd.arg("-i").arg(a.path);
+            let kbps = format!("{}k", a.kbps.clamp(8, 512));
+            cmd.args(["-map", "0:v", "-map", "1:a?", "-c:a", "aac", "-b:a", &kbps, "-shortest"]);
+            if a.mono {
+                cmd.args(["-ac", "1"]);
+            }
         }
         // 4:3 の正方画素 640x480 にして書き出す
         cmd.args(["-vf", "scale=640:480:flags=bicubic,setsar=1"]);
@@ -225,5 +347,41 @@ impl Drop for Recorder {
             }
             let _ = self.child.wait();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    /// ffmpeg と音声付きの動画が必要: `VHS_TEST_VIDEO=in.mp4 cargo test -p vhs-next -- --ignored`
+    #[test]
+    #[ignore]
+    fn export_audio_roundtrip() {
+        let input = PathBuf::from(std::env::var("VHS_TEST_VIDEO").expect("VHS_TEST_VIDEO"));
+        let dir = std::env::temp_dir();
+        let wav = dir.join("vhs_test_audio.wav");
+        let out = dir.join("vhs_test_out.mp4");
+        let params = vhs_core::Params::default();
+        let mut proc = vhs_core::audio::AudioProcessor::new(&params, AUDIO_RATE);
+        let latency = proc.latency();
+        let has = process_audio(&input, &wav, latency, &AtomicBool::new(false), |b| proc.process(b)).unwrap();
+        assert!(has);
+        let rec = Recorder::start(&out, Some(AudioTrack { path: &wav, kbps: 64, mono: true })).unwrap();
+        let frame = vec![128u8; OUTPUT_WIDTH * OUTPUT_HEIGHT * 4];
+        for _ in 0..120 {
+            assert!(rec.push(&frame));
+        }
+        rec.finish().unwrap();
+        let probe = command(&ffprobe_path())
+            .args(["-v", "error", "-show_entries", "stream=codec_type,channels,bit_rate", "-of", "compact"])
+            .arg(&out)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&probe.stdout);
+        println!("{text}");
+        assert!(text.contains("codec_type=audio") && text.contains("channels=1"), "{text}");
+        let _ = std::fs::remove_file(&wav);
     }
 }

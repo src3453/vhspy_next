@@ -28,18 +28,32 @@ impl Default for Decoder {
     }
 }
 
-/// 同期の後縁 (-20 IRE を下から上へ横切る位置) を小数精度で探す
-fn find_sync_edge(line: &[f32]) -> Option<f32> {
+/// 同期の後縁 (-20 IRE を下から上へ横切る位置) を小数精度で探す。
+///
+/// 実機の同期分離回路と同じく、スライスの前に積分 (ここでは左右対称の移動平均) して
+/// 雑音で誤検出しにくくする。対称な平均なのでエッジ位置は動かない。
+pub(crate) fn find_sync_edge(line: &[f32]) -> Option<f32> {
+    const R: usize = 4;
     let thr = ire::SYNC / 2.0;
-    let mut low_seen = false;
-    for n in 1..(ACTIVE_START - 10) {
-        if line[n - 1] < thr {
-            low_seen = true;
+    let mut acc: f32 = line[..2 * R + 1].iter().sum();
+    let norm = 1.0 / (2 * R + 1) as f32;
+    // prev = n-1 を中心とした平均
+    let mut prev = acc * norm;
+    let mut low_run = 0;
+    for n in (R + 1)..(ACTIVE_START - 10) {
+        acc += line[n + R] - line[n - R - 1];
+        let cur = acc * norm;
+        if prev < thr {
+            low_run += 1;
+        } else {
+            low_run = 0;
         }
-        if low_seen && line[n - 1] < thr && line[n] >= thr {
-            let t = (thr - line[n - 1]) / (line[n] - line[n - 1]);
+        // 同期パルス幅の 1/4 以上低レベルが続いたあとの立ち上がりだけを採る
+        if low_run >= 16 && prev < thr && cur >= thr {
+            let t = (thr - prev) / (cur - prev);
             return Some(n as f32 - 1.0 + t);
         }
+        prev = cur;
     }
     None
 }

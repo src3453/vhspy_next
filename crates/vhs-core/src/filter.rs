@@ -30,43 +30,72 @@ impl Biquad {
         Self { b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0, a2: a2 / a0, z1: 0.0, z2: 0.0 }
     }
 
-    fn w0(fc: f32) -> (f32, f32) {
-        let fc = fc.clamp(1.0, 0.45 * FS);
-        let w = 2.0 * PI * fc / FS;
+    fn w0(fc: f32, fs: f32) -> (f32, f32) {
+        let fc = fc.clamp(1e-6 * fs, 0.45 * fs);
+        let w = 2.0 * PI * fc / fs;
         (w.cos(), w.sin())
     }
 
     pub fn lowpass(fc: f32, q: f32) -> Self {
-        let (c, s) = Self::w0(fc);
-        let alpha = s / (2.0 * q);
-        Self::norm((1.0 - c) / 2.0, 1.0 - c, (1.0 - c) / 2.0, 1.0 + alpha, -2.0 * c, 1.0 - alpha)
+        Self::lowpass_at(fc, q, FS)
     }
 
     pub fn highpass(fc: f32, q: f32) -> Self {
-        let (c, s) = Self::w0(fc);
-        let alpha = s / (2.0 * q);
-        Self::norm((1.0 + c) / 2.0, -(1.0 + c), (1.0 + c) / 2.0, 1.0 + alpha, -2.0 * c, 1.0 - alpha)
+        Self::highpass_at(fc, q, FS)
     }
 
     /// ピークゲイン 0 dB のバンドパス
     pub fn bandpass(fc: f32, q: f32) -> Self {
-        let (c, s) = Self::w0(fc);
-        let alpha = s / (2.0 * q);
-        Self::norm(alpha, 0.0, -alpha, 1.0 + alpha, -2.0 * c, 1.0 - alpha)
+        Self::bandpass_at(fc, q, FS)
     }
 
     pub fn notch(fc: f32, q: f32) -> Self {
-        let (c, s) = Self::w0(fc);
+        let (c, s) = Self::w0(fc, FS);
         let alpha = s / (2.0 * q);
         Self::norm(1.0, -2.0 * c, 1.0, 1.0 + alpha, -2.0 * c, 1.0 - alpha)
     }
 
     /// 高域シェルフ (スロープ S = 1)。エンファシス / ピーキングに使う。
     pub fn high_shelf(fc: f32, gain_db: f32) -> Self {
+        Self::high_shelf_at(fc, gain_db, FS)
+    }
+
+    // ---- 任意のサンプリング周波数版 (音声処理用) ----
+
+    pub fn lowpass_at(fc: f32, q: f32, fs: f32) -> Self {
+        let (c, s) = Self::w0(fc, fs);
+        let alpha = s / (2.0 * q);
+        Self::norm((1.0 - c) / 2.0, 1.0 - c, (1.0 - c) / 2.0, 1.0 + alpha, -2.0 * c, 1.0 - alpha)
+    }
+
+    pub fn highpass_at(fc: f32, q: f32, fs: f32) -> Self {
+        let (c, s) = Self::w0(fc, fs);
+        let alpha = s / (2.0 * q);
+        Self::norm((1.0 + c) / 2.0, -(1.0 + c), (1.0 + c) / 2.0, 1.0 + alpha, -2.0 * c, 1.0 - alpha)
+    }
+
+    pub fn bandpass_at(fc: f32, q: f32, fs: f32) -> Self {
+        let (c, s) = Self::w0(fc, fs);
+        let alpha = s / (2.0 * q);
+        Self::norm(alpha, 0.0, -alpha, 1.0 + alpha, -2.0 * c, 1.0 - alpha)
+    }
+
+    /// ピーキング EQ
+    pub fn peaking_at(fc: f32, q: f32, gain_db: f32, fs: f32) -> Self {
         if gain_db.abs() < 1e-4 {
             return Self::IDENTITY;
         }
-        let (c, s) = Self::w0(fc);
+        let (c, s) = Self::w0(fc, fs);
+        let a = 10f32.powf(gain_db / 40.0);
+        let alpha = s / (2.0 * q);
+        Self::norm(1.0 + alpha * a, -2.0 * c, 1.0 - alpha * a, 1.0 + alpha / a, -2.0 * c, 1.0 - alpha / a)
+    }
+
+    pub fn high_shelf_at(fc: f32, gain_db: f32, fs: f32) -> Self {
+        if gain_db.abs() < 1e-4 {
+            return Self::IDENTITY;
+        }
+        let (c, s) = Self::w0(fc, fs);
         let a = 10f32.powf(gain_db / 40.0);
         let alpha = s / 2.0 * std::f32::consts::SQRT_2;
         let sa = 2.0 * a.sqrt() * alpha;
@@ -130,13 +159,21 @@ impl Cascade {
 
     /// Butterworth ローパス (偶数次、最大 8 次)
     pub fn butter_lowpass(order: usize, fc: f32) -> Self {
-        let v: Vec<Biquad> = Self::butter_qs(order).map(|q| Biquad::lowpass(fc, q)).collect();
-        Self::new(&v)
+        Self::butter_lowpass_at(order, fc, FS)
     }
 
     /// Butterworth ハイパス (偶数次、最大 8 次)
     pub fn butter_highpass(order: usize, fc: f32) -> Self {
-        let v: Vec<Biquad> = Self::butter_qs(order).map(|q| Biquad::highpass(fc, q)).collect();
+        Self::butter_highpass_at(order, fc, FS)
+    }
+
+    pub fn butter_lowpass_at(order: usize, fc: f32, fs: f32) -> Self {
+        let v: Vec<Biquad> = Self::butter_qs(order).map(|q| Biquad::lowpass_at(fc, q, fs)).collect();
+        Self::new(&v)
+    }
+
+    pub fn butter_highpass_at(order: usize, fc: f32, fs: f32) -> Self {
+        let v: Vec<Biquad> = Self::butter_qs(order).map(|q| Biquad::highpass_at(fc, q, fs)).collect();
         Self::new(&v)
     }
 
@@ -147,6 +184,10 @@ impl Cascade {
             y = s.process(y);
         }
         y
+    }
+
+    pub fn sections(&self) -> &[Biquad] {
+        &self.s[..self.n]
     }
 
     pub fn process_slice(&mut self, buf: &mut [f32]) {

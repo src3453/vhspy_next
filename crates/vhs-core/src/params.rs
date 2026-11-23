@@ -9,8 +9,15 @@ pub struct Params {
     pub encoder: EncoderParams,
     pub tape: TapeParams,
     pub transport: TransportParams,
+    /// VCR → TV の RF (アンテナ) 接続
+    pub rf: RfParams,
     pub decoder: DecoderParams,
+    /// デジタルキャプチャ (ADC・色差間引き・圧縮)
+    pub capture: CaptureParams,
+    /// 音声トラック (書き出し時に適用)
+    pub audio: AudioParams,
     pub output: OutputParams,
+    pub osd: OsdParams,
     /// 乱数シード (同じシードなら同じ劣化パターン)
     pub seed: u64,
 }
@@ -92,6 +99,14 @@ pub struct TapeParams {
     pub dropout_length: f32,
     /// ドロップアウト補償 (1H 前のラインで置換)
     pub dropout_compensation: bool,
+
+    // --- テープの物理的な傷み ---
+    /// しわ・折れ目 (クリース) の発生頻度 [回/分]
+    pub crease_rate: f32,
+    /// 1 回のしわが画面に現れる長さ [フィールド]
+    pub crease_fields: f32,
+    /// ヘッドの目詰まり (画面全体が一瞬ノイズに埋もれる) の発生頻度 [回/分]
+    pub head_clog_rate: f32,
 }
 
 impl Default for TapeParams {
@@ -115,6 +130,9 @@ impl Default for TapeParams {
             dropout_rate: 0.002,
             dropout_length: 40.0,
             dropout_compensation: true,
+            crease_rate: 0.0,
+            crease_fields: 20.0,
+            head_clog_rate: 0.0,
         }
     }
 }
@@ -143,6 +161,8 @@ pub struct TransportParams {
     pub tracking_error: f32,
     /// ノイズバーの移動速度 [ライン/フィールド]
     pub tracking_speed: f32,
+    /// 垂直方向の揺れ (rms) [ライン]。安物デッキの V ジッタ
+    pub vertical_jitter: f32,
 }
 
 impl Default for TransportParams {
@@ -158,6 +178,7 @@ impl Default for TransportParams {
             skew_samples: 0.0,
             tracking_error: 0.0,
             tracking_speed: 1.5,
+            vertical_jitter: 0.0,
         }
     }
 }
@@ -221,4 +242,224 @@ pub enum Deinterlace {
 #[serde(default)]
 pub struct OutputParams {
     pub deinterlace: Deinterlace,
+}
+
+/// OSD の合成先
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OsdMode {
+    /// デッキが再生出力 (コンポジット) に重畳する
+    #[default]
+    Composite,
+    /// 録画時にテープへ焼き込まれている (カメラの日付表示など)
+    Tape,
+}
+
+/// OSD (オンスクリーン表示)。書式は `osd::markup` を参照。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct OsdParams {
+    pub enabled: bool,
+    pub mode: OsdMode,
+    /// 表示内容のマークアップ
+    pub markup: String,
+    /// 既定の文字サイズ (1 = 2×2 ドット/画素, 1〜8)
+    pub scale: u32,
+    /// 不透明度 (0..1)
+    pub opacity: f32,
+    /// `{date}` `{time}` などの起点となる日時 ("YYYY-MM-DD HH:MM:SS")
+    pub start_datetime: String,
+}
+
+impl Default for OsdParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: OsdMode::Composite,
+            markup: "<pos=56,48><edge=black>PLAY ▶</edge>
+<pos=56,400><edge=black>{counter}   <color=#9cf>SP</color></edge>
+<pos=698,400><align=right><edge=black>{MON}.{D} {Y}</edge>".into(),
+            scale: 2,
+            opacity: 1.0,
+            start_datetime: "1995-08-12 14:30:00".into(),
+        }
+    }
+}
+
+/// VCR の RF モジュレータ → テレビのチューナ経由で見たときの劣化
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RfParams {
+    pub enabled: bool,
+    /// 受信ノイズ (スノー) の rms [IRE]
+    pub snow_ire: f32,
+    /// ゴースト (反射波) の遅延 [µs]
+    pub ghost_delay_us: f32,
+    /// ゴーストの強さ (負なら反転ゴースト)
+    pub ghost_gain: f32,
+    /// ビート妨害 (斜め縞) の振幅 [IRE]
+    pub interference_ire: f32,
+    /// ビート妨害の周波数 [MHz]
+    pub interference_mhz: f32,
+    /// 音声搬送波が映像に漏れる量 (920 kHz ビート / 音声連動の縞)
+    pub sound_beat: f32,
+}
+
+impl Default for RfParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            snow_ire: 3.0,
+            ghost_delay_us: 1.2,
+            ghost_gain: 0.12,
+            interference_ire: 0.0,
+            interference_mhz: 2.7,
+            sound_beat: 0.0,
+        }
+    }
+}
+
+/// キャプチャ時のレベル (ビデオレンジ/フルレンジ) の扱い
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureLevels {
+    /// 正しく変換
+    #[default]
+    Correct,
+    /// 16-235 をフルレンジとして表示 (黒が浮いて白がくすむ)
+    WashedOut,
+    /// フルレンジを 16-235 として表示 (黒つぶれ・白飛び)
+    Crushed,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ChromaSubsampling {
+    #[serde(rename = "444")]
+    S444,
+    #[serde(rename = "422")]
+    S422,
+    /// MPEG-2 / DVD / 多くの USB キャプチャ
+    #[default]
+    #[serde(rename = "420")]
+    S420,
+    /// NTSC DV
+    #[serde(rename = "411")]
+    S411,
+}
+
+/// デジタルキャプチャ (アナログキャプチャボード → MPEG 系エンコーダ)
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CaptureParams {
+    pub enabled: bool,
+    pub levels: CaptureLevels,
+    pub chroma_subsampling: ChromaSubsampling,
+    /// DCT ブロック圧縮 (MPEG-2 風) を行う
+    pub codec: bool,
+    /// 目標ビットレート [kbps] (29.97 fps 換算)
+    pub bitrate_kbps: f32,
+    /// GOP 長 (I フレーム間隔) [フレーム]
+    pub gop: u32,
+    /// 動き探索範囲 [画素] (0 で動き補償なし)
+    pub motion_search: u32,
+    /// レート制御の追従の速さ (0..1)。大きいほど画質が「呼吸」する
+    pub rate_control: f32,
+    /// コマ落ち (前フレームの繰り返し) の確率
+    pub frame_drop_rate: f32,
+    /// ADC の量子化ビット数 (8 が普通)
+    pub adc_bits: u32,
+}
+
+impl Default for CaptureParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            levels: CaptureLevels::Correct,
+            chroma_subsampling: ChromaSubsampling::S420,
+            codec: true,
+            bitrate_kbps: 4000.0,
+            gop: 15,
+            motion_search: 7,
+            rate_control: 0.5,
+            frame_drop_rate: 0.0,
+            adc_bits: 8,
+        }
+    }
+}
+
+/// 音声トラックの方式
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioMode {
+    /// 固定ヘッドによるリニア (ノーマル) 音声トラック: モノラル・狭帯域・ヒス・ワウフラッタ
+    #[default]
+    Linear,
+    /// 回転ヘッドによる Hi-Fi (FM 深層記録) 音声: ステレオ・広帯域だがヘッド切替バズが出る
+    Hifi,
+}
+
+/// 音声の劣化 (テープ → 再生機 → キャプチャ)
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AudioParams {
+    pub enabled: bool,
+    pub mode: AudioMode,
+
+    // --- テープ ---
+    /// リニアトラックの低域カットオフ [Hz]
+    pub low_cut_hz: f32,
+    /// リニアトラックの高域カットオフ [Hz] (SP ≒ 10k, EP ≒ 5k)
+    pub high_cut_hz: f32,
+    /// テープヒス [dBFS]
+    pub hiss_db: f32,
+    /// 録音レベル (テープ飽和へのドライブ) [dB]
+    pub drive_db: f32,
+    /// ワウ (遅い速度変動) [%]
+    pub wow_pct: f32,
+    /// フラッタ (速い速度変動) [%]
+    pub flutter_pct: f32,
+    /// ドロップアウト (音がこもって痩せる) [回/秒]
+    pub dropout_rate: f32,
+    /// Hi-Fi のヘッド切替バズ (トラッキングずれでも増える)
+    pub hifi_buzz: f32,
+
+    // --- 周辺機器 ---
+    /// 電源ハム (グラウンドループ) [dBFS]
+    pub hum_db: f32,
+    /// 電源周波数 [Hz]
+    pub hum_hz: f32,
+    /// AGC (自動録音レベル) の強さ (0..1)。ポンピングと無音部のノイズ持ち上げ
+    pub agc: f32,
+    /// キャプチャ ADC のサンプリング周波数 [Hz]
+    pub sample_rate_hz: f32,
+    /// キャプチャ ADC の量子化ビット数
+    pub bits: u32,
+    /// モノラルにする
+    pub mono: bool,
+    /// 書き出し時の AAC ビットレート [kbps] (低いほど圧縮ノイズ)
+    pub codec_kbps: u32,
+}
+
+impl Default for AudioParams {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: AudioMode::Linear,
+            low_cut_hz: 80.0,
+            high_cut_hz: 10000.0,
+            hiss_db: -52.0,
+            drive_db: 0.0,
+            wow_pct: 0.12,
+            flutter_pct: 0.08,
+            dropout_rate: 0.05,
+            hifi_buzz: 0.1,
+            hum_db: -90.0,
+            hum_hz: 60.0,
+            agc: 0.0,
+            sample_rate_hz: 48000.0,
+            bits: 16,
+            mono: false,
+            codec_kbps: 192,
+        }
+    }
 }

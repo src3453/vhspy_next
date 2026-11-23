@@ -1,6 +1,7 @@
 //! 静止画にシミュレーションをかけて PNG 出力、および速度計測。
 //!
-//! cargo run -p vhs-core --release --example render -- in.png out.png [params.json]
+//! cargo run -p vhs-core --release --example render -- in.png out.png [params.json] [fields] [pan_px]
+//!   pan_px: 1 フィールドごとに画像を横へずらす量 (動き補償・圧縮の確認用)
 //! cargo run -p vhs-core --release --example render -- --bench [fields]
 
 use std::time::{Duration, Instant};
@@ -55,9 +56,19 @@ fn main() {
         None => Params::default(),
     };
     let mut p = Pipeline::new(params);
-    // 状態 (AFC, ジッタ) が落ち着くまで数フィールド回す
-    for _ in 0..8 {
-        p.process_field(&input);
+    // 状態 (AFC, ジッタ, レート制御) が落ち着くまで数フィールド回す
+    let fields: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(8);
+    let pan: f32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    for i in 0..fields {
+        if pan != 0.0 {
+            p.process_field(&shifted(&input, (pan * i as f32) as isize));
+        } else {
+            p.process_field(&input);
+        }
+        if let Some(c) = p.codec_stats().filter(|_| i + 16 >= fields) {
+            let kind = if c.intra_frame { 'I' } else { 'P' };
+            println!("field {i}: {kind} q={:.1} {:.0} kbit", c.q, c.bits as f64 / 1e3);
+        }
     }
     let out = p.output();
     // 表示用に 4:3 (640x480) へリサイズ
@@ -65,4 +76,18 @@ fn main() {
     let img = image::imageops::resize(&img, 640, 480, image::imageops::FilterType::Triangle);
     img.save(&out_path).unwrap();
     println!("wrote {out_path}");
+}
+
+/// 横方向に巡回シフトした画像
+fn shifted(f: &RgbFrame, dx: isize) -> RgbFrame {
+    let mut o = f.clone();
+    let w = f.width as isize;
+    for y in 0..f.height {
+        for x in 0..f.width {
+            let sx = (x as isize - dx).rem_euclid(w) as usize;
+            let (d, s) = ((y * f.width + x) * 3, (y * f.width + sx) * 3);
+            o.data[d..d + 3].copy_from_slice(&f.data[s..s + 3]);
+        }
+    }
+    o
 }
