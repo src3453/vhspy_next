@@ -3,7 +3,7 @@
   import { listen } from "@tauri-apps/api/event";
   import { open, save } from "@tauri-apps/plugin-dialog";
   import { onMount } from "svelte";
-  import { groups, help, getPath, setPath, presets, applyDiff, type Params } from "#lib/params.ts";
+  import { groups, help, getPath, setPath, presets, applyDiff, standardDiffs, type Params } from "#lib/params.ts";
 
   type Stats = {
     source: string;
@@ -110,7 +110,7 @@
   }
 
   function applyPreset(i: number) {
-    if (defaults) params = applyDiff(defaults, presets[i].diff);
+    if (defaults) params = applyDiff(applyDiff(defaults, standardDiffs[params?.standard ?? "ntsc"]), presets[i].diff);
   }
 
   async function pickFont(path: string) {
@@ -346,7 +346,14 @@
                 <span class="name">{c.label}</span>
                 <select
                   value={getPath(params, c.path)}
-                  onchange={(e) => setPath(params, c.path, (e.target as HTMLSelectElement).value)}
+                  onchange={(e) => {
+                    const v = (e.target as HTMLSelectElement).value;
+                    // 方式の切り替えは、その方式で一般的な値 (帯域・電源周波数) も合わせる
+                    // ($state のプロキシは structuredClone できないので、スナップショットを渡す)
+                    if (c.path === "standard")
+                      params = applyDiff($state.snapshot(params), standardDiffs[v as Params["standard"]]);
+                    else setPath(params, c.path, v);
+                  }}
                 >
                   {#each c.options as o}<option value={o.value}>{o.label}</option>{/each}
                 </select>

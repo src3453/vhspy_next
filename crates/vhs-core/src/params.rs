@@ -148,7 +148,7 @@ impl Default for CameraParams {
     }
 }
 
-/// 放送/カメラ側の NTSC エンコーダ
+/// 放送/カメラ側のエンコーダ (NTSC は I/Q、PAL は U/V で色を載せる)
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct EncoderParams {
@@ -158,13 +158,15 @@ pub struct EncoderParams {
     pub i_bw_mhz: f32,
     /// Q 信号帯域 [MHz]
     pub q_bw_mhz: f32,
+    /// PAL の U/V 信号帯域 [MHz]
+    pub uv_bw_mhz: f32,
     /// 色信号の振幅倍率
     pub chroma_gain: f32,
 }
 
 impl Default for EncoderParams {
     fn default() -> Self {
-        Self { luma_bw_mhz: 4.2, i_bw_mhz: 1.3, q_bw_mhz: 0.6, chroma_gain: 1.0 }
+        Self { luma_bw_mhz: 4.2, i_bw_mhz: 1.3, q_bw_mhz: 0.6, uv_bw_mhz: 1.3, chroma_gain: 1.0 }
     }
 }
 
@@ -315,11 +317,11 @@ pub enum YcSeparation {
     /// トラップ (ノッチ) フィルタ。ドットクロールとクロスカラーが出る
     #[default]
     Notch,
-    /// 1H ラインくし形フィルタ
+    /// ラインくし形フィルタ (NTSC は 1H、PAL は 2H)
     Comb,
 }
 
-/// 受像機 (NTSC デコーダ)
+/// 受像機 (NTSC / PAL デコーダ)
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct DecoderParams {
@@ -332,6 +334,13 @@ pub struct DecoderParams {
     pub color_killer: bool,
     /// 水平 AFC の追従係数 (0 = 追従しない, 1 = 即時追従)
     pub h_pll: f32,
+    /// 色副搬送波 PLL のバーストへの追従係数 (ライン単位。1 = ラインごとにバーストへ即時同期)。
+    /// 小さいとテープのライン単位の位相ゆらぎを取り切れず、NTSC は色相の揺れ、PAL は彩度低下
+    /// (遅延線なしならハノーバーバー) になる
+    pub burst_pll: f32,
+    /// PAL: 1H 遅延線で前のラインと色差を平均する (位相誤差が色相ずれではなく彩度低下になる)。
+    /// 切ると「シンプル PAL」になり、位相誤差がハノーバーバー (ライン交互の色相ずれ) として見える
+    pub pal_delay_line: bool,
     pub contrast: f32,
     pub brightness: f32,
     pub saturation: f32,
@@ -346,6 +355,8 @@ impl Default for DecoderParams {
             acc: true,
             color_killer: true,
             h_pll: 0.25,
+            burst_pll: 1.0,
+            pal_delay_line: true,
             contrast: 1.0,
             brightness: 0.0,
             saturation: 1.0,
@@ -421,11 +432,36 @@ impl Default for OsdParams {
     }
 }
 
-/// VCR の RF モジュレータ → テレビのチューナ経由で見たときの劣化
+/// RF 接続 (チューナ経由) をパイプラインのどこに入れるか
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RfPlacement {
+    /// テープの前: 放送を受信して録画した (受信時の劣化ごとテープに記録される)
+    BeforeTape,
+    /// テープの後: デッキの RF 出力をテレビのアンテナ端子で受けた
+    #[default]
+    AfterTape,
+    /// 両方: 放送を録画し、さらにデッキから RF でテレビに入れた (雑音は独立)
+    Both,
+}
+
+impl RfPlacement {
+    pub fn before_tape(self) -> bool {
+        matches!(self, Self::BeforeTape | Self::Both)
+    }
+
+    pub fn after_tape(self) -> bool {
+        matches!(self, Self::AfterTape | Self::Both)
+    }
+}
+
+/// RF 接続 (VCR の RF モジュレータ → テレビ、または放送受信) のチューナ経由の劣化
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct RfParams {
     pub enabled: bool,
+    /// どこで RF を通すか (放送受信 / デッキ→テレビ / 両方)
+    pub placement: RfPlacement,
     /// 受信ノイズ (スノー) の rms [IRE]
     pub snow_ire: f32,
     /// ゴースト (反射波) の遅延 [µs]
@@ -444,6 +480,7 @@ impl Default for RfParams {
     fn default() -> Self {
         Self {
             enabled: false,
+            placement: RfPlacement::AfterTape,
             snow_ire: 3.0,
             ghost_delay_us: 1.2,
             ghost_gain: 0.12,

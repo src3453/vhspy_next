@@ -19,8 +19,10 @@ vhs_next.py       旧実装 (参照用)
 
 ```
 RGB 画像 ─ encoder ─▶ コンポジット信号 (4fsc, 910 サンプル/ライン, IRE)
+         ─ rf ──────▶ 放送受信 (録画前の RF)                           ※任意
          ─ tape ────▶ 記録/再生経路 → 媒体欠陥 → 走行系 (時間軸誤差)
          ─ rf ──────▶ RF 接続 (スノー, ゴースト, ビート妨害)            ※任意
+                      (rf.placement: after_tape / before_tape / both)
          ─ decoder ─▶ 受像機 (水平 AFC, Y/C 分離, バースト同期検波) ─▶ RGBA
          ─ capture ─▶ ADC → 色差間引き → DCT 圧縮 (MPEG-2 風)       ※任意 ─▶ RGBA
 

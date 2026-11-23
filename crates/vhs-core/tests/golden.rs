@@ -67,3 +67,12 @@ fn golden_ntsc_camera() {
     p.osd.mode = vhs_core::params::OsdMode::Composite;
     run("ntsc_camera", p);
 }
+
+#[test]
+fn golden_pal_full() {
+    let mut p = full();
+    p.standard = vhs_core::TvStandard::Pal;
+    p.decoder.burst_pll = 0.5;
+    p.decoder.yc_separation = vhs_core::params::YcSeparation::Comb;
+    run("pal_full", p);
+}

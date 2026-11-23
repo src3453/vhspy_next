@@ -1,7 +1,12 @@
 //! テレビ方式 (NTSC など) のタイミングと信号レベル。
 //!
 //! 信号は 4fsc でサンプリングした 1 次元のコンポジット信号として扱う。単位は IRE
-//! (ブランキング = 0、白 = 100)。方式ごとの値は [`Standard`] にまとめ、`Field` が参照を持つ。
+//! (ブランキング = 0、白 = 100。PAL は 700 mV = 100 とした同じ尺度)。
+//! 方式ごとの値は [`Standard`] にまとめ、`Field` が参照を持つ。
+//!
+//! PAL の簡略化: 実際の PAL の副搬送波は 1 ラインあたり 283.7516 周期 (25 Hz オフセット) で、
+//! 4fsc ではライン同期しない。ここでは 283.75 周期 (= 1135 サンプル) に丸め、ライン同期として扱う。
+//! 第 2 フィールドの開始位相 (半ライン = 567.5 サンプル) も 90° 単位に丸めている。
 
 use serde::{Deserialize, Serialize};
 
@@ -12,12 +17,15 @@ pub enum TvStandard {
     /// NTSC-M (525 ライン / 59.94 Hz)
     #[default]
     Ntsc,
+    /// PAL-B/G (625 ライン / 50 Hz)
+    Pal,
 }
 
 impl TvStandard {
     pub fn spec(self) -> &'static Standard {
         match self {
             TvStandard::Ntsc => &NTSC,
+            TvStandard::Pal => &PAL,
         }
     }
 }
@@ -115,11 +123,44 @@ impl Standard {
     ///
     /// NTSC: 1 ライン = 227.5 周期なのでラインごとに 180° 反転、1 フレーム = 119437.5 周期なので
     /// フレームごとにも 180° 反転する。第 2 フィールドは 262.5 ライン後に始まるので 270° ずれる。
+    ///
+    /// PAL: 1 ライン = 283.75 周期なのでラインごとに 270° 進む。1 フレーム (625 ライン) でも 270°、
+    /// 第 2 フィールドは 312.5 ライン後 (≒ 315°、270° に丸める)。
     #[inline]
     pub fn line_phase_base(&self, field_line: usize, frame: u64, parity: u8) -> usize {
         match self.kind {
             TvStandard::Ntsc => (2 * field_line + 2 * (frame as usize & 1) + 3 * parity as usize) & 3,
+            TvStandard::Pal => (3 * field_line + 3 * (frame as usize & 3) + 3 * parity as usize) & 3,
         }
+    }
+
+    /// 1 ライン進んだときの副搬送波位相の進み (90° 単位)。受像機の PLL がバーストの来る位相を予測するのに使う
+    #[inline(always)]
+    pub const fn line_phase_step(&self) -> usize {
+        self.line_samples & 3
+    }
+
+    /// 色の V 成分の符号 (PAL スイッチ)。NTSC は常に +1
+    ///
+    /// PAL は 1 ラインごとに V を反転する。1 フレームは奇数 (625) ラインなのでフレームごとに、
+    /// 第 2 フィールドの有効ラインは第 1 フィールドから 313 ライン後なのでフィールド間でも反転する。
+    #[inline(always)]
+    pub fn v_switch(&self, field_line: usize, frame: u64, parity: u8) -> f32 {
+        match self.kind {
+            TvStandard::Ntsc => 1.0,
+            TvStandard::Pal => {
+                if (field_line + (frame as usize & 1) + parity as usize) & 1 == 0 {
+                    1.0
+                } else {
+                    -1.0
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_pal(&self) -> bool {
+        self.kind == TvStandard::Pal
     }
 }
 
@@ -147,7 +188,30 @@ pub static NTSC: Standard = Standard {
     ire: Levels { sync: -40.0, blank: 0.0, black: 7.5, white: 100.0, burst: 20.0 },
 };
 
+/// PAL-B/G。4fsc = 17.734475 MHz、1 ライン 64 µs = 1135 サンプル。
+/// 同期 4.7 µs、バースト 10 周期 (同期の立ち下がりから 5.6 µs)、有効映像 52 µs (10.5 µs から)
+pub static PAL: Standard = Standard {
+    kind: TvStandard::Pal,
+    fsc: 4_433_618.75,
+    fs: 4.0 * 4_433_618.75,
+    line_samples: 1135,
+    sync_end: 83,
+    burst_start: 100,
+    burst_end: 140,
+    active_start: 186,
+    active_width: 922,
+    field_lines: 288,
+    total_lines_per_field: 312.5,
+    field_rate: 50.0,
+    field_rate_ratio: (50, 1),
+    sound_carrier_hz: 5.5e6,
+    video_bw_hz: 5.0e6,
+    // 同期 300 mV、バースト 300 mVp-p (700 mV = 100)。黒 = ブランキング (セットアップなし)
+    ire: Levels { sync: -300.0 / 7.0, blank: 0.0, black: 0.0, white: 100.0, burst: 150.0 / 7.0 },
+};
+
 const _: () = assert!(NTSC.line_samples <= MAX_LINE_SAMPLES && NTSC.active_width <= MAX_ACTIVE_WIDTH);
+const _: () = assert!(PAL.line_samples <= MAX_LINE_SAMPLES && PAL.active_width <= MAX_ACTIVE_WIDTH);
 
 /// サブキャリアの 4 象限位相テーブル (4fsc サンプリングでは位相は 90° 刻みになる)
 pub const COS4: [f32; 4] = [1.0, 0.0, -1.0, 0.0];

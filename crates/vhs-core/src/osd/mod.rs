@@ -12,7 +12,7 @@ pub mod face;
 mod font;
 pub mod markup;
 
-use crate::decoder::find_sync_edge;
+use crate::decoder::{find_sync_edge, pal_ident};
 use crate::frame::{Field, VideoFrame};
 use crate::params::OsdParams;
 use crate::timing::*;
@@ -228,18 +228,33 @@ impl Osd {
         debug_assert!(std::ptr::eq(s, self.std));
         let (w, lv) = (self.w, s.ire);
         let span = lv.span();
+        let pal = s.is_pal();
+        // キャラクタジェネレータは再生信号の H 同期でタイミングを取る
+        let sync_offset = |line: &[f32]| {
+            find_sync_edge(line, s).map(|e| e - s.sync_end as f32).filter(|d| d.abs() < 40.0).unwrap_or(0.0)
+        };
+        // PAL: 再生信号のバーストから PAL スイッチの向きを決める (テープの垂直揺れでライン順がずれるため)
+        let s0 = if pal {
+            let mus: Vec<Option<f32>> = (0..s.field_lines)
+                .map(|l| {
+                    let line = field.line(l);
+                    Some(burst_phase(line, sync_offset(line), s))
+                })
+                .collect();
+            pal_ident(&mus, s)
+        } else {
+            1.0
+        };
         for l in 0..s.field_lines {
             let row = 2 * l + field.parity as usize;
             if row < y0 || row >= y1 {
                 continue;
             }
             let line = field.line_mut(l);
-            // キャラクタジェネレータは再生信号の H 同期でタイミングを取る
-            let d = find_sync_edge(line, s)
-                .map(|e| e - s.sync_end as f32)
-                .filter(|d| d.abs() < 40.0)
-                .unwrap_or(0.0);
-            let psi = burst_phase(line, d, s);
+            let d = sync_offset(line);
+            let sv = if !pal || l % 2 == 0 { s0 } else { -s0 };
+            // バーストの位相 μ から副搬送波位相 φ へ (PAL は μ = φ - 45°·sV)
+            let psi = burst_phase(line, d, s) + if pal { std::f32::consts::FRAC_PI_4 * sv } else { 0.0 };
             let src = &self.overlay[row * w..(row + 1) * w];
             for x in 0..w {
                 // 文字発生器の立ち上がり (≒100 ns) を 3 タップで近似
@@ -259,10 +274,14 @@ impl Osd {
                 }
                 let (r, g, bb) = (o[0], o[1], o[2]);
                 let y = lv.black * o[3] + span * (0.299 * r + 0.587 * g + 0.114 * bb);
-                let i = span * (0.5959 * r - 0.2746 * g - 0.3213 * bb);
-                let q = span * (0.2115 * r - 0.5227 * g + 0.3112 * bb);
+                // NTSC: (i, q) = (I, Q)、PAL: (i, q) = (±V, U)。どちらも i は cos 側、q は sin 側
+                let (i, q, rot) = if pal {
+                    (sv * span * (0.615 * r - 0.515 * g - 0.100 * bb), span * (-0.147 * r - 0.289 * g + 0.436 * bb), 0.0)
+                } else {
+                    (span * (0.5959 * r - 0.2746 * g - 0.3213 * bb), span * (0.2115 * r - 0.5227 * g + 0.3112 * bb), IQ_ROT)
+                };
                 // 色副搬送波は再生バーストに位相同期させる (デッキ内の APC 出力を使う想定)
-                let theta = m as f32 * std::f32::consts::FRAC_PI_2 + psi + IQ_ROT;
+                let theta = m as f32 * std::f32::consts::FRAC_PI_2 + psi + rot;
                 let s = y + i * theta.cos() + q * theta.sin();
                 let v = &mut line[m as usize];
                 *v = *v * (1.0 - o[3]) + s;

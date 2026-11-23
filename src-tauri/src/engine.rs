@@ -385,3 +385,53 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 最新フレームの (幅, 高さ) を待って返す
+    fn wait_size(engine: &Engine, want: (u32, u32)) -> (u32, u32) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut got = (0, 0);
+        while Instant::now() < deadline {
+            {
+                let slot = engine.shared.frame.lock().unwrap();
+                if slot.bytes.len() >= 16 {
+                    let w = u32::from_le_bytes(slot.bytes[8..12].try_into().unwrap());
+                    let h = u32::from_le_bytes(slot.bytes[12..16].try_into().unwrap());
+                    got = (w, h);
+                }
+            }
+            if got == want {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        got
+    }
+
+    /// GUI からテレビ方式を切り替えると、出力の大きさが方式に合わせて変わる (テストパターン入力)
+    #[test]
+    fn switching_standard_changes_output_size() {
+        let engine = Engine::start();
+        assert_eq!(wait_size(&engine, (754, 480)), (754, 480));
+
+        let mut p = Params::default();
+        p.standard = vhs_core::TvStandard::Pal;
+        engine.set_params(p.clone());
+        assert_eq!(wait_size(&engine, (922, 576)), (922, 576));
+        assert_eq!(engine.shared.stats.lock().unwrap().error, None);
+
+        p.standard = vhs_core::TvStandard::Ntsc;
+        engine.set_params(p);
+        assert_eq!(wait_size(&engine, (754, 480)), (754, 480));
+    }
+
+    /// GUI から送られる JSON (snake_case) で PAL を受け取れる
+    #[test]
+    fn params_json_accepts_pal() {
+        let p: Params = serde_json::from_str(r#"{"standard":"pal"}"#).unwrap();
+        assert_eq!(p.standard, vhs_core::TvStandard::Pal);
+    }
+}

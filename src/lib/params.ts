@@ -1,9 +1,11 @@
 // vhs-core の Params と対応する型と、GUI 用のパラメータ定義。
 // Rust 側 (crates/vhs-core/src/params.rs) を変更したらここも合わせる。
 
+export type Standard = "ntsc" | "pal";
+
 export type Params = {
-  /** テレビ方式 (今は NTSC のみ) */
-  standard: "ntsc";
+  /** テレビ方式 */
+  standard: Standard;
   camera: {
     enabled: boolean;
     exposure_ev: number;
@@ -38,7 +40,7 @@ export type Params = {
     white_clip: number;
     camera_gamma: number;
   };
-  encoder: { luma_bw_mhz: number; i_bw_mhz: number; q_bw_mhz: number; chroma_gain: number };
+  encoder: { luma_bw_mhz: number; i_bw_mhz: number; q_bw_mhz: number; uv_bw_mhz: number; chroma_gain: number };
   tape: {
     enabled: boolean;
     luma_bw_mhz: number;
@@ -77,6 +79,7 @@ export type Params = {
   };
   rf: {
     enabled: boolean;
+    placement: "before_tape" | "after_tape" | "both";
     snow_ire: number;
     ghost_delay_us: number;
     ghost_gain: number;
@@ -90,6 +93,8 @@ export type Params = {
     acc: boolean;
     color_killer: boolean;
     h_pll: number;
+    burst_pll: number;
+    pal_delay_line: boolean;
     contrast: number;
     brightness: number;
     saturation: number;
@@ -158,6 +163,19 @@ const b = (path: string, label: string): Control => ({ kind: "bool", path, label
 
 export const groups: Group[] = [
   {
+    title: "テレビ方式",
+    note: "方式を変えると画像サイズ (NTSC 754×480 / PAL 922×576) とフィールド周波数が変わる。録画中なら録画は止まる。",
+    controls: [
+      {
+        kind: "select", path: "standard", label: "方式",
+        options: [
+          { value: "ntsc", label: "NTSC (525 / 59.94 Hz)" },
+          { value: "pal", label: "PAL-B/G (625 / 50 Hz)" },
+        ],
+      },
+    ],
+  },
+  {
     title: "撮像管カメラ: 光学系",
     note: "入力映像を被写体とみなし、RGB 3 管式の撮像管カメラで撮影した映像にする (パイプラインの先頭)。",
     controls: [
@@ -210,7 +228,7 @@ export const groups: Group[] = [
     title: "OSD (画面表示)",
     note:
       "タグ: <color=色> <bg=色> <edge=色> <shadow=色> <size=1〜8> <blink> は </名前> で閉じる。" +
-      "<pos=X,Y> (754×480 座標) と <align=left|center|right> は単独。" +
+      "<pos=X,Y> (NTSC 754×480 / PAL 922×576 座標) と <align=left|center|right> は単独。" +
       "色は #rgb / #rrggbb / #rrggbbaa / white, black, red, green, blue, yellow, cyan, magenta, gray, orange, none。" +
       "置換: {counter} {date} {time} {Y} {M} {D} {h} {m} {s} {MON} {h12} {ampm} {f}。" +
       "記号: ▶ ◀ ■ ● ▲ ▼ ⏸ ❚ █ °。\\< \\{ で記号そのもの。",
@@ -295,9 +313,17 @@ export const groups: Group[] = [
   },
   {
     title: "RF 接続 (アンテナ端子)",
-    note: "デッキの RF 出力をテレビのチューナで受けたときの劣化。",
+    note: "チューナ経由で受けたときの劣化。放送受信 (録画前) / デッキ→テレビ (再生後) / 両方を選べる。",
     controls: [
       b("rf.enabled", "RF 経由で受像"),
+      {
+        kind: "select", path: "rf.placement", label: "経路",
+        options: [
+          { value: "after_tape", label: "デッキ → テレビ (テープの後)" },
+          { value: "before_tape", label: "放送受信 → 録画 (テープの前)" },
+          { value: "both", label: "両方 (放送を録画して RF で再生)" },
+        ],
+      },
       r("rf.snow_ire", "スノー", 0, 30, 0.1, "IRE"),
       r("rf.ghost_gain", "ゴースト", -0.6, 0.6, 0.01),
       r("rf.ghost_delay_us", "ゴースト遅延", 0.1, 10, 0.05, "µs"),
@@ -312,6 +338,7 @@ export const groups: Group[] = [
       r("encoder.luma_bw_mhz", "輝度帯域", 1, 6, 0.05, "MHz"),
       r("encoder.i_bw_mhz", "I 帯域", 0.2, 3, 0.05, "MHz"),
       r("encoder.q_bw_mhz", "Q 帯域", 0.1, 3, 0.05, "MHz"),
+      r("encoder.uv_bw_mhz", "U/V 帯域 (PAL)", 0.2, 3, 0.05, "MHz"),
       r("encoder.chroma_gain", "色ゲイン", 0, 3, 0.01),
     ],
   },
@@ -320,12 +347,14 @@ export const groups: Group[] = [
     controls: [
       {
         kind: "select", path: "decoder.yc_separation", label: "Y/C 分離",
-        options: [{ value: "notch", label: "ノッチ (ドットクロール)" }, { value: "comb", label: "1H くし形" }],
+        options: [{ value: "notch", label: "ノッチ (ドットクロール)" }, { value: "comb", label: "くし形 (NTSC 1H / PAL 2H)" }],
       },
       r("decoder.chroma_bw_mhz", "色差帯域", 0.2, 3, 0.05, "MHz"),
       b("decoder.acc", "ACC"),
       b("decoder.color_killer", "カラーキラー"),
       r("decoder.h_pll", "水平 AFC 追従", 0, 1, 0.01),
+      r("decoder.burst_pll", "色副搬送波 PLL 追従", 0.02, 1, 0.01),
+      b("decoder.pal_delay_line", "PAL 遅延線"),
       r("decoder.contrast", "コントラスト", 0, 2, 0.01),
       r("decoder.brightness", "明るさ", -0.5, 0.5, 0.01),
       r("decoder.saturation", "色の濃さ", 0, 3, 0.01),
@@ -494,6 +523,10 @@ export const help: Record<string, string> = {
 
   // RF
   "rf.enabled": "デッキの RF 出力 (アンテナ端子) をテレビのチューナで受けた状態にする。",
+  "rf.placement":
+    "デッキ → テレビ: 再生したデッキの RF 出力をテレビで受ける (テープの劣化の後に乗る)。\n" +
+    "放送受信 → 録画: 電波で受けた放送を録画した状態 (スノーやゴーストもテープに記録され、テープの劣化を一緒に受ける)。\n" +
+    "両方: 放送を録画したテープを RF 接続で見る。2 回の雑音は独立。",
   "rf.snow_ire": "受信ノイズ (スノー) の量。電波が弱いときの砂嵐。",
   "rf.ghost_gain": "反射波によるゴースト (二重像) の強さ。負にすると反転ゴースト。",
   "rf.ghost_delay_us": "ゴーストの遅れ。大きいほど二重像が右に離れる。",
@@ -502,7 +535,11 @@ export const help: Record<string, string> = {
   "rf.sound_beat": "音声搬送波が映像に漏れる量。920 kHz ビートや音声に連動する縞が出る。",
 
   // エンコーダ
-  "encoder.luma_bw_mhz": "送出側の輝度帯域。NTSC 放送は 4.2 MHz。",
+  standard:
+    "テレビ方式。NTSC は位相の誤差がそのまま色相のずれになる。PAL は V 成分をラインごとに反転して送るので、" +
+    "受像機の遅延線で上下のラインを平均すると位相の誤差が打ち消され、色相ではなく彩度の低下になる。",
+  "encoder.luma_bw_mhz": "送出側の輝度帯域。NTSC 放送は 4.2 MHz、PAL-B/G は 5 MHz。",
+  "encoder.uv_bw_mhz": "PAL の U/V 信号の帯域。規格は 1.3 MHz。NTSC では使わない。",
   "encoder.i_bw_mhz": "I 信号 (橙〜青緑方向の色差) の帯域。NTSC 規格は 1.3 MHz。",
   "encoder.q_bw_mhz": "Q 信号 (紫〜黄緑方向の色差) の帯域。NTSC 規格は 0.6 MHz。",
   "encoder.chroma_gain": "送出時の色信号の振幅倍率。大きいとテープでの色飽和が起きやすい。",
@@ -510,8 +547,13 @@ export const help: Record<string, string> = {
   // デコーダ
   "decoder.yc_separation":
     "輝度と色の分離方式。ノッチは安価な方式でドットクロールや虹色のクロスカラーが出る。" +
-    "1H くし形はそれらを抑えるが、縦方向の色の境目がにじむ。",
+    "くし形はそれらを抑えるが、縦方向の色の境目がにじむ (PAL は 2 ライン離れたラインと比べるので、にじみが大きい)。",
   "decoder.chroma_bw_mhz": "受像機で復調した後の色差の帯域。小さいほど色がにじむ。",
+  "decoder.burst_pll":
+    "色副搬送波の PLL がバーストに追従する速さ (ライン単位)。1 = ラインごとに即時同期。" +
+    "小さくするとテープのライン単位の位相ゆらぎを取り切れず、NTSC では色相の横縞、PAL では彩度のむらになる。",
+  "decoder.pal_delay_line":
+    "PAL の 1H 遅延線 (PAL-D)。切るとシンプル PAL になり、位相の誤差がライン交互の色相ずれ (ハノーバーバー) として見える。",
   "decoder.acc": "カラーバーストの振幅で色の濃さを自動調整する (ACC)。",
   "decoder.color_killer": "カラーバーストが弱いとき色を消して白黒表示にする。",
   "decoder.h_pll": "水平同期 (AFC) の追従の速さ。0 = 追従しない、1 = 即時追従。小さいと時間軸の揺れがそのまま見える。",
@@ -570,7 +612,13 @@ export function setPath(obj: any, path: string, value: any) {
 
 type DeepPartial<T> = { [K in keyof T]?: T[K] extends object ? DeepPartial<T[K]> : T[K] };
 
-// 組み込みプリセット (既定値からの差分)
+// テレビ方式を切り替えたときに合わせる値 (その方式で一般的な値)
+export const standardDiffs: Record<Standard, DeepPartial<Params>> = {
+  ntsc: { standard: "ntsc", encoder: { luma_bw_mhz: 4.2 } },
+  pal: { standard: "pal", encoder: { luma_bw_mhz: 5.0 }, audio: { hum_hz: 50 } },
+};
+
+// 組み込みプリセット (既定値からの差分。テレビ方式は今の方式を引き継ぐ)
 export const presets: { name: string; diff: DeepPartial<Params> }[] = [
   { name: "VHS 標準 (SP)", diff: {} },
   {
@@ -628,6 +676,12 @@ export const presets: { name: string; diff: DeepPartial<Params> }[] = [
     },
   },
   {
+    name: "電波の弱い放送を録画",
+    diff: {
+      rf: { enabled: true, placement: "before_tape", snow_ire: 8, ghost_gain: 0.25, ghost_delay_us: 2.5 },
+    },
+  },
+  {
     name: "DVD レコーダーでダビング",
     diff: {
       capture: { enabled: true, bitrate_kbps: 4500, chroma_subsampling: "420", gop: 15 },
@@ -652,6 +706,10 @@ export const presets: { name: string; diff: DeepPartial<Params> }[] = [
   {
     name: "放送受信 (テープなし)",
     diff: { tape: { enabled: false } },
+  },
+  {
+    name: "PAL VHS (シンプル PAL 受像機)",
+    diff: { ...standardDiffs.pal, decoder: { pal_delay_line: false, burst_pll: 0.3 } },
   },
 ];
 

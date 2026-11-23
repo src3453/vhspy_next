@@ -12,6 +12,9 @@ use crate::tape::TapeSim;
 use crate::timing::Standard;
 use std::time::{Duration, Instant};
 
+/// 放送受信側の RF の乱数系列をデッキ→テレビ側と分けるための値
+const RF_BROADCAST_SEED: u64 = 0x5246_4252_4f41_4443;
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StageTimings {
     pub camera: Duration,
@@ -33,6 +36,9 @@ pub struct Pipeline {
     camera: CameraSim,
     field: Field,
     tape: TapeSim,
+    /// 放送受信 (テープの前) の RF
+    rf_broadcast: RfSim,
+    /// デッキ → テレビ (テープの後) の RF
     rf: RfSim,
     decoder: Decoder,
     capture: CaptureSim,
@@ -55,6 +61,7 @@ impl Pipeline {
             camera,
             field: Field::new(std),
             tape: TapeSim::new(std),
+            rf_broadcast: RfSim::default(),
             rf: RfSim::default(),
             decoder: Decoder::new(std),
             capture: CaptureSim::default(),
@@ -172,6 +179,11 @@ impl Pipeline {
         let t0 = Instant::now();
         encode_field(input, &mut self.field, &p.encoder);
         let t1 = Instant::now();
+        // 放送受信: 受信時の劣化ごとテープに記録される (デッキ→テレビの RF とは独立した雑音)
+        if p.rf.enabled && p.rf.placement.before_tape() {
+            self.rf_broadcast.process(&mut self.field, &p.rf, p.seed ^ RF_BROADCAST_SEED);
+        }
+        let t1r = Instant::now();
         if p.tape.enabled {
             self.tape.process(&mut self.field, &p.tape, &p.transport, p.seed);
         }
@@ -179,7 +191,7 @@ impl Pipeline {
             self.osd.insert_composite(&mut self.field, opacity);
         }
         let t2 = Instant::now();
-        if p.rf.enabled {
+        if p.rf.enabled && p.rf.placement.after_tape() {
             self.rf.process(&mut self.field, &p.rf, p.seed);
         }
         let t3 = Instant::now();
@@ -191,7 +203,7 @@ impl Pipeline {
         let t5 = Instant::now();
 
         self.timings =
-            StageTimings { camera: t0 - tc, encode: t1 - t0, tape: t2 - t1, rf: t3 - t2, decode: t4 - t3, capture: t5 - t4 };
+            StageTimings { camera: t0 - tc, encode: t1 - t0, tape: t2 - t1r, rf: (t1r - t1) + (t3 - t2), decode: t4 - t3, capture: t5 - t4 };
         self.field_index += 1;
         self.output()
     }
