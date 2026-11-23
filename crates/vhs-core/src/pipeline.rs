@@ -6,7 +6,7 @@ use crate::decoder::Decoder;
 use crate::encoder::encode_field;
 use crate::frame::{Field, LinearFrame, RgbFrame, RgbaFrame, VideoFrame};
 use crate::osd::Osd;
-use crate::params::{OsdMode, Params};
+use crate::params::{Connection, OsdMode, Params};
 use crate::rf::RfSim;
 use crate::tape::TapeSim;
 use crate::timing::Standard;
@@ -184,6 +184,12 @@ impl Pipeline {
             self.rf_broadcast.process(&mut self.field, &p.rf, p.seed ^ RF_BROADCAST_SEED);
         }
         let t1r = Instant::now();
+        // S 映像はテープの再生出力を受像機へ直接つなぐときだけ (テープなし・テープ後の RF 接続はコンポジット)
+        self.field.set_separate(
+            p.output.connection == Connection::SVideo
+                && p.tape.enabled
+                && !(p.rf.enabled && p.rf.placement.after_tape()),
+        );
         if p.tape.enabled {
             self.tape.process(&mut self.field, &p.tape, &p.transport, p.seed);
         }

@@ -3,7 +3,8 @@
   import { listen } from "@tauri-apps/api/event";
   import { open, save } from "@tauri-apps/plugin-dialog";
   import { onMount } from "svelte";
-  import { groups, help, getPath, setPath, presets, applyDiff, standardDiffs, type Params } from "#lib/params.ts";
+  import { groups, help, getPath, setPath, presets, applyDiff, retarget, type Params } from "#lib/params.ts";
+  import Scopes from "#lib/Scopes.svelte";
 
   type Stats = {
     source: string;
@@ -29,6 +30,7 @@
   let message = $state("");
   let exporting = $state<ExportProgress | null>(null);
   let canvas: HTMLCanvasElement;
+  let scopes: Scopes | undefined = $state();
 
   const VIDEO_EXTS = ["mp4", "mkv", "mov", "avi", "webm", "m4v", "mpg", "ts"];
   const IMAGE_EXTS = ["png", "jpg", "jpeg", "bmp", "webp"];
@@ -110,7 +112,12 @@
   }
 
   function applyPreset(i: number) {
-    if (defaults) params = applyDiff(applyDiff(defaults, standardDiffs[params?.standard ?? "ntsc"]), presets[i].diff);
+    // 今のテレビ方式とテープのフォーマットは引き継ぐ (プリセットが指定していればそちら)
+    if (!defaults) return;
+    // FM モデルで使っていたときだけフォーマットの値をすべて引き継ぐ (簡易モデルの既定の見た目は変えない)
+    const fm = params?.tape.luma_model === "fm";
+    const base = retarget(defaults, params?.standard ?? "ntsc", params?.tape.format ?? "vhs", fm);
+    params = applyDiff(base, presets[i].diff);
   }
 
   async function pickFont(path: string) {
@@ -164,7 +171,9 @@
               canvas.width = w;
               canvas.height = h;
             }
-            ctx.putImageData(new ImageData(new Uint8ClampedArray(buf, 16, w * h * 4), w, h), 0, 0);
+            const px = new Uint8ClampedArray(buf, 16, w * h * 4);
+            ctx.putImageData(new ImageData(px, w, h), 0, 0);
+            scopes?.push(px, w, h);
           }
         } catch (e) {
           console.error(e);
@@ -225,6 +234,8 @@
     <div class="screen">
       <canvas bind:this={canvas} width="754" height="480"></canvas>
     </div>
+
+    <Scopes bind:this={scopes} standard={params?.standard ?? "ntsc"} />
 
     <div class="status">
       <span>{stats?.source ?? "…"}</span>
@@ -348,11 +359,13 @@
                   value={getPath(params, c.path)}
                   onchange={(e) => {
                     const v = (e.target as HTMLSelectElement).value;
-                    // 方式の切り替えは、その方式で一般的な値 (帯域・電源周波数) も合わせる
+                    // 方式・フォーマットの切り替えは、それに合う値 (帯域・搬送波・電源周波数など) もまとめて合わせる
                     // ($state のプロキシは structuredClone できないので、スナップショットを渡す)
-                    if (c.path === "standard")
-                      params = applyDiff($state.snapshot(params), standardDiffs[v as Params["standard"]]);
-                    else setPath(params, c.path, v);
+                    if (c.path === "standard" || c.path === "tape.format") {
+                      const snap = $state.snapshot(params) as Params;
+                      setPath(snap, c.path, v);
+                      params = retarget(snap, snap.standard, snap.tape.format, c.path === "tape.format");
+                    } else setPath(params, c.path, v);
                   }}
                 >
                   {#each c.options as o}<option value={o.value}>{o.label}</option>{/each}

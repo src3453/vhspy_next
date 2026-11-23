@@ -2,6 +2,7 @@
 // Rust 側 (crates/vhs-core/src/params.rs) を変更したらここも合わせる。
 
 export type Standard = "ntsc" | "pal";
+export type TapeFormat = "vhs" | "svhs" | "beta" | "super_beta" | "video8" | "hi8" | "custom";
 
 export type Params = {
   /** テレビ方式 */
@@ -43,6 +44,14 @@ export type Params = {
   encoder: { luma_bw_mhz: number; i_bw_mhz: number; q_bw_mhz: number; uv_bw_mhz: number; chroma_gain: number };
   tape: {
     enabled: boolean;
+    format: TapeFormat;
+    luma_model: "simple" | "fm";
+    fm_sync_mhz: number;
+    fm_white_mhz: number;
+    fm_channel_mhz: number;
+    fm_noise: number;
+    color_under_khz: number;
+    color_under_level: number;
     luma_bw_mhz: number;
     emphasis_db: number;
     emphasis_mhz: number;
@@ -131,7 +140,7 @@ export type Params = {
     mono: boolean;
     codec_kbps: number;
   };
-  output: { deinterlace: "weave" | "bob" };
+  output: { deinterlace: "weave" | "bob"; connection: "composite" | "s_video" };
   osd: {
     enabled: boolean;
     mode: "composite" | "tape";
@@ -248,6 +257,46 @@ export const groups: Group[] = [
       r("osd.scale", "文字サイズ", 1, 8, 1),
       r("osd.opacity", "不透明度", 0, 1, 0.01),
       { kind: "text", path: "osd.start_datetime", label: "開始日時", placeholder: "1995-08-12 14:30:00" },
+    ],
+  },
+  {
+    title: "テープ: フォーマット",
+    note:
+      "フォーマットを選ぶと搬送波周波数・低域変換周波数・帯域などをまとめて設定し、FM モデルに切り替える " +
+      "(テレビ方式を変えたときも、その方式での値に合わせ直す)。",
+    controls: [
+      {
+        kind: "select", path: "tape.format", label: "フォーマット",
+        options: [
+          { value: "vhs", label: "VHS" },
+          { value: "svhs", label: "S-VHS" },
+          { value: "beta", label: "ベータ (β-II)" },
+          { value: "super_beta", label: "SuperBeta" },
+          { value: "video8", label: "Video8" },
+          { value: "hi8", label: "Hi8" },
+          { value: "custom", label: "カスタム" },
+        ],
+      },
+      {
+        kind: "select", path: "tape.luma_model", label: "輝度の FM モデル",
+        options: [
+          { value: "fm", label: "FM を計算 (変調・伝送路・復調)" },
+          { value: "simple", label: "簡易 (加算ノイズ・確率的ベアディング)" },
+        ],
+      },
+      r("tape.fm_sync_mhz", "シンクチップ周波数", 2, 8, 0.05, "MHz"),
+      r("tape.fm_white_mhz", "ホワイトピーク周波数", 2.5, 10, 0.05, "MHz"),
+      r("tape.fm_channel_mhz", "再生伝送路の帯域", 2.5, 12, 0.1, "MHz"),
+      r("tape.fm_noise", "RF ノイズ", 0, 0.5, 0.005),
+      r("tape.color_under_khz", "低域変換周波数", 400, 1200, 1, "kHz"),
+      r("tape.color_under_level", "低域変換の記録レベル", 0, 0.6, 0.01),
+      {
+        kind: "select", path: "output.connection", label: "受像機への接続",
+        options: [
+          { value: "composite", label: "コンポジット (映像端子)" },
+          { value: "s_video", label: "S 映像 (Y/C 分離)" },
+        ],
+      },
     ],
   },
   {
@@ -555,6 +604,25 @@ export const help: Record<string, string> = {
   "decoder.pal_delay_line":
     "PAL の 1H 遅延線 (PAL-D)。切るとシンプル PAL になり、位相の誤差がライン交互の色相ずれ (ハノーバーバー) として見える。",
   "decoder.acc": "カラーバーストの振幅で色の濃さを自動調整する (ACC)。",
+
+  // テープのフォーマット
+  "tape.format":
+    "テープのフォーマット。VHS / ベータ / Video8 は同じ方式 (FM 輝度 + 低域変換クロマ) で、搬送波周波数と帯域が違う。" +
+    "S-VHS / Hi8 は搬送波を上げて輝度帯域を広げた高画質版で、S 映像でつなぐのが普通。",
+  "tape.luma_model":
+    "FM を計算: 輝度で搬送波を周波数変調し、ヘッド・テープの伝送路とノイズを通して、ゼロ交差の間隔から復調する。" +
+    "ベアディング・砂嵐・RF レベルの低下が自然に出る (重い)。簡易: 帯域制限と加算ノイズで近似する (軽い)。",
+  "tape.fm_sync_mhz": "シンクチップ (同期の先端) を記録する搬送波周波数。VHS 3.4 MHz、Hi8 5.7 MHz など。",
+  "tape.fm_white_mhz": "ホワイトピークを記録する搬送波周波数。シンクチップとの差が周波数偏移。",
+  "tape.fm_channel_mhz":
+    "再生伝送路 (ヘッド・テープ・再生アンプ) の帯域。狭いと白のエッジで搬送波が弱まり、" +
+    "ゼロ交差を見落として白の右に黒い筋 (ベアディング) が出る。ヘッドの摩耗の目安。",
+  "tape.fm_noise": "再生 RF のノイズ (搬送波に対する比)。大きいと白黒の粒状ノイズが増え、トラッキングずれで一気に悪化する。",
+  "tape.color_under_khz": "低域変換クロマの周波数。VHS 629 kHz、ベータ 688 kHz、8mm 743 kHz (NTSC)。",
+  "tape.color_under_level": "低域変換クロマの記録レベル (FM 搬送波に対する比)。大きいと鮮やかな色の部分の輝度にモアレが乗る。",
+  "output.connection":
+    "再生機と受像機の接続。S 映像は Y と C を分けたまま送るので、受像機の Y/C 分離によるドットクロール・クロスカラーが出ない。" +
+    "テープを通さないとき・テープの後に RF でつなぐときはコンポジットになる。",
   "decoder.color_killer": "カラーバーストが弱いとき色を消して白黒表示にする。",
   "decoder.h_pll": "水平同期 (AFC) の追従の速さ。0 = 追従しない、1 = 即時追従。小さいと時間軸の揺れがそのまま見える。",
   "decoder.contrast": "受像機のコントラスト (映像の振幅倍率)。",
@@ -611,6 +679,73 @@ export function setPath(obj: any, path: string, value: any) {
 }
 
 type DeepPartial<T> = { [K in keyof T]?: T[K] extends object ? DeepPartial<T[K]> : T[K] };
+
+// テープのフォーマットごとの値。NTSC / PAL で搬送波・低域変換周波数が違うものは方式で分ける。
+// 数値は各規格の公称値 (搬送波はシンクチップ〜ホワイトピーク)。再生伝送路の帯域は画質の目安として決めた値
+type FormatSpec = {
+  fm: { ntsc: [number, number]; pal: [number, number] };
+  colorUnder: { ntsc: number; pal: number };
+  lumaBw: number;
+  channel: number;
+  noise: number;
+  connection: "composite" | "s_video";
+  extra?: DeepPartial<Params>;
+};
+const formatSpecs: Record<Exclude<TapeFormat, "custom">, FormatSpec> = {
+  vhs: {
+    fm: { ntsc: [3.4, 4.4], pal: [3.8, 4.8] }, colorUnder: { ntsc: 629, pal: 627 },
+    lumaBw: 3.0, channel: 5.5, noise: 0.05, connection: "composite",
+  },
+  svhs: {
+    fm: { ntsc: [5.4, 7.0], pal: [5.4, 7.0] }, colorUnder: { ntsc: 629, pal: 627 },
+    lumaBw: 5.0, channel: 8.5, noise: 0.04, connection: "s_video",
+  },
+  beta: {
+    fm: { ntsc: [3.6, 4.8], pal: [3.8, 5.2] }, colorUnder: { ntsc: 688, pal: 685 },
+    lumaBw: 3.2, channel: 6.0, noise: 0.05, connection: "composite",
+  },
+  super_beta: {
+    fm: { ntsc: [4.4, 5.6], pal: [4.4, 5.6] }, colorUnder: { ntsc: 688, pal: 685 },
+    lumaBw: 3.8, channel: 7.0, noise: 0.045, connection: "composite",
+  },
+  video8: {
+    fm: { ntsc: [4.2, 5.4], pal: [4.2, 5.4] }, colorUnder: { ntsc: 743, pal: 732 },
+    lumaBw: 3.0, channel: 6.5, noise: 0.05, connection: "composite",
+    // 薄いメタル (蒸着) テープはドロップアウトが多い
+    extra: { tape: { dropout_rate: 0.004 } },
+  },
+  hi8: {
+    fm: { ntsc: [5.7, 7.7], pal: [5.7, 7.7] }, colorUnder: { ntsc: 743, pal: 732 },
+    lumaBw: 4.8, channel: 9.5, noise: 0.04, connection: "s_video",
+    extra: { tape: { dropout_rate: 0.004 } },
+  },
+};
+
+/// フォーマットに合わせる値 (カスタムは何も変えない)。
+/// `full` = false なら、テレビ方式で変わる値 (搬送波周波数・低域変換周波数) だけを返す
+export function formatDiff(format: TapeFormat, standard: Standard, full = true): DeepPartial<Params> {
+  if (format === "custom") return { tape: { format } };
+  const f = formatSpecs[format];
+  const [sync, white] = f.fm[standard];
+  if (!full) return { tape: { fm_sync_mhz: sync, fm_white_mhz: white, color_under_khz: f.colorUnder[standard] } };
+  return applyDiff(
+    {
+      tape: {
+        format, luma_model: "fm", fm_sync_mhz: sync, fm_white_mhz: white, fm_channel_mhz: f.channel,
+        fm_noise: f.noise, color_under_khz: f.colorUnder[standard], luma_bw_mhz: f.lumaBw,
+        dropout_rate: 0.002,
+      },
+      output: { connection: f.connection },
+    },
+    f.extra ?? {},
+  );
+}
+
+/// テレビ方式とテープのフォーマットに合わせて値を設定し直す。
+/// `fullFormat` = false (方式だけを変えたとき) は、フォーマットの値のうち方式で変わるものだけ合わせる
+export function retarget(p: Params, standard: Standard, format: TapeFormat, fullFormat = true): Params {
+  return applyDiff(applyDiff(p, standardDiffs[standard]), formatDiff(format, standard, fullFormat));
+}
 
 // テレビ方式を切り替えたときに合わせる値 (その方式で一般的な値)
 export const standardDiffs: Record<Standard, DeepPartial<Params>> = {

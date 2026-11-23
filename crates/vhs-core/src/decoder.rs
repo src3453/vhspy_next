@@ -16,8 +16,10 @@ use rayon::prelude::*;
 pub struct Decoder {
     /// AFC が推定している同期後縁位置 (フィールドをまたいで保持)
     h_sync_pos: f32,
-    /// AFC 補正後のフィールド
+    /// AFC 補正後のフィールド (S 映像なら Y)
     aligned: Vec<f32>,
+    /// AFC 補正後の C (S 映像のときだけ使う)
+    aligned_c: Vec<f32>,
     corrections: Vec<f32>,
     /// Y/C 分離後の輝度・色 (field_lines × line_samples)
     luma: Vec<f32>,
@@ -63,6 +65,7 @@ impl Decoder {
         Self {
             h_sync_pos: s.sync_end as f32,
             aligned: vec![0.0; n],
+            aligned_c: Vec::new(),
             corrections: vec![0.0; s.field_lines],
             luma: vec![0.0; n],
             chroma: vec![0.0; n],
@@ -150,6 +153,14 @@ impl Decoder {
         self.aligned.par_chunks_mut(ls).enumerate().for_each(|(l, dst)| {
             fractional_shift(field.line(l), dst, -corr[l], lv.blank);
         });
+        // S 映像: C も同じ補正で揃える
+        let separate = field.separate;
+        if separate {
+            self.aligned_c.resize(fl * ls, 0.0);
+            self.aligned_c.par_chunks_mut(ls).enumerate().for_each(|(l, dst)| {
+                fractional_shift(field.chroma_line(l).unwrap(), dst, -corr[l], 0.0);
+            });
+        }
 
         // --- Y/C 分離とバースト検出 (ライン並列) ---
         let notch = Cascade::new(&[Biquad::notch_at(s.fsc, 1.0, s.fs)]);
@@ -157,7 +168,7 @@ impl Decoder {
         // くし形の相手: 副搬送波が 180° ずれたライン (NTSC は 1H、PAL は V の符号も揃う 2H 前)
         let comb_lag = if pal { 2 } else { 1 };
         let use_comb = p.yc_separation == YcSeparation::Comb;
-        let aligned = &self.aligned;
+        let (aligned, aligned_c) = (&self.aligned, &self.aligned_c);
         let burst_gate = s.burst_start..s.burst_end + 16;
         self.luma
             .par_chunks_mut(ls)
@@ -166,7 +177,15 @@ impl Decoder {
             .enumerate()
             .for_each(|(l, ((y, c), burst))| {
                 let x = &aligned[l * ls..(l + 1) * ls];
-                if use_comb && l >= comb_lag {
+                if separate {
+                    // S 映像: Y/C 分離は要らない (C は帯域外の雑音だけ落とす)
+                    let xc = &aligned_c[l * ls..(l + 1) * ls];
+                    let mut bp = c_bp;
+                    for n in 0..ls {
+                        y[n] = x[n];
+                        c[n] = bp.process(xc[n]);
+                    }
+                } else if use_comb && l >= comb_lag {
                     let prev = &aligned[(l - comb_lag) * ls..(l - comb_lag + 1) * ls];
                     let mut bp = c_bp;
                     for n in 0..ls {

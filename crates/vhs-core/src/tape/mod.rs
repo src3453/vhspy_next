@@ -1,10 +1,10 @@
-//! VHS 方式の磁気テープ記録・再生モデル。
+//! 低域変換方式 (VHS / ベータ / 8mm とその高画質版) の磁気テープ記録・再生モデル。
 //!
 //! 処理は実機の信号経路に沿って 3 段階に分かれる。
 //!
 //! 1. 記録/再生の信号経路 (ライン並列)
-//!    - 輝度: Y/C 分離 → 帯域制限 → エンファシス → ホワイトクリップ → FM 伝送 (ノイズ・過変調による
-//!      ベアディング) → ディエンファシス → ピーキング
+//!    - 輝度: Y/C 分離 → 帯域制限 → エンファシス → ホワイトクリップ → FM 伝送 → ディエンファシス → ピーキング。
+//!      FM 伝送は 2 通り: Simple (加算ノイズと確率的なベアディングで近似) と Fm (変調・伝送路・復調を計算、[`fm`])
 //!    - 色: バンドパス → 低域変換 (複素包絡線で等価的に扱う) → 狭帯域化 → 磁気飽和 → AM/位相ノイズ
 //!      → 再生時の高域変換
 //! 2. 媒体の欠陥: ドロップアウトとドロップアウト補償 (DOC)、しわ (クリース)、ヘッド目詰まり
@@ -12,11 +12,13 @@
 //! 3. 走行系: ジッタ、ワウフラッタ、スキュー、ヘッド切替、トラッキングずれ (時間軸誤差として
 //!    ライン全体 = 同期・バーストごとずらす。補正は受像機の AFC/バースト同期に任せる)、垂直方向の揺れ
 
+pub mod fm;
 pub mod magnetic;
 
 use crate::filter::{Biquad, Cascade, fractional_shift};
 use crate::frame::Field;
-use crate::params::{TapeParams, TransportParams};
+use crate::params::{LumaModel, TapeParams, TransportParams};
+use fm::{FmChannel, FmConfig};
 use crate::rng::Rng;
 use crate::timing::*;
 use magnetic::MagneticTransfer;
@@ -42,6 +44,40 @@ pub struct TapeSim {
     crease: Option<(f32, f32, f32, f32)>,
     /// ヘッド目詰まりの残りフィールド数
     clog_left: f32,
+    /// ラインごとのドロップアウト区間 [開始, 終了) (Fm モデルで RF の欠落として使う)
+    drops: Vec<Vec<(usize, usize)>>,
+}
+
+/// 色の低域変換記録 → 再生 (複素包絡線で等価的に扱う)
+#[derive(Clone, Copy)]
+struct ChromaRec {
+    c_bp: Cascade,
+    lp_i: Cascade,
+    lp_q: Cascade,
+    n_i: Cascade,
+    n_q: Cascade,
+    mag: MagneticTransfer,
+    /// クロマノイズの rms [IRE]
+    cn: f32,
+}
+
+impl ChromaRec {
+    /// 1 サンプル進めて、再生した複素包絡線 (I, Q) を返す。`k` は副搬送波の位相象限
+    #[inline(always)]
+    fn step(&mut self, xv: f32, k: usize, rng: &mut Rng) -> (f32, f32) {
+        let cr = self.c_bp.process(xv);
+        let mut bi = self.lp_i.process(2.0 * cr * COS4[k]);
+        let mut bq = self.lp_q.process(2.0 * cr * SIN4[k]);
+        let a = (bi * bi + bq * bq).sqrt();
+        if a > 1e-4 {
+            let g = self.mag.amplitude(a) / a;
+            bi *= g;
+            bq *= g;
+        }
+        bi += self.n_i.process(rng.normal()) * self.cn;
+        bq += self.n_q.process(rng.normal()) * self.cn;
+        (bi, bq)
+    }
 }
 
 impl Default for TapeSim {
@@ -63,18 +99,27 @@ impl TapeSim {
             v_state: 0.0,
             crease: None,
             clog_left: 0.0,
+            drops: vec![Vec::new(); s.field_lines],
         }
     }
 }
 
 impl TapeSim {
+    /// 1 フィールドを記録・再生する。`field.separate` が立っていれば Y/C を分けたまま (S 映像) 出力する
     pub fn process(&mut self, field: &mut Field, tp: &TapeParams, tr: &TransportParams, seed: u64) {
         if self.y_buf.len() != field.data.len() {
             *self = Self::new(field.std);
         }
         self.compute_rf_level(field, tp, tr, seed);
-        self.signal_path(field, tp, seed);
-        self.dropouts(field, tp, seed);
+        if tp.luma_model == LumaModel::Fm {
+            // ドロップアウトは RF の欠落として FM 復調に通し、DOC はその後で掛ける
+            self.plan_dropouts(field, tp, seed);
+            self.signal_path(field, tp, seed);
+            self.compensate_dropouts(field, tp);
+        } else {
+            self.signal_path(field, tp, seed);
+            self.dropouts(field, tp, seed);
+        }
         self.transport(field, tr, seed);
     }
 
@@ -151,6 +196,20 @@ impl TapeSim {
         let c_lp = Cascade::butter_lowpass_at(2, tp.chroma_bw_khz * 1e3, fs);
         let cn_lp = Cascade::butter_lowpass_at(2, tp.chroma_bw_khz * 1e3, fs);
         let mag = MagneticTransfer::new(tp.magnetic_model, tp.saturation_ire);
+        let fm = (tp.luma_model == LumaModel::Fm).then(|| {
+            FmChannel::new(&FmConfig {
+                fs,
+                f_sync_hz: tp.fm_sync_mhz * 1e6,
+                f_white_hz: tp.fm_white_mhz * 1e6,
+                levels: lv,
+                channel_bw_hz: tp.fm_channel_mhz * 1e6,
+                luma_bw_hz: tp.luma_bw_mhz * 1e6,
+                noise: tp.fm_noise.max(0.0),
+                color_under_hz: tp.color_under_khz * 1e3,
+                color_under_level: tp.color_under_level.max(0.0),
+            })
+        });
+        let drops = &self.drops;
 
         // 帯域制限した白色雑音の rms を 1 に戻す係数
         let luma_noise_norm = (0.5 * fs / (tp.luma_bw_mhz * 1e6)).sqrt();
@@ -171,7 +230,8 @@ impl TapeSim {
                 let noise_gain = 1.0 / rf_level[l];
                 let (mut rec_notch, mut rec_lp, mut pre, mut de, mut noise_lp, mut sharp) =
                     (rec_notch, rec_lp, pre, de, noise_lp, sharp);
-                let (mut c_bp, mut lp_i, mut lp_q, mut n_i, mut n_q) = (c_bp, c_lp, c_lp, cn_lp, cn_lp);
+                let cn = tp.chroma_noise_ire * chroma_noise_norm * noise_gain;
+                let mut chroma = ChromaRec { c_bp, lp_i: c_lp, lp_q: c_lp, n_i: cn_lp, n_q: cn_lp, mag, cn };
 
                 // 再生時の低域変換クロマの位相誤差 (APC で取り切れない残留分)
                 let dphi = rng.normal() * phase_noise * noise_gain.min(4.0);
@@ -179,6 +239,47 @@ impl TapeSim {
                 let mut beard_left = 0u32;
 
                 co.fill(0.0);
+                // 再生クロマを (遅延をつけて) 書き込む
+                let put_chroma = |co: &mut [f32], n: usize, bi: f32, bq: f32| {
+                    let (ri, rq) = (bi * cd - bq * sd, bi * sd + bq * cd);
+                    let out_n = n as i32 + delay;
+                    if (0..ls as i32).contains(&out_n) {
+                        let m = out_n as usize;
+                        let km = (m + base) & 3;
+                        co[m] = ri * COS4[km] + rq * SIN4[km];
+                    }
+                };
+
+                if let Some(fm) = &fm {
+                    // ---- Fm モデル: 記録する輝度と色を 1 ライン分作ってから FM で伝送する ----
+                    let mut rec = [0f32; MAX_LINE_SAMPLES];
+                    let mut cu_i = [0f32; MAX_LINE_SAMPLES];
+                    let mut cu_q = [0f32; MAX_LINE_SAMPLES];
+                    for n in 0..ls {
+                        let xv = x[n];
+                        let yr = rec_lp.process(rec_notch.process(xv));
+                        rec[n] = pre.process(yr).clamp(lv.sync - 20.0, tp.white_clip_ire);
+                        let (bi, bq) = chroma.step(xv, (n + base) & 3, &mut rng);
+                        cu_i[n] = bi;
+                        cu_q[n] = bq;
+                        put_chroma(co, n, bi, bq);
+                    }
+                    let mut demod = [0f32; MAX_LINE_SAMPLES];
+                    fm.process_line(
+                        &rec[..ls],
+                        &cu_i[..ls],
+                        &cu_q[..ls],
+                        rf_level[l],
+                        &drops[l],
+                        &mut rng,
+                        &mut demod[..ls],
+                    );
+                    for n in 0..ls {
+                        yo[n] = sharp.process(de.process(demod[n]));
+                    }
+                    return;
+                }
+
                 for n in 0..ls {
                     let xv = x[n];
 
@@ -201,28 +302,46 @@ impl TapeSim {
                     yo[n] = sharp.process(yd);
 
                     // ---- 色 (低域変換) ----
-                    let k = (n + base) & 3;
-                    let cr = c_bp.process(xv);
-                    let mut bi = lp_i.process(2.0 * cr * COS4[k]);
-                    let mut bq = lp_q.process(2.0 * cr * SIN4[k]);
-                    let a = (bi * bi + bq * bq).sqrt();
-                    if a > 1e-4 {
-                        let g = mag.amplitude(a) / a;
-                        bi *= g;
-                        bq *= g;
-                    }
-                    let cn = tp.chroma_noise_ire * chroma_noise_norm * noise_gain;
-                    bi += n_i.process(rng.normal()) * cn;
-                    bq += n_q.process(rng.normal()) * cn;
-                    let (ri, rq) = (bi * cd - bq * sd, bi * sd + bq * cd);
-                    let out_n = n as i32 + delay;
-                    if (0..ls as i32).contains(&out_n) {
-                        let m = out_n as usize;
-                        let km = (m + base) & 3;
-                        co[m] = ri * COS4[km] + rq * SIN4[km];
-                    }
+                    let (bi, bq) = chroma.step(xv, (n + base) & 3, &mut rng);
+                    put_chroma(co, n, bi, bq);
                 }
             });
+    }
+
+    /// Fm モデル用: ラインごとのドロップアウト区間を決める (発生確率は Simple モデルと同じ)
+    fn plan_dropouts(&mut self, field: &Field, tp: &TapeParams, seed: u64) {
+        let ls = field.std.line_samples;
+        for (l, segs) in self.drops.iter_mut().enumerate() {
+            segs.clear();
+            if tp.dropout_rate <= 0.0 {
+                continue;
+            }
+            let mut rng = Rng::derive(seed, field.index, l as u64, STREAM_DROPOUT);
+            let rf = self.rf_level[l];
+            let prob = (tp.dropout_rate * (1.0 + 30.0 * (1.0 - rf))).min(1.0);
+            while segs.len() < 3 && rng.uniform() < prob {
+                let start = (rng.uniform() * ls as f32) as usize;
+                let len = rng.exponential(tp.dropout_length * (1.0 + 2.0 * (1.0 - rf))) as usize + 2;
+                segs.push((start, (start + len).min(ls)));
+            }
+        }
+    }
+
+    /// Fm モデル用: ドロップアウト補償 (DOC)。RF の欠落を検出して 1H 前のラインで置き換える。
+    /// 補償しない場合は、FM 復調器が拾ったノイズ (白黒の砂嵐) がそのまま残る
+    fn compensate_dropouts(&mut self, field: &Field, tp: &TapeParams) {
+        let ls = field.std.line_samples;
+        for l in 0..field.std.field_lines {
+            for &(start, end) in &self.drops[l] {
+                for n in start..end {
+                    let i = l * ls + n;
+                    if tp.dropout_compensation && l > 0 {
+                        self.y_buf[i] = self.y_buf[i - ls];
+                    }
+                    self.c_buf[i] = 0.0;
+                }
+            }
+        }
     }
 
     fn dropouts(&mut self, field: &Field, tp: &TapeParams, seed: u64) {
@@ -286,14 +405,23 @@ impl TapeSim {
         let (y_buf, c_buf) = (&self.y_buf, &self.c_buf);
         let hs_noise = tr.head_switch_noise;
         let index = field.index;
-        field.data.par_chunks_mut(ls).enumerate().for_each(|(l, out)| {
+        let separate = field.separate;
+        // S 映像なら C も同じ時間軸誤差で別に書き出す
+        let mut c_dummy = Vec::new();
+        let c_out = if separate { &mut field.chroma } else { &mut c_dummy };
+        let c_chunks: Vec<Option<&mut [f32]>> = if separate {
+            c_out.chunks_mut(ls).map(Some).collect()
+        } else {
+            (0..fl).map(|_| None).collect()
+        };
+        field.data.par_chunks_mut(ls).zip(c_chunks.into_par_iter()).enumerate().for_each(|(l, (out, c_out))| {
             let mut comp_buf = [0f32; MAX_LINE_SAMPLES];
             let comp = &mut comp_buf[..ls];
             let src = l as isize - v_shift;
-            if (0..fl as isize).contains(&src) {
-                let base = src as usize * ls;
+            let src_line = (0..fl as isize).contains(&src).then(|| src as usize * ls);
+            if let Some(base) = src_line {
                 for n in 0..ls {
-                    comp[n] = y_buf[base + n] + c_buf[base + n];
+                    comp[n] = if separate { y_buf[base + n] } else { y_buf[base + n] + c_buf[base + n] };
                 }
             } else {
                 // 垂直帰線区間が見えている: 同期だけの黒いライン
@@ -316,6 +444,12 @@ impl TapeSim {
                 }
             }
             fractional_shift(comp, out, offsets[l], lv.blank);
+            if let Some(c_out) = c_out {
+                match src_line {
+                    Some(base) => fractional_shift(&c_buf[base..base + ls], c_out, offsets[l], 0.0),
+                    None => c_out.fill(0.0),
+                }
+            }
         });
     }
 }

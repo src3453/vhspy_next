@@ -76,3 +76,13 @@ fn golden_pal_full() {
     p.decoder.yc_separation = vhs_core::params::YcSeparation::Comb;
     run("pal_full", p);
 }
+
+#[test]
+fn golden_ntsc_fm_svideo() {
+    let mut p = full();
+    p.tape.luma_model = vhs_core::params::LumaModel::Fm;
+    p.tape.fm_channel_mhz = 4.5;
+    p.output.connection = vhs_core::params::Connection::SVideo;
+    p.rf.enabled = false;
+    run("ntsc_fm_svideo", p);
+}

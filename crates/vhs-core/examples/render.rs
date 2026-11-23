@@ -3,7 +3,7 @@
 //! cargo run -p vhs-core --release --example render -- in.png out.png [params.json] [fields] [pan_px]
 //!   pan_px: 1 フィールドごとに画像を横へずらす量 (動き補償・圧縮の確認用)
 //!   in が .hdr / .exr ならシーンリニアな HDR 入力として扱う (撮像管カメラに白を超える光が届く)
-//! cargo run -p vhs-core --release --example render -- --bench [fields]
+//! cargo run -p vhs-core --release --example render -- --bench [fields] [params.json]
 
 use std::time::{Duration, Instant};
 use vhs_core::{LinearFrame, Params, Pipeline, RgbFrame, Standard};
@@ -60,7 +60,10 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(|s| s.as_str()) == Some("--bench") {
         let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(600);
-        let params = Params::default();
+        let params: Params = match args.get(2) {
+            Some(p) => serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap(),
+            None => Params::default(),
+        };
         let input = test_pattern(params.standard.spec());
         let mut p = Pipeline::new(params);
         for _ in 0..30 {

@@ -218,6 +218,108 @@ mod tests {
         }
     }
 
+    /// FM モデル: ノイズ・クロマ重畳なしなら、変調 → 伝送路 → 復調で輝度と色がほぼ保たれる (NTSC / PAL)
+    #[test]
+    fn fm_luma_clean_roundtrip() {
+        for pal in [false, true] {
+            let mut p = if pal { pal_clean() } else { Params::default() };
+            p.tape.enabled = true;
+            p.tape.luma_model = params::LumaModel::Fm;
+            p.tape.fm_noise = 0.0;
+            p.tape.color_under_level = 0.0;
+            p.tape.chroma_noise_ire = 0.0;
+            p.tape.chroma_phase_noise_deg = 0.0;
+            p.tape.dropout_rate = 0.0;
+            p.transport.jitter_samples = 0.0;
+            p.transport.wow_samples = 0.0;
+            p.transport.vertical_jitter = 0.0;
+            p.transport.head_switch_noise = 0.0;
+            // 比較対象: 同じテープ条件で FM を近似しない (ノイズなし) Simple モデル。
+            // 色は FM モデルの方が濃く残る (復調後のローパスで輝度経路に残る副搬送波が減るため) ので、
+            // 輝度と色相だけ比べる
+            let mut simple = p.clone();
+            simple.tape.luma_model = params::LumaModel::Simple;
+            simple.tape.luma_noise_ire = 0.0;
+            simple.tape.bearding_strength = 0.0;
+            let luma = |c: [i32; 3]| 0.299 * c[0] as f32 + 0.587 * c[1] as f32 + 0.114 * c[2] as f32;
+            let hue = |c: [i32; 3]| {
+                let y = luma(c);
+                (0.877 * (c[0] as f32 - y)).atan2(0.492 * (c[2] as f32 - y)).to_degrees()
+            };
+            for rgb in [[16u8, 16, 16], [128, 128, 128], [235, 235, 235], [200, 40, 40], [40, 40, 200]] {
+                let pl = run_flat(&p, rgb, 6);
+                let (w, h) = pl.output_size();
+                let got = pixel(&pl, h / 2 + 1, w / 2);
+                let want = pixel(&run_flat(&simple, rgb, 6), h / 2 + 1, w / 2);
+                let msg = format!("pal={pal} input {rgb:?} fm {got:?} simple {want:?}");
+                assert!((luma(got) - luma(want)).abs() <= 2.0, "{msg}");
+                if rgb[0] != rgb[1] {
+                    assert!((hue(got) - hue(rgb.map(i32::from))).abs() <= 6.0, "{msg}");
+                }
+                // 搬送波の漏れ・復調の揺れが残っていないこと (平坦な入力は平坦なまま)
+                let row: Vec<f32> = (w / 8..w * 7 / 8).map(|x| pixel(&pl, h / 2 + 1, x)[1] as f32).collect();
+                let mean = row.iter().sum::<f32>() / row.len() as f32;
+                let sd = (row.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / row.len() as f32).sqrt();
+                assert!(sd < 0.6, "{msg}: sd {sd}");
+            }
+        }
+    }
+
+    /// S 映像: 色はコンポジットと同じように再生され、輝度の細かい縞はノッチで削られずに残る
+    #[test]
+    fn svideo_keeps_color_and_luma_detail() {
+        for pal in [false, true] {
+            let mut p = if pal { pal_clean() } else { Params::default() };
+            p.tape.enabled = true;
+            p.tape.luma_noise_ire = 0.0;
+            p.tape.chroma_noise_ire = 0.0;
+            p.tape.chroma_phase_noise_deg = 0.0;
+            p.tape.dropout_rate = 0.0;
+            p.transport.jitter_samples = 0.0;
+            p.transport.wow_samples = 0.0;
+            p.transport.vertical_jitter = 0.0;
+            p.output.connection = params::Connection::SVideo;
+            for rgb in COLORS {
+                let pl = run_flat(&p, rgb, 6);
+                let (w, h) = pl.output_size();
+                let got = pixel(&pl, h / 2 + 1, w / 2);
+                for c in 0..3 {
+                    // テープの色の飽和で少し落ちる
+                    assert!((got[c] - rgb[c] as i32).abs() <= 28, "pal={pal} input {rgb:?} got {got:?}");
+                }
+            }
+
+            // 約 2.3 MHz の縦縞 (テープの輝度帯域内、受像機のノッチの帯域内)
+            let s = p.standard.spec();
+            let (w, h) = s.image_size();
+            let period = s.fs / 2.3e6;
+            let mut stripes = RgbFrame::new(w, h);
+            for (i, px) in stripes.data.chunks_exact_mut(3).enumerate() {
+                let x = (i % w) as f32;
+                let v = (128.0 + 90.0 * (std::f32::consts::TAU * x / period).sin()) as u8;
+                px.copy_from_slice(&[v, v, v]);
+            }
+            let contrast = |p: &Params| {
+                let mut pl = Pipeline::new(p.clone());
+                for _ in 0..6 {
+                    pl.process_field(&stripes);
+                }
+                // コンポジットではクロスカラー (偽色) が出るので、RGB から輝度を求めて比べる
+                let row: Vec<f32> = (w / 3..w * 2 / 3)
+                    .map(|x| {
+                        let c = pixel(&pl, h / 2 + 1, x);
+                        0.299 * c[0] as f32 + 0.587 * c[1] as f32 + 0.114 * c[2] as f32
+                    })
+                    .collect();
+                row.iter().cloned().fold(f32::MIN, f32::max) - row.iter().cloned().fold(f32::MAX, f32::min)
+            };
+            let mut composite = p.clone();
+            composite.output.connection = params::Connection::Composite;
+            let (sv, cv) = (contrast(&p), contrast(&composite));
+            assert!(sv > cv * 1.1, "pal={pal}: S-video contrast {sv} vs composite {cv}");
+        }
+    }
+
     /// PAL をテープに通しても色が保たれる。垂直揺れでライン順がずれても PAL スイッチの向きを取り違えない
     #[test]
     fn pal_through_tape_keeps_color() {

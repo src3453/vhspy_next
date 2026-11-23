@@ -181,12 +181,56 @@ pub enum MagneticModel {
     Tanh,
 }
 
+/// テープのフォーマット (表示・既定値の選択用のラベル。信号処理は下の数値パラメータで決まる)
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TapeFormat {
+    #[default]
+    Vhs,
+    Svhs,
+    Beta,
+    SuperBeta,
+    Video8,
+    Hi8,
+    /// 数値を個別に調整したもの
+    Custom,
+}
+
+/// 輝度の FM 記録のモデル
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LumaModel {
+    /// ベースバンドの近似: 帯域制限 + 加算ノイズ + 確率的なベアディング (軽い)
+    #[default]
+    Simple,
+    /// FM の変調・伝送路・復調を実際に計算する (搬送波周波数・RF レベルで画質が決まる)
+    Fm,
+}
+
 /// 記録・テープ媒体・再生の信号経路
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct TapeParams {
     /// false ならテープを通さない (放送をそのまま受像)
     pub enabled: bool,
+    /// フォーマット (GUI の既定値の選択に使うラベル)
+    pub format: TapeFormat,
+    /// 輝度の FM 記録のモデル
+    pub luma_model: LumaModel,
+
+    // --- FM 記録 (luma_model = Fm のときに使う) ---
+    /// シンクチップの搬送波周波数 [MHz]
+    pub fm_sync_mhz: f32,
+    /// ホワイトピークの搬送波周波数 [MHz]
+    pub fm_white_mhz: f32,
+    /// 再生伝送路 (ヘッド・テープ・再生アンプ) の帯域 [MHz]。狭いほど白のエッジでベアディングが出る
+    pub fm_channel_mhz: f32,
+    /// RF ノイズ (伝送路の帯域内の rms、搬送波振幅 1 に対する比)
+    pub fm_noise: f32,
+    /// 低域変換クロマの周波数 [kHz]
+    pub color_under_khz: f32,
+    /// 低域変換クロマの記録レベル (バースト振幅のとき、搬送波振幅 1 に対する比)。輝度へのモアレになる
+    pub color_under_level: f32,
 
     // --- 輝度 (FM 記録) 経路 ---
     /// 輝度記録帯域 [MHz] (VHS SP ≒ 3.0, LP/EP はさらに狭い)
@@ -197,11 +241,11 @@ pub struct TapeParams {
     pub emphasis_mhz: f32,
     /// エンファシス後のホワイトクリップ [IRE]
     pub white_clip_ire: f32,
-    /// FM 過変調で反転が起きる閾値 [IRE] (ベアディング)
+    /// FM 過変調で反転が起きる閾値 [IRE] (ベアディング。Simple モデルのみ)
     pub bearding_threshold_ire: f32,
     /// ベアディングの強さ
     pub bearding_strength: f32,
-    /// FM 復調ノイズ (rms) [IRE]
+    /// FM 復調ノイズ (rms) [IRE] (Simple モデルのみ。Fm モデルは fm_noise)
     pub luma_noise_ire: f32,
     /// 再生ピーキング [dB] (負で甘く、正でシャープ)
     pub sharpness_db: f32,
@@ -241,6 +285,14 @@ impl Default for TapeParams {
     fn default() -> Self {
         Self {
             enabled: true,
+            format: TapeFormat::Vhs,
+            luma_model: LumaModel::Simple,
+            fm_sync_mhz: 3.4,
+            fm_white_mhz: 4.4,
+            fm_channel_mhz: 5.5,
+            fm_noise: 0.05,
+            color_under_khz: 629.0,
+            color_under_level: 0.1,
             luma_bw_mhz: 3.0,
             emphasis_db: 10.0,
             emphasis_mhz: 0.6,
@@ -375,10 +427,23 @@ pub enum Deinterlace {
     Bob,
 }
 
+/// 再生機 → 受像機の接続
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Connection {
+    /// コンポジット (映像端子 1 本)。受像機で Y/C 分離するのでドットクロール・クロスカラーが出る
+    #[default]
+    Composite,
+    /// S 映像 (Y/C 分離のまま)。テープを通すときだけ有効 (放送受信・RF 接続はコンポジット)
+    SVideo,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct OutputParams {
     pub deinterlace: Deinterlace,
+    /// 再生機 → 受像機の接続
+    pub connection: Connection,
 }
 
 /// OSD の合成先

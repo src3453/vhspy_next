@@ -238,7 +238,8 @@ impl Osd {
             let mus: Vec<Option<f32>> = (0..s.field_lines)
                 .map(|l| {
                     let line = field.line(l);
-                    Some(burst_phase(line, sync_offset(line), s))
+                    // S 映像ならバーストは C 側にある
+                    Some(burst_phase(field.chroma_line(l).unwrap_or(line), sync_offset(line), s))
                 })
                 .collect();
             pal_ident(&mus, s)
@@ -250,11 +251,15 @@ impl Osd {
             if row < y0 || row >= y1 {
                 continue;
             }
-            let line = field.line_mut(l);
+            let (line, mut c_line) = field.lines_mut(l);
             let d = sync_offset(line);
             let sv = if !pal || l % 2 == 0 { s0 } else { -s0 };
             // バーストの位相 μ から副搬送波位相 φ へ (PAL は μ = φ - 45°·sV)
-            let psi = burst_phase(line, d, s) + if pal { std::f32::consts::FRAC_PI_4 * sv } else { 0.0 };
+            let burst_src: &[f32] = match &c_line {
+                Some(c) => c,
+                None => line,
+            };
+            let psi = burst_phase(burst_src, d, s) + if pal { std::f32::consts::FRAC_PI_4 * sv } else { 0.0 };
             let src = &self.overlay[row * w..(row + 1) * w];
             for x in 0..w {
                 // 文字発生器の立ち上がり (≒100 ns) を 3 タップで近似
@@ -282,9 +287,18 @@ impl Osd {
                 };
                 // 色副搬送波は再生バーストに位相同期させる (デッキ内の APC 出力を使う想定)
                 let theta = m as f32 * std::f32::consts::FRAC_PI_2 + psi + rot;
-                let s = y + i * theta.cos() + q * theta.sin();
-                let v = &mut line[m as usize];
-                *v = *v * (1.0 - o[3]) + s;
+                let m = m as usize;
+                match c_line.as_deref_mut() {
+                    // S 映像: Y と C に分けて重ねる
+                    Some(c) => {
+                        line[m] = line[m] * (1.0 - o[3]) + y;
+                        c[m] = c[m] * (1.0 - o[3]) + i * theta.cos() + q * theta.sin();
+                    }
+                    None => {
+                        let s = y + i * theta.cos() + q * theta.sin();
+                        line[m] = line[m] * (1.0 - o[3]) + s;
+                    }
+                }
             }
         }
     }

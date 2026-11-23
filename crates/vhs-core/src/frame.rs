@@ -228,12 +228,19 @@ impl RgbaFrame {
     }
 }
 
-/// 1 フィールド分のコンポジット信号 (field_lines × line_samples, 単位 IRE)
+/// 1 フィールド分の映像信号 (field_lines × line_samples, 単位 IRE)。
+///
+/// 通常はコンポジット信号 (`data`)。S 映像 (Y/C 分離) で送るときは `separate` が立ち、
+/// `data` が Y (同期付き)、`chroma` が C (バースト付き) になる。
 #[derive(Clone, Debug)]
 pub struct Field {
     /// この信号のテレビ方式
     pub std: &'static Standard,
     pub data: Vec<f32>,
+    /// S 映像のとき true (`data` = Y, `chroma` = C)
+    pub separate: bool,
+    /// S 映像の C 信号 (`separate` のときだけ使う)
+    pub chroma: Vec<f32>,
     /// 0 = 第 1 (偶数ライン) フィールド, 1 = 第 2 (奇数ライン) フィールド
     pub parity: u8,
     /// フレーム番号
@@ -250,7 +257,15 @@ impl Default for Field {
 
 impl Field {
     pub fn new(std: &'static Standard) -> Self {
-        Self { std, data: vec![0.0; std.field_lines * std.line_samples], parity: 0, frame: 0, index: 0 }
+        Self {
+            std,
+            data: vec![0.0; std.field_lines * std.line_samples],
+            separate: false,
+            chroma: Vec::new(),
+            parity: 0,
+            frame: 0,
+            index: 0,
+        }
     }
 
     pub fn set_index(&mut self, index: u64) {
@@ -265,5 +280,27 @@ impl Field {
 
     pub fn line_mut(&mut self, l: usize) -> &mut [f32] {
         &mut self.data[l * self.std.line_samples..(l + 1) * self.std.line_samples]
+    }
+
+    /// S 映像に切り替え、C 信号の領域を用意する
+    pub fn set_separate(&mut self, separate: bool) {
+        self.separate = separate;
+        if separate && self.chroma.len() != self.data.len() {
+            self.chroma = vec![0.0; self.data.len()];
+        }
+    }
+
+    /// S 映像の C 信号のライン (コンポジットなら None)
+    pub fn chroma_line(&self, l: usize) -> Option<&[f32]> {
+        let ls = self.std.line_samples;
+        self.separate.then(|| &self.chroma[l * ls..(l + 1) * ls])
+    }
+
+    /// Y (またはコンポジット) と C (S 映像のときだけ) のラインを同時に借りる
+    pub fn lines_mut(&mut self, l: usize) -> (&mut [f32], Option<&mut [f32]>) {
+        let ls = self.std.line_samples;
+        let y = &mut self.data[l * ls..(l + 1) * ls];
+        let c = if self.separate { Some(&mut self.chroma[l * ls..(l + 1) * ls]) } else { None };
+        (y, c)
     }
 }
