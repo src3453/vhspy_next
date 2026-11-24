@@ -54,14 +54,12 @@ pub struct Pipeline {
     decoder: Decoder,
     capture: CaptureSim,
     osd: Osd,
-    /// デッキのメニュー表示 (キャラクタジェネレータ)。再生出力のコンポジット / S 映像に重畳する
+    /// デッキのメニュー表示 (キャラクタジェネレータ)。テープ再生後のコンポジット信号に重畳する
     menu: Osd,
     /// メニュー表示の内容 (None なら表示しない)
     menu_params: Option<OsdParams>,
     /// エンコーダに渡す映像信号の作業領域 (カメラなしの入力、OSD の焼き込み)
     video: VideoFrame,
-    /// コンポジットを通さないときにデッキの OSD を重ねる作業領域
-    deck: VideoFrame,
     output: RgbaFrame,
     field_index: u64,
     pub timings: StageTimings,
@@ -89,7 +87,6 @@ impl Pipeline {
             menu: Osd::with_vcr_face(std),
             menu_params: None,
             video: VideoFrame::new(w, h),
-            deck: VideoFrame::new(w, h),
             output: RgbaFrame::new(w, h),
             field_index: 0,
             timings: StageTimings::default(),
@@ -115,7 +112,7 @@ impl Pipeline {
     }
 
     /// デッキのメニュー表示 (OSD マークアップ) を設定する。None で消す。
-    /// 内蔵の VCR 風ドットフォントで描き、デッキの再生出力 (コンポジット / S 映像) に重畳する。
+    /// 内蔵の VCR 風ドットフォントで描き、テープ再生後のコンポジット信号に重畳する。
     /// 座標系・タグは通常の OSD と同じ ([`crate::osd::markup`])。
     pub fn set_menu(&mut self, markup: Option<String>) {
         self.menu_params = markup.map(|markup| OsdParams { enabled: true, markup, scale: 2, ..OsdParams::default() });
@@ -275,10 +272,10 @@ impl Pipeline {
                     self.tbc.process(&mut self.field, &p.tbc, p.seed);
                 }
             }
+            // デッキ OSD は再生信号に同期してテープ後の出力へ混ぜる。後段の RF・復調処理は受ける。
             if osd == Some(OsdMode::Composite) {
                 self.osd.insert_composite(&mut self.field, opacity);
             }
-            // デッキのメニューは文字発生器が最後に重ねる
             if menu {
                 self.menu.insert_composite(&mut self.field, 1.0);
             }
@@ -296,22 +293,18 @@ impl Pipeline {
             );
         } else {
             // コンポジットを通さない: 映像をデジタルのまま出す (DV なら FireWire 取り込み)
-            let deck_osd = osd == Some(OsdMode::Composite);
-            let frame = if deck_osd || menu {
-                self.deck.data.copy_from_slice(&input.data);
-                if deck_osd {
-                    self.osd.burn_into(&mut self.deck, opacity);
-                }
-                if menu {
-                    self.menu.burn_into(&mut self.deck, 1.0);
-                }
-                &self.deck
-            } else {
-                input
-            };
-            write_field(frame, self.field.parity, p.output.deinterlace, &mut self.output);
+            write_field(input, self.field.parity, p.output.deinterlace, &mut self.output);
         }
         let t4 = Instant::now();
+        // コンポジット経路がない場合だけ、OSD をデジタル映像へ直接重ねる。
+        if !p.encoder.enabled {
+            if osd == Some(OsdMode::Composite) {
+                self.osd.burn_into_rgba(&mut self.output, opacity);
+            }
+            if menu {
+                self.menu.burn_into_rgba(&mut self.output, 1.0);
+            }
+        }
         if osd == Some(OsdMode::Capture) && p.capture.enabled {
             self.osd.burn_into_rgba(&mut self.output, opacity);
         }
