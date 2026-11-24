@@ -3,7 +3,7 @@
   import { listen } from "@tauri-apps/api/event";
   import { open, save } from "@tauri-apps/plugin-dialog";
   import { onMount } from "svelte";
-  import { groups, help, getPath, setPath, presets, applyDiff, retarget, type Params } from "#lib/params.ts";
+  import { groups, help, getPath, setPath, isActive, presets, applyDiff, retarget, type Params } from "#lib/params.ts";
   import Scopes from "#lib/Scopes.svelte";
 
   type Stats = {
@@ -359,11 +359,13 @@
           <summary>{g.title}</summary>
           {#if g.note}<p class="note">{g.note}</p>{/if}
           {#each g.controls as c}
+            {@const off = !isActive(params, c.path)}
             {#if c.kind === "range"}
-              <label class="row" title={help[c.path]}>
+              <label class="row" class:off title={help[c.path]}>
                 <span class="name">{c.label}</span>
                 <input
                   type="range"
+                  disabled={off}
                   min={c.min}
                   max={c.max}
                   step={c.step}
@@ -375,47 +377,51 @@
                 <span class="val">{fmt(getPath(params, c.path), c.step)}{c.unit ? ` ${c.unit}` : ""}</span>
               </label>
             {:else if c.kind === "bool"}
-              <label class="row check" title={help[c.path]}>
+              <label class="row check" class:off title={help[c.path]}>
                 <input
                   type="checkbox"
+                  disabled={off}
                   checked={getPath(params, c.path)}
                   onchange={(e) => setPath(params, c.path, (e.target as HTMLInputElement).checked)}
                 />
                 <span>{c.label}</span>
               </label>
             {:else if c.kind === "text"}
-              <label class="row" title={help[c.path]}>
+              <label class="row" class:off title={help[c.path]}>
                 <span class="name">{c.label}</span>
                 <input
                   class="wide"
                   type="text"
+                  disabled={off}
                   placeholder={c.placeholder}
                   value={getPath(params, c.path)}
                   onchange={(e) => setPath(params, c.path, (e.target as HTMLInputElement).value)}
                 />
               </label>
             {:else if c.kind === "font"}
-              <div class="row" title={help[c.path]}>
+              <div class="row" class:off title={help[c.path]}>
                 <span class="name">{c.label}</span>
                 <input
                   type="text"
+                  disabled={off}
                   placeholder="内蔵 5×7 ドット"
                   value={getPath(params, c.path)}
                   onchange={(e) => setPath(params, c.path, (e.target as HTMLInputElement).value.trim())}
                 />
                 <span class="btns">
-                  <button class="small" onclick={() => pickFont(c.path)} title="フォントファイルを選ぶ">…</button>
-                  <button class="small" onclick={() => setPath(params, c.path, "")} title="内蔵フォントに戻す">内蔵</button>
+                  <button class="small" disabled={off} onclick={() => pickFont(c.path)} title="フォントファイルを選ぶ">…</button>
+                  <button class="small" disabled={off} onclick={() => setPath(params, c.path, "")} title="内蔵フォントに戻す">内蔵</button>
                 </span>
               </div>
-              {#if fontStatus}
+              {#if fontStatus && !off}
                 <p class="note" class:err={fontStatus.error}>{fontStatus.text}</p>
               {/if}
             {:else if c.kind === "markup"}
-              <label class="stack" title={help[c.path]}>
+              <label class="stack" class:off title={help[c.path]}>
                 <span class="name">{c.label}</span>
                 <textarea
                   rows="6"
+                  disabled={off}
                   spellcheck="false"
                   value={getPath(params, c.path)}
                   oninput={(e) => setPath(params, c.path, (e.target as HTMLTextAreaElement).value)}
@@ -426,9 +432,10 @@
                 ></textarea>
               </label>
             {:else}
-              <label class="row" title={help[c.path]}>
+              <label class="row" class:off title={help[c.path]}>
                 <span class="name">{c.label}</span>
                 <select
+                  disabled={off}
                   value={getPath(params, c.path)}
                   onchange={(e) => {
                     const v = (e.target as HTMLSelectElement).value;
@@ -473,9 +480,9 @@
             <button class="small" onclick={() => invoke("reload_crt")} title="シェーダーを読み直す">⟳</button>
           </span>
         </div>
-        <label class="row">
+        <label class="row" class:off={!params.crt.enabled}>
           <span class="name">録画・書き出しの高さ</span>
-          <select bind:value={params.crt.height}>
+          <select bind:value={params.crt.height} disabled={!params.crt.enabled}>
             {#each CRT_HEIGHTS as h}<option value={h}>{Math.round((h * 4) / 3)}×{h}</option>{/each}
           </select>
         </label>
@@ -504,10 +511,11 @@
               {#if p.min === p.max}
                 <p class="crt-head">{p.description}</p>
               {:else}
-                <label class="row" title={`${p.id}\n(ダブルクリックでプリセットの値)`}>
+                <label class="row" class:off={!params.crt.enabled} title={`${p.id}\n(ダブルクリックでプリセットの値)`}>
                   <span class="name" class:changed={p.id in params.crt.params}>{p.description}</span>
                   <input
                     type="range"
+                    disabled={!params.crt.enabled}
                     min={p.min}
                     max={p.max}
                     step={p.step}
@@ -690,8 +698,18 @@
   button:hover:not(:disabled) {
     border-color: var(--accent);
   }
-  button:disabled {
+  button:disabled,
+  select:disabled,
+  input:disabled,
+  textarea:disabled {
     opacity: 0.5;
+    cursor: default;
+  }
+  /* 今の設定では効かないコントロール */
+  .off .name,
+  .off > span,
+  .off .val {
+    color: #5a5e69;
   }
   button.rec,
   .rec-label {

@@ -307,6 +307,7 @@ export const groups: Group[] = [
       "フォーマットを選ぶと搬送波周波数・低域変換周波数・帯域などをまとめて設定し、FM モデルに切り替える " +
       "(テレビ方式を変えたときも、その方式での値に合わせ直す)。",
     controls: [
+      b("tape.enabled", "テープを通す"),
       {
         kind: "select", path: "tape.format", label: "フォーマット",
         options: [
@@ -368,7 +369,6 @@ export const groups: Group[] = [
   {
     title: "テープ: 輝度 (FM 記録)",
     controls: [
-      b("tape.enabled", "テープを通す"),
       r("tape.luma_bw_mhz", "輝度帯域", 0.5, 5, 0.05, "MHz"),
       r("tape.luma_noise_ire", "FM ノイズ", 0, 20, 0.1, "IRE"),
       r("tape.emphasis_db", "エンファシス", 0, 20, 0.5, "dB"),
@@ -820,6 +820,134 @@ export const help: Record<string, string> = {
   "audio.mono": "音声をモノラルにまとめる。",
   "audio.codec_kbps": "書き出し時の AAC ビットレート。低いほど圧縮ノイズが増える。",
 };
+
+// ---- 今の設定で効かないコントロールの判定 ----
+// パイプライン (crates/vhs-core/src/pipeline.rs ほか) の分岐に合わせる。向こうを変えたらここも直す。
+
+/** コンポジット信号 (エンコーダ → 受像機) を通すか */
+const composite = (p: Params) => p.encoder.enabled;
+/** アナログのテープ処理 (FM 輝度・低域変換クロマ・走行系・TBC) を通すか */
+const analogTape = (p: Params) => composite(p) && p.tape.enabled && !isDigitalFormat(p.tape.format);
+/** DV の記録・再生を通すか (コンポジットを通さなくても FireWire 取り込みとして効く) */
+const dvTape = (p: Params) => p.tape.enabled && isDigitalFormat(p.tape.format);
+const fmModel = (p: Params) => p.tape.luma_model === "fm";
+const tanh = (p: Params) => p.tape.magnetic_model === "tanh";
+/** S 映像が実際に使われるか (テープの再生出力を受像機へ直接つなぐときだけ) */
+const sVideo = (p: Params) =>
+  composite(p) &&
+  p.output.connection === "s_video" &&
+  p.tape.enabled &&
+  !(p.rf.enabled && (p.rf.placement === "after_tape" || p.rf.placement === "both"));
+const ycSeparated = (p: Params) => composite(p) && !sVideo(p);
+const comb3d = (p: Params) => ycSeparated(p) && p.decoder.yc_separation === "comb3d";
+
+/** path → 効く条件。ここにない path は常に有効。
+ *  `"camera."` のように末尾が "." のキーはそのグループ全体 (個別のキーがあればそちらも満たす必要がある) */
+const activeWhen: Record<string, (p: Params) => boolean> = {
+  // 撮像管カメラ
+  "camera.": (p) => p.camera.enabled,
+  "camera.act_level": (p) => p.camera.act,
+
+  // OSD
+  "osd.": (p) => p.osd.enabled,
+  "osd.font_index": (p) => /\.(ttc|otc)$/i.test(p.osd.font.trim()),
+  "osd.font_dots": (p) => p.osd.font.trim() !== "",
+
+  // テープ (アナログ)
+  "tape.": analogTape,
+  "tape.format": (p) => p.tape.enabled,
+  // 簡易モデルでも磁性体が tanh なら、搬送波と色の相互変調の計算に搬送波・低域変換の値を使う
+  "tape.fm_sync_mhz": (p) => fmModel(p) || tanh(p),
+  "tape.fm_white_mhz": (p) => fmModel(p) || tanh(p),
+  "tape.color_under_khz": (p) => fmModel(p) || tanh(p),
+  "tape.color_under_level": (p) => fmModel(p) || tanh(p),
+  "tape.fm_channel_mhz": fmModel,
+  "tape.fm_noise": fmModel,
+  // FM を計算するモデルではノイズ・ベアディングは伝送路から自然に出る
+  "tape.luma_noise_ire": (p) => !fmModel(p),
+  "tape.bearding_threshold_ire": (p) => !fmModel(p),
+  "tape.bearding_strength": (p) => !fmModel(p),
+  "tape.saturation_ire": tanh,
+  "tape.rf_saturation": tanh,
+  "output.connection": (p) => composite(p) && p.tape.enabled && !(p.rf.enabled && p.rf.placement !== "before_tape"),
+
+  // DV
+  "dv.": dvTape,
+  "dv.ecc_miss": (p) => p.dv.ecc,
+
+  // 走行系・TBC (アナログのテープの再生時だけ)
+  "transport.": analogTape,
+  // トラッキングずれは Hi-Fi 音声のバズにも効く
+  "transport.tracking_error": (p) => analogTape(p) || (p.audio.enabled && p.audio.mode === "hifi"),
+  "tbc.": analogTape,
+  "tbc.window_samples": (p) => p.tbc.enabled,
+  "tbc.gate_samples": (p) => p.tbc.enabled,
+  "tbc.reacquire_lines": (p) => p.tbc.enabled,
+  "tbc.error_rate": (p) => p.tbc.enabled,
+  "tbc.residual_samples": (p) => p.tbc.enabled,
+  "tbc.bits": (p) => p.tbc.enabled,
+  "tbc.regenerate_sync": (p) => p.tbc.enabled,
+
+  // RF
+  "rf.": composite,
+  "rf.placement": (p) => p.rf.enabled,
+  "rf.snow_ire": (p) => p.rf.enabled,
+  "rf.ghost_gain": (p) => p.rf.enabled,
+  "rf.ghost_delay_us": (p) => p.rf.enabled,
+  "rf.interference_ire": (p) => p.rf.enabled,
+  "rf.interference_mhz": (p) => p.rf.enabled,
+  "rf.sound_beat": (p) => p.rf.enabled,
+
+  // エンコーダ
+  "encoder.luma_bw_mhz": composite,
+  "encoder.chroma_gain": composite,
+  "encoder.i_bw_mhz": (p) => composite(p) && p.standard === "ntsc",
+  "encoder.q_bw_mhz": (p) => composite(p) && p.standard === "ntsc",
+  "encoder.uv_bw_mhz": (p) => composite(p) && p.standard === "pal",
+
+  // 受像機
+  "decoder.": composite,
+  "decoder.yc_separation": ycSeparated,
+  "decoder.motion_adaptive": comb3d,
+  "decoder.motion_threshold_ire": (p) => comb3d(p) && p.decoder.motion_adaptive,
+  "decoder.frame_buffer_bits": comb3d,
+  "decoder.pal_delay_line": (p) => p.standard === "pal",
+
+  // キャプチャ
+  "capture.": (p) => p.capture.enabled,
+  "capture.bitrate_kbps": (p) => p.capture.codec,
+  "capture.gop": (p) => p.capture.codec,
+  "capture.motion_search": (p) => p.capture.codec,
+  "capture.rate_control": (p) => p.capture.codec,
+
+  // 音声
+  "audio.": (p) => p.audio.enabled,
+  "audio.low_cut_hz": (p) => p.audio.mode === "linear",
+  "audio.high_cut_hz": (p) => p.audio.mode === "linear",
+  "audio.hifi_buzz": (p) => p.audio.mode === "hifi",
+};
+
+/** グループ全体の条件 ("camera." など) を掛けない path (グループのオン・オフ自体のスイッチなど) */
+const ignoreGroup = new Set([
+  "camera.enabled",
+  "osd.enabled",
+  "tape.enabled",
+  "tape.format",
+  "transport.tracking_error",
+  "capture.enabled",
+  "audio.enabled",
+]);
+
+/** 今の設定でそのコントロールが効くか */
+export function isActive(p: Params, path: string): boolean {
+  const dot = path.indexOf(".");
+  if (dot > 0 && !ignoreGroup.has(path)) {
+    const group = activeWhen[path.slice(0, dot + 1)];
+    if (group && !group(p)) return false;
+  }
+  const own = activeWhen[path];
+  return own ? own(p) : true;
+}
 
 export function getPath(obj: any, path: string): any {
   return path.split(".").reduce((o, k) => o?.[k], obj);
