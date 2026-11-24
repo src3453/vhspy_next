@@ -125,16 +125,28 @@ impl InputAdjust {
         });
 
         // --- 輪郭強調 (アンシャープマスク, 輝度のみ) ---
-        // 負の量は細部を削る (甘い画)。縦方向は 1H 遅延線の補正が弱かった機種を真似て別に絞れる
+        // 負の量は細部を削る (甘い画)。
+        // 細部を横成分 Y - Bh と縦成分 Bh - Bhv (Bh: 横だけぼかし, Bhv: 縦横ぼかし) に分け、
+        // 縦成分に `sharpness_vertical` を掛ける。0 で横方向だけ (1H 遅延線の垂直補正がない機種)、
+        // 1 で普通の縦横同じアンシャープマスク (Y - Bhv) と一致し、その間は線形に変わる
         let amount = p.sharpness;
-        if amount.abs() > 1e-4 && p.sharpness_radius_px > 0.05 {
+        let r = p.sharpness_radius_px;
+        if amount.abs() > 1e-4 && r > 0.05 {
+            let v = p.sharpness_vertical.clamp(0.0, 1.0);
+            // luma_blur = Bh, plane = Bhv
             self.luma_blur.copy_from_slice(&self.luma);
-            let sy = p.sharpness_radius_px * p.sharpness_vertical.clamp(0.0, 1.0);
-            blur_plane(&mut self.luma_blur, &mut self.tmp, w, h, p.sharpness_radius_px, sy);
+            blur_plane(&mut self.luma_blur, &mut self.tmp, w, h, r, 0.0);
+            if v > 0.0 {
+                self.plane.copy_from_slice(&self.luma_blur);
+                blur_plane(&mut self.plane, &mut self.tmp, w, h, 0.0, r);
+            } else {
+                self.plane.copy_from_slice(&self.luma_blur);
+            }
             let coring = p.sharpness_coring.max(0.0);
             let limit = if p.sharpness_limit > 0.0 { p.sharpness_limit } else { f32::INFINITY };
-            self.rgb.par_chunks_mut(3).zip(self.luma.par_iter().zip(self.luma_blur.par_iter())).for_each(|(px, (&y, &yb))| {
-                let d = y - yb;
+            let detail = self.luma.par_iter().zip(self.luma_blur.par_iter()).zip(self.plane.par_iter());
+            self.rgb.par_chunks_mut(3).zip(detail).for_each(|(px, ((&y, &bh), &bhv))| {
+                let d = (y - bh) + v * (bh - bhv);
                 let d = d.signum() * (d.abs() - coring).max(0.0);
                 let add = (d * amount).clamp(-limit, limit);
                 for v in px.iter_mut() {
@@ -227,6 +239,28 @@ mod tests {
         let out = a.process_rgb(&src, &p);
         let row = &out.data[4 * 32 * 3..5 * 32 * 3];
         assert!(row[15 * 3] > 64 && row[16 * 3] < 192);
+    }
+
+    /// 横縞 (縦方向の輪郭) は「横だけ」では強調されず、「縦横」では強調される
+    #[test]
+    fn vertical_ratio_controls_horizontal_edges() {
+        let (w, h) = (8, 32);
+        let mut src = RgbFrame::new(w, h);
+        for y in 0..h {
+            let v = if y < h / 2 { 64 } else { 192 };
+            src.data[y * w * 3..(y + 1) * w * 3].fill(v);
+        }
+        let mut a = InputAdjust::default();
+        let base = InputParams { sharpness: 1.5, ..on() };
+        let out = a.process_rgb(&src, &InputParams { sharpness_vertical: 0.0, ..base.clone() }).data.clone();
+        assert_eq!(out, src.data, "横方向だけなら横縞は変わらない");
+        let out = a.process_rgb(&src, &InputParams { sharpness_vertical: 1.0, ..base.clone() });
+        assert!(out.data[(h / 2) * w * 3] > 192 && out.data[(h / 2 - 1) * w * 3] < 64);
+        // 縦縞 (横方向の輪郭) は比率に関わらず同じ
+        let src = edge(32, 8);
+        let a0 = a.process_rgb(&src, &InputParams { sharpness_vertical: 0.0, ..base.clone() }).data.clone();
+        let a1 = a.process_rgb(&src, &InputParams { sharpness_vertical: 1.0, ..base }).data.clone();
+        assert_eq!(a0, a1);
     }
 
     #[test]

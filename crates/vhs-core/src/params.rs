@@ -50,7 +50,7 @@ pub struct InputParams {
     pub sharpness: f32,
     /// 輪郭強調の半径 (ガウス σ) [画素]。大きいほどハローが太い
     pub sharpness_radius_px: f32,
-    /// 縦方向の輪郭強調の割合 (0 = 横だけ, 1 = 縦横同じ)
+    /// 輪郭強調の方向 (異方性)。縦方向の細部に掛ける割合 (0 = 横方向だけ, 1 = 縦横同じ, 間は線形)
     pub sharpness_vertical: f32,
     /// コアリング: これより小さい細部 (雑音) は強調しない (0..1 の振幅)
     pub sharpness_coring: f32,
