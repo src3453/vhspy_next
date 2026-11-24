@@ -84,7 +84,7 @@ export type Params = {
     chroma_noise_ire: number;
     chroma_phase_noise_deg: number;
     chroma_delay_samples: number;
-    magnetic_model: "linear" | "tanh";
+    magnetic_model: "linear" | "tanh" | "jiles_atherton";
     saturation_ire: number;
     rf_saturation: number;
     dropout_rate: number;
@@ -200,6 +200,7 @@ export type Params = {
     font: string;
     font_index: number;
     font_dots: number;
+    font_rounding: boolean;
   };
   /** ブラウン管 (RetroArch slang シェーダー)。GUI 側の専用パネルで操作する */
   crt: {
@@ -355,6 +356,8 @@ export const groups: Group[] = [
       {
         kind: "select", path: "osd.mode", label: "合成先",
         options: [
+          { value: "direct", label: "ダイレクト (処理なし)" },
+          { value: "capture", label: "キャプチャ段のみ" },
           { value: "composite", label: "デッキ出力に重畳 (コンポジット)" },
           { value: "tape", label: "テープに焼き込み (録画済み)" },
         ],
@@ -363,6 +366,7 @@ export const groups: Group[] = [
       { kind: "font", path: "osd.font", label: "フォント" },
       r("osd.font_index", "TTC 内の番号", 0, 7, 1),
       r("osd.font_dots", "ドット数 (0=なめらか)", 0, 32, 1, "dot"),
+      b("osd.font_rounding", "SAA5050 風の斜め補間"),
       r("osd.scale", "文字サイズ", 1, 8, 1),
       r("osd.opacity", "不透明度", 0, 1, 0.01),
       { kind: "text", path: "osd.start_datetime", label: "開始日時", placeholder: "1995-08-12 14:30:00" },
@@ -457,11 +461,15 @@ export const groups: Group[] = [
   },
   {
     title: "テープ: 磁性体",
-    note: "記録するすべての信号 (FM 輝度の RF・低域変換クロマ・リニア音声) に同じ伝達特性が掛かる。",
+    note: "Jiles–Atherton は FM 輝度 RF のみで使う PoC。ラインごとに状態を初期化し、4 倍オーバーサンプリングする。係数は論文のフェライト系テープ値を正規化した初期値で、VHS 用の同定値ではない。クロマ包絡線・簡易輝度・音声は tanh 近似のまま。",
     controls: [
       {
         kind: "select", path: "tape.magnetic_model", label: "磁性体モデル",
-        options: [{ value: "tanh", label: "tanh 飽和" }, { value: "linear", label: "線形" }],
+        options: [
+          { value: "tanh", label: "tanh 飽和" },
+          { value: "jiles_atherton", label: "Jiles–Atherton (FM RF PoC)" },
+          { value: "linear", label: "線形" },
+        ],
       },
       r("tape.saturation_ire", "色の飽和レベル", 5, 150, 1, "IRE"),
       r("tape.rf_saturation", "RF の飽和レベル", 0.2, 5, 0.05),
@@ -701,17 +709,20 @@ export const help: Record<string, string> = {
   // OSD
   "osd.enabled": "デッキやカメラの画面表示 (PLAY、カウンタ、日付など) を重ねる。",
   "osd.mode":
+    "ダイレクト: すべての映像処理の後で画面に重ねる (文字はテープや受像機の劣化を受けない)。\n" +
+    "キャプチャ段のみ: アナログ映像処理後、キャプチャ処理の直前に重ねる。キャプチャ処理が有効なとき表示され、キャプチャ由来の劣化を受ける。\n" +
     "デッキ出力に重畳: 再生機が出力に文字を重ねる (くっきり、テープ劣化を受けない)。\n" +
     "テープに焼き込み: 録画時に記録された文字 (カメラの日付など)。テープの劣化を一緒に受ける。",
   "osd.markup": "表示内容のマークアップ。書式はグループ上部の説明を参照。",
   "osd.scale": "既定の文字サイズ。1 = 1 ドットが 2×2 画素。<size=> タグで部分的に変更できる。",
   "osd.opacity": "OSD 全体の不透明度。0 で透明、1 で不透明。",
   "osd.font":
-    "表示に使うフォントファイル (.ttf / .otf / .ttc)。空なら内蔵の 5×7 ドットフォント。\n" +
+    "表示に使うフォントファイル (.ttf / .otf / .ttc)。空なら内蔵の VCR-JP ドットフォント (半角カナ対応)。\n" +
     "例: C:\\Windows\\Fonts\\msgothic.ttc (日本語も表示できる)。フォントにない文字は内蔵フォントで代用する。",
   "osd.font_index": ".ttc (フォントコレクション) の中のどのフォントを使うか。msgothic.ttc なら 0 = MS ゴシック、2 = MS P ゴシック。",
   "osd.font_dots":
-    "外部フォントを 1 文字の高さあたり何ドットで描くか。16 で漢字 ROM 風のドット文字になる。0 はなめらかに描く。内蔵フォントには効かない。",
+    "外部フォントを 1 文字の高さあたり何ドットで描くか。16 で漢字 ROM 風のドット文字になる。0 はなめらかに描く。内蔵 VCR-JP は 8 ドット。",
+  "osd.font_rounding": "ドット表示の斜めの角を半ドットで補い、SAA5050 風に滑らかにする。なめらかな外部フォントには効かない。",
   "osd.start_datetime": "{date} {time} などの起点となる日時 (YYYY-MM-DD HH:MM:SS)。再生時間に合わせて進む。",
 
   // テープ: 輝度
@@ -731,13 +742,14 @@ export const help: Record<string, string> = {
   "tape.chroma_phase_noise_deg": "再生時の色位相の揺らぎ (rms)。ラインごとに色相がぶれる。",
   "tape.chroma_delay_samples": "輝度に対する色の位置ずれ。正で色が右にずれる。",
   "tape.magnetic_model":
-    "磁性体の伝達特性。記録するすべての信号に掛かる。tanh は記録レベルが大きいと磁化が飽和する: " +
+    "磁性体の伝達特性。tanh は記録レベルが大きいと磁化が飽和する: " +
     "強い色が頭打ちになり、FM の搬送波と色の相互変調で鮮やかな色の部分に輝度のモアレが出て、" +
-    "リニア音声は大きい音が潰れる (テープコンプレッション)。線形は飽和なし。",
+    "リニア音声は大きい音が潰れる (テープコンプレッション)。Jiles–Atherton は FM 輝度 RF の履歴を持つ PoC。" +
+    "線形は飽和なし。",
   "tape.saturation_ire": "低域変換クロマの磁気飽和が始まる色の振幅。小さいほど鮮やかな色が早く潰れる (tanh のみ)。",
   "tape.rf_saturation":
     "FM 輝度の RF (搬送波の振幅 = 1) の飽和レベル。小さいほど搬送波と色の相互変調が強くなり、" +
-    "鮮やかな色の部分に細かいモアレが出る。搬送波も縮むのでノイズがやや増える (tanh のみ)。",
+    "鮮やかな色の部分に細かいモアレが出る。J-A 選択時は磁界スケールの調整にも使う。",
 
   // テープ: ドロップアウト
   "tape.dropout_rate": "1 ラインあたりのドロップアウト (磁性体の欠落による白や黒の横筋) の発生確率。",
@@ -921,7 +933,7 @@ const analogTape = (p: Params) => composite(p) && p.tape.enabled && !isDigitalFo
 /** DV の記録・再生を通すか (コンポジットを通さなくても FireWire 取り込みとして効く) */
 const dvTape = (p: Params) => p.tape.enabled && isDigitalFormat(p.tape.format);
 const fmModel = (p: Params) => p.tape.luma_model === "fm";
-const tanh = (p: Params) => p.tape.magnetic_model === "tanh";
+const nonlinearMag = (p: Params) => p.tape.magnetic_model !== "linear";
 /** S 映像が実際に使われるか (テープの再生出力を受像機へ直接つなぐときだけ) */
 const sVideo = (p: Params) =>
   composite(p) &&
@@ -953,19 +965,19 @@ const activeWhen: Record<string, (p: Params) => boolean> = {
   // テープ (アナログ)
   "tape.": analogTape,
   "tape.format": (p) => p.tape.enabled,
-  // 簡易モデルでも磁性体が tanh なら、搬送波と色の相互変調の計算に搬送波・低域変換の値を使う
-  "tape.fm_sync_mhz": (p) => fmModel(p) || tanh(p),
-  "tape.fm_white_mhz": (p) => fmModel(p) || tanh(p),
-  "tape.color_under_khz": (p) => fmModel(p) || tanh(p),
-  "tape.color_under_level": (p) => fmModel(p) || tanh(p),
+  // 簡易モデルでも非線形磁性体なら、搬送波と色の相互変調の計算に搬送波・低域変換の値を使う
+  "tape.fm_sync_mhz": (p) => fmModel(p) || nonlinearMag(p),
+  "tape.fm_white_mhz": (p) => fmModel(p) || nonlinearMag(p),
+  "tape.color_under_khz": (p) => fmModel(p) || nonlinearMag(p),
+  "tape.color_under_level": (p) => fmModel(p) || nonlinearMag(p),
   "tape.fm_channel_mhz": fmModel,
   "tape.fm_noise": fmModel,
   // FM を計算するモデルではノイズ・ベアディングは伝送路から自然に出る
   "tape.luma_noise_ire": (p) => !fmModel(p),
   "tape.bearding_threshold_ire": (p) => !fmModel(p),
   "tape.bearding_strength": (p) => !fmModel(p),
-  "tape.saturation_ire": tanh,
-  "tape.rf_saturation": tanh,
+  "tape.saturation_ire": nonlinearMag,
+  "tape.rf_saturation": nonlinearMag,
   "output.connection": (p) => composite(p) && p.tape.enabled && !(p.rf.enabled && p.rf.placement !== "before_tape"),
 
   // DV

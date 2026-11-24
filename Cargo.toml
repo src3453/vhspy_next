@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/vhs-core", "src-tauri"]
+members = ["crates/vhs-core", "crates/vhs-ffi", "src-tauri"]
 
 [workspace.package]
 version = "0.1.0"

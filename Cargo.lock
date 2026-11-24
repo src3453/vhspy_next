@@ -5489,6 +5489,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "vhs-ffi"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "vhs-core",
+]
+
+[[package]]
 name = "vhs-next"
 version = "0.1.0"
 dependencies = [

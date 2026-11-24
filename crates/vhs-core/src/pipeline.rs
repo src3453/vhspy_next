@@ -306,8 +306,20 @@ impl Pipeline {
             write_field(frame, self.field.parity, p.output.deinterlace, &mut self.output);
         }
         let t4 = Instant::now();
+        if osd == Some(OsdMode::Capture) && p.capture.enabled {
+            self.osd.burn_into_rgba(&mut self.output, opacity);
+        }
         if p.capture.enabled {
             self.capture.process(&self.output, &p.capture, p.seed, self.field_index, self.field.std.frame_rate());
+        }
+        if osd == Some(OsdMode::Direct) {
+            if p.capture.enabled {
+                if let Some(output) = self.capture.output_mut() {
+                    self.osd.burn_into_rgba(output, opacity);
+                }
+            } else {
+                self.osd.burn_into_rgba(&mut self.output, opacity);
+            }
         }
         let t5 = Instant::now();
 

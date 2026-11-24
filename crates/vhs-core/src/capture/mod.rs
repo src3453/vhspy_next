@@ -71,6 +71,10 @@ impl CaptureSim {
         self.out.as_ref()
     }
 
+    pub(crate) fn output_mut(&mut self) -> Option<&mut RgbaFrame> {
+        self.out.as_mut()
+    }
+
     pub fn codec_stats(&self) -> CodecStats {
         self.codec.stats
     }

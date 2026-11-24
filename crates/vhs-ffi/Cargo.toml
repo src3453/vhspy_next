@@ -1,0 +1,13 @@
+[package]
+name = "vhs-ffi"
+description = "C ABI for using the VHS signal simulator from render hosts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+vhs-core = { path = "../vhs-core" }
+serde_json.workspace = true

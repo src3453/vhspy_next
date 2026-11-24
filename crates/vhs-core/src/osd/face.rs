@@ -1,4 +1,4 @@
-//! OSD の書体: 内蔵 5×7 ドットフォントと、外部の TrueType / OpenType フォント。
+//! OSD の書体: 内蔵 VCR-JP フォントと、外部の TrueType / OpenType フォント。
 //!
 //! 外部フォントは 2 通りで描ける。
 //! - ドット表示 (`dots` > 0): 1 em を `dots` ドットでラスタライズして 2 値化し、ドットを
@@ -62,13 +62,20 @@ const VCR_FONT: &[u8] = include_bytes!("../../fonts/vcr-jp.ttf");
 
 /// デッキのメニュー表示用の書体。1 em = 8 ドット、サイズ 1 で 1 ドット = 1.5 ライン
 /// (サイズ 2 で 1 ドット = 3 ライン、サイズ 4 で 6 ライン)
-pub fn vcr(aspect: f32) -> Face {
+pub fn vcr(aspect: f32, enabled: bool) -> Face {
     let mut f = load_bytes(VCR_FONT.to_vec(), 0, 8, aspect).expect("内蔵 VCR フォント");
     if let Face::External { em_lines, rounding, .. } = &mut f {
         *em_lines = 12.0;
-        *rounding = true;
+        *rounding = enabled;
     }
     f
+}
+
+/// ドット表示の文字に SAA5050 風の斜め補間を設定する。
+pub fn set_rounding(face: &mut Face, enabled: bool) {
+    if let Face::External { rounding, .. } = face {
+        *rounding = enabled;
+    }
 }
 
 impl Default for Face {

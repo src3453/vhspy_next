@@ -1,8 +1,8 @@
 //! 輝度の FM 記録・再生を実際に計算するモデル。
 //!
-//! 1 ラインごとに次の順で処理する (サンプリングは方式の 4fsc の 2 倍)。
+//! 1 ラインごとに次の順で処理する (通常 2 倍、J-A は 4 倍にオーバーサンプリング)。
 //!
-//! 1. 2 倍オーバーサンプリング: Hi8 (白 7.7 MHz) でも搬送波と側波帯がナイキスト周波数に収まるようにする
+//! 1. オーバーサンプリング: Hi8 (白 7.7 MHz) でも搬送波と側波帯がナイキスト周波数に収まるようにする
 //! 2. 周波数変調: シンクチップ〜ホワイトピークを各フォーマットの搬送波周波数に割り当てる。
 //!    エンファシスで白のエッジが行き過ぎると、ホワイトピークより高い周波数まで振れる
 //! 3. 低域変換クロマの重畳と磁性体の伝達特性: 実機では色は FM 信号をバイアス代わりに同じトラックへ
@@ -23,11 +23,15 @@ use crate::timing::{Levels, MAX_LINE_SAMPLES};
 pub const OVERSAMPLE: usize = 2;
 /// ライン先頭の前に流す助走 (元のレートのサンプル数)。フィルタと復調器を落ち着かせる
 const PRE_ROLL: usize = 48;
-const MAX_LEN: usize = (MAX_LINE_SAMPLES + PRE_ROLL) * OVERSAMPLE;
+const JA_OVERSAMPLE: usize = 4;
+const MAX_OVERSAMPLE: usize = JA_OVERSAMPLE;
+const MAX_LEN: usize = (MAX_LINE_SAMPLES + PRE_ROLL) * MAX_OVERSAMPLE;
 
 /// FM 伝送路の設定 (フィールドごとに作る)
 #[derive(Clone, Copy)]
 pub struct FmChannel {
+    /// J-A は 4 倍、それ以外は従来どおり 2 倍で処理する
+    oversample: usize,
     /// オーバーサンプリング後のサンプリング周波数 [Hz]
     fs2: f32,
     /// シンクチップ・ホワイトピークの搬送波周波数 [Hz]
@@ -182,13 +186,15 @@ pub struct FmConfig {
 
 impl FmChannel {
     pub fn new(c: &FmConfig) -> Self {
-        let fs2 = c.fs * OVERSAMPLE as f32;
+        let oversample = if c.mag.is_jiles_atherton() { JA_OVERSAMPLE } else { OVERSAMPLE };
+        let fs2 = c.fs * oversample as f32;
         let bw = c.channel_bw_hz.clamp(0.5e6, 0.45 * fs2);
         // 低域変換クロマ (〜1.2 MHz) と搬送波の下側波帯の間で切る
         let hp = (0.4 * c.f_sync_hz).clamp(0.3e6, 0.4 * bw);
         let rf_lp = Cascade::butter_lowpass_at(4, bw, fs2);
         let post_lp = Cascade::butter_lowpass_at(4, c.luma_bw_hz.clamp(0.3e6, 0.4 * c.fs), fs2);
         Self {
+            oversample,
             fs2,
             f_sync: c.f_sync_hz,
             f_white: c.f_white_hz.max(c.f_sync_hz + 0.1e6),
@@ -237,7 +243,8 @@ impl FmChannel {
         use std::f32::consts::TAU;
         let n = luma.len();
         debug_assert!(n <= MAX_LINE_SAMPLES && out.len() == n);
-        let len = (n + PRE_ROLL) * OVERSAMPLE;
+        let os = self.oversample;
+        let len = (n + PRE_ROLL) * os;
         let has_cu = cu_i.len() == n && cu_q.len() == n && self.cu_gain > 0.0;
 
         // 元のレートでの値 (助走区間はシンクチップ)
@@ -252,23 +259,34 @@ impl FmChannel {
         let mut cu_phase = rng.uniform() * TAU;
         let (dphi_k, dcu) = (TAU / self.fs2, TAU * self.cu_freq / self.fs2);
         let (mut lp, mut hp) = (self.rf_lp, self.rf_hp);
+        // Line-local state keeps this PoC compatible with the existing parallel line renderer.
+        // The sync-carrier pre-roll gives the hysteresis loop several cycles to settle.
+        let mut magnetic = self.mag.state();
         let ct = cos_table();
         for m in 0..len {
-            let i = (m / OVERSAMPLE) as isize;
-            // 2 倍補間: 偶数サンプルはそのまま、奇数は 4 点の 3 次補間 (Catmull-Rom の中点)
-            let v = if m % OVERSAMPLE == 0 {
+            let i = (m / os) as isize;
+            // Catmull-Rom interpolation. At 2x this is the previous midpoint formula;
+            // the J-A model uses quarter-sample points for its 4x RF oversampling.
+            let frac = (m % os) as f32 / os as f32;
+            let v = if frac == 0.0 {
                 at(i)
             } else {
-                (9.0 * (at(i) + at(i + 1)) - at(i - 1) - at(i + 2)) / 16.0
+                let (p0, p1, p2, p3) = (at(i - 1), at(i), at(i + 1), at(i + 2));
+                let t2 = frac * frac;
+                let t3 = t2 * frac;
+                0.5 * ((2.0 * p1)
+                    + (-p0 + p2) * frac
+                    + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+                    + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3)
             };
             phase += dphi_k * self.freq_of(v);
             if phase > TAU {
                 phase -= TAU;
             }
             // 搬送波の振幅: ドロップアウト区間は端をなだらかにして落とす
-            let src = (m / OVERSAMPLE).saturating_sub(PRE_ROLL);
+            let src = (m / os).saturating_sub(PRE_ROLL);
             let mut a = amp;
-            if m >= PRE_ROLL * OVERSAMPLE {
+            if m >= PRE_ROLL * os {
                 for &(s, e) in drop {
                     let d = if src < s { s - src } else if src >= e { src + 1 - e } else { 0 };
                     if d < 6 {
@@ -278,7 +296,7 @@ impl FmChannel {
             }
             // 記録: 搬送波 + 低域変換クロマを磁性体の伝達特性に通す
             let mut rec = fast_cos(ct, phase);
-            if has_cu && m >= PRE_ROLL * OVERSAMPLE {
+            if has_cu && m >= PRE_ROLL * os {
                 let j = src.min(n - 1);
                 cu_phase += dcu;
                 if cu_phase > TAU {
@@ -287,7 +305,8 @@ impl FmChannel {
                 rec += self.cu_gain * (cu_i[j] * fast_cos(ct, cu_phase) - cu_q[j] * fast_sin(ct, cu_phase));
             }
             // 再生: 同じトラックなので、クロマも RF レベルの影響を同じだけ受ける
-            let x = a * self.mag.transfer(rec) + self.noise * rng.normal();
+            let recorded = magnetic.process(rec, self.fs2);
+            let x = a * recorded + self.noise * rng.normal();
             rf[m] = hp.process(lp.process(x));
         }
 
@@ -324,7 +343,7 @@ impl FmChannel {
         }
         // --- 遅れを打ち消して間引く ---
         for (j, o) in out.iter_mut().enumerate() {
-            let t = ((j + PRE_ROLL) * OVERSAMPLE) as f32 + self.delay;
+            let t = ((j + PRE_ROLL) * os) as f32 + self.delay;
             let i0 = (t.floor() as usize).min(len - 2);
             let fr = (t - i0 as f32).clamp(0.0, 1.0);
             *o = self.level_of(freq[i0] + (freq[i0 + 1] - freq[i0]) * fr);

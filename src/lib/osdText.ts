@@ -306,11 +306,11 @@ export const controlLabels: Record<string, string> = {
 export const optionLabels: Record<string, Record<string, string>> = {
   standard: { ntsc: "NTSC", pal: "PAL" },
   "image.fit": { stretch: "ﾋｷﾉﾊﾞｼ", cover: "ｵｵｳ", contain: "ｵｻﾒﾙ" },
-  "osd.mode": { composite: "ﾃﾞｯｷ ｼｭﾂﾘｮｸ", tape: "ﾃｰﾌﾟ ﾔｷｺﾐ" },
+  "osd.mode": { direct: "ﾀﾞｲﾚｸﾄ", capture: "ｷｬﾌﾟﾁｬ", composite: "ﾃﾞｯｷ ｼｭﾂﾘｮｸ", tape: "ﾃｰﾌﾟ ﾔｷｺﾐ" },
   "tape.format": { beta: "BETA", custom: "ｶｽﾀﾑ", dv: "DV", digital8: "Digital8" },
   "tape.luma_model": { fm: "FM ｹｲｻﾝ", simple: "ｶﾝｲ" },
   "output.connection": { composite: "ｺﾝﾎﾟｼﾞｯﾄ", s_video: "S ｴｲｿﾞｳ" },
-  "tape.magnetic_model": { tanh: "tanh ﾎｳﾜ", linear: "ｾﾝｹｲ" },
+  "tape.magnetic_model": { tanh: "tanh ﾎｳﾜ", jiles_atherton: "J-A ﾋｽﾃﾘｼｽ", linear: "ｾﾝｹｲ" },
   "rf.placement": { after_tape: "ﾃｰﾌﾟ ﾉ ｱﾄ", before_tape: "ﾃｰﾌﾟ ﾉ ﾏｴ", both: "ﾘｮｳﾎｳ" },
   "decoder.yc_separation": { notch: "ﾉｯﾁ", comb: "ｸｼｶﾞﾀ", comb3d: "3ｼﾞｹﾞﾝ" },
   "capture.levels": { correct: "ﾀﾀﾞｼｲ", washed_out: "ｸﾛｳｷ", crushed: "ｸﾛﾂﾌﾞﾚ" },

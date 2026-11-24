@@ -13,7 +13,7 @@ mod font;
 pub mod markup;
 
 use crate::decoder::{find_sync_edge, pal_ident};
-use crate::frame::{Field, VideoFrame};
+use crate::frame::{Field, RgbaFrame, VideoFrame};
 use crate::params::OsdParams;
 use crate::timing::*;
 use face::{Face, Mask};
@@ -35,8 +35,8 @@ pub struct Osd {
     /// 描画済み範囲 (行) — 空なら None
     rows: Option<(usize, usize)>,
     face: Face,
-    /// 読み込み済みフォントの設定 (パス, 番号, ドット数)
-    face_key: Option<(String, u32, u32)>,
+    /// 読み込み済みフォントの設定 (パス, 番号, ドット数, 補間)
+    face_key: Option<(String, u32, u32, bool)>,
     face_error: Option<String>,
     /// 書体を固定する (`OsdParams` のフォント設定を無視する。デッキのメニュー表示用)
     fixed_face: bool,
@@ -68,9 +68,9 @@ impl Osd {
         }
     }
 
-    /// 書体を固定した OSD (デッキのメニュー表示用。内蔵の VCR 風ドットフォントを使う)
+    /// 書体を固定した OSD (デッキのメニュー表示用。内蔵 VCR-JP フォントを使う)
     pub fn with_vcr_face(std: &'static Standard) -> Self {
-        Self { face: face::vcr(std.sample_aspect()), fixed_face: true, ..Self::new(std) }
+        Self { face: face::vcr(std.sample_aspect(), true), fixed_face: true, ..Self::new(std) }
     }
 }
 
@@ -101,16 +101,19 @@ impl Osd {
             return false;
         }
         let path = p.font.trim();
-        let key = (path.to_string(), p.font_index, p.font_dots.min(64));
+        let key = (path.to_string(), p.font_index, p.font_dots.min(64), p.font_rounding);
         if self.face_key.as_ref() == Some(&key) {
             return false;
         }
         (self.face, self.face_error) = if path.is_empty() {
-            (Face::Builtin, None)
+            (face::vcr(self.std.sample_aspect(), p.font_rounding), None)
         } else {
             match face::load(path, key.1, key.2, self.std.sample_aspect()) {
-                Ok(f) => (f, None),
-                Err(e) => (Face::Builtin, Some(e)),
+                Ok(mut f) => {
+                    face::set_rounding(&mut f, p.font_rounding);
+                    (f, None)
+                }
+                Err(e) => (face::vcr(self.std.sample_aspect(), p.font_rounding), Some(e)),
             }
         };
         self.face_key = Some(key);
@@ -227,6 +230,27 @@ impl Osd {
                 }
                 for k in 0..3 {
                     px[k] = px[k] * (1.0 - a) + o[k] * opacity;
+                }
+            }
+        }
+    }
+
+    /// すべての映像処理後の表示用 RGBA 画像に重ねる
+    pub fn burn_into_rgba(&self, frame: &mut RgbaFrame, opacity: f32) {
+        let Some((y0, y1)) = self.rows else { return };
+        let w = self.w;
+        debug_assert_eq!((frame.width, frame.height), (w, self.h));
+        for y in y0..y1 {
+            let src = &self.overlay[y * w..(y + 1) * w];
+            let dst = &mut frame.data[y * w * 4..(y + 1) * w * 4];
+            for (o, px) in src.iter().zip(dst.chunks_exact_mut(4)) {
+                let a = (o[3] * opacity).clamp(0.0, 1.0);
+                if a <= 0.0 {
+                    continue;
+                }
+                for k in 0..3 {
+                    let v = o[k] * opacity + px[k] as f32 / 255.0 * (1.0 - a);
+                    px[k] = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
                 }
             }
         }

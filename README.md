@@ -39,8 +39,9 @@ RGB 画像 ─ encoder ─▶ コンポジット信号 (4fsc, 910 サンプル/�
 
 | 経路 | 現在のモデル |
 | --- | --- |
-| 輝度 (FM) | Y/C 分離 → 帯域制限 → エンファシス → ホワイトクリップ → FM ノイズ・過変調 (ベアディング) → ディエンファシス |
+| 輝度 (FM) | Y/C 分離 → 帯域制限 → エンファシス → ホワイトクリップ → FM 記録 (磁性体は tanh または JA PoC) → 再生帯域・ノイズ → 復調 |
 | 色 (低域変換) | 複素包絡線で等価的に処理: 狭帯域化 → 磁気飽和 → AM/位相ノイズ → Y/C 遅延 |
+| 磁性体 | tanh / 線形。Jiles–Atherton は FM 輝度 RF のみ、ラインごとに初期化して 4 倍処理する PoC |
 | 媒体 | ドロップアウト (DOC あり/なし)、しわ (流れる帯状ノイズ)、ヘッド目詰まり (一瞬の砂嵐) |
 | 走行系 | ジッタ、ワウフラッタ、スキュー、ヘッド切替、トラッキングずれ (ノイズバー)、垂直揺れ |
 
@@ -98,10 +99,17 @@ $env:VHS_MENU = '<pos=40,40><bg=black>ﾒﾆｭｰ MENU</bg>'; cargo run -p vhs-
 ffmpeg -i in.mp4 -vn -ac 2 -ar 48000 -f f32le - | cargo run -p vhs-core --release --example audio -- [params.json] | ffmpeg -f f32le -ar 48000 -ac 2 -i - out.wav
 ```
 
+### レンダーパス連携
+
+Blenderなどのホストから使うためのC ABI (`vhs-ffi`) と、Render Resultを処理する
+Blenderアドオンを追加。シーンリニアな `float32 RGBA` を受け取り、フレーム間の
+テープ状態を保持したまま処理する。導入手順は [docs/render-hosts.md](docs/render-hosts.md) を参照。
+
 ## 今後
 
 - 輝度 FM の実変調/復調 (オーバーサンプリングして、FM の側帯波とモアレを再現する)
-- 磁性体のヒステリシスモデル (Jiles–Atherton)、減磁、プリントスルー
+- 減磁、プリントスルー
 - アジマス記録とクロストーク、VHS 色位相回転とくし形フィルタによる打ち消し
 - 同期分離・垂直同期の乱れ、TBC の有無
-- 参考資料: [AV Artifact Atlas](https://www.avartifactatlas.com/)
+- 磁性体モデル: [J. Chowdhury, Real-Time Physical Modelling for Analog Tape Machines (DAFx-19)](https://dafx.de/paper-archive/2019/DAFx2019_paper_3.pdf)
+- その他の参考資料: [AV Artifact Atlas](https://www.avartifactatlas.com/)

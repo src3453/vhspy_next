@@ -27,6 +27,7 @@
   type ShaderParam = { id: string; description: string; initial: number; min: number; max: number; step: number };
   type CrtInfo = { preset: string; loading: boolean; error: string | null; gpu: string | null; params: ShaderParam[] };
   type ExportProgress = { done: number; total: number | null; finished: boolean; error: string | null };
+  type PerformanceSegment = { key: string; label: string; ms: number };
 
   let params = $state<Params | null>(null);
   let defaults = $state.raw<Params | null>(null);
@@ -41,6 +42,22 @@
   let crtVersion = -1;
   let crtFilter = $state("");
   const CRT_HEIGHTS = [720, 960, 1080, 1440, 2160];
+  const FIELD_RATES: Record<Params["standard"], number> = { ntsc: 60000 / 1001, pal: 50 };
+  let fieldBudgetMs = $derived(1000 / FIELD_RATES[params?.standard ?? "ntsc"]);
+  let performanceSegments = $derived.by((): PerformanceSegment[] => {
+    if (!stats) return [];
+    return [
+      { key: "camera", label: "入力・カメラ", ms: stats.camera_ms },
+      { key: "encode", label: "エンコード", ms: stats.encode_ms },
+      { key: "tape", label: "テープ", ms: stats.tape_ms },
+      { key: "rf", label: "RF", ms: stats.rf_ms },
+      { key: "decode", label: "デコード", ms: stats.decode_ms },
+      { key: "capture", label: "キャプチャ", ms: stats.capture_ms },
+      { key: "crt", label: "CRT", ms: stats.crt_ms },
+    ].filter((segment) => Number.isFinite(segment.ms) && segment.ms > 0);
+  });
+  let performanceTotalMs = $derived(performanceSegments.reduce((sum, segment) => sum + segment.ms, 0));
+  let performanceOverBudget = $derived(performanceTotalMs > fieldBudgetMs);
 
   const VIDEO_EXTS = ["mp4", "mkv", "mov", "avi", "webm", "m4v", "mpg", "ts"];
   const IMAGE_EXTS = ["png", "jpg", "jpeg", "bmp", "webp", "exr"];
@@ -159,13 +176,17 @@
 
   function applyPreset(i: number) {
     // 今のテレビ方式とテープのフォーマットは引き継ぐ (プリセットが指定していればそちら)
-    if (!defaults) return;
+    const preset = presets[i];
+    if (!defaults || !preset) return;
     // FM モデルで使っていたときだけフォーマットの値をすべて引き継ぐ (簡易モデルの既定の見た目は変えない)
     const fm = params?.tape.luma_model === "fm";
-    const base = retarget(defaults, params?.standard ?? "ntsc", params?.tape.format ?? "vhs", fm);
+    const standard = preset.diff.standard ?? params?.standard ?? "ntsc";
+    const format = preset.diff.tape?.format ?? params?.tape.format ?? "vhs";
+    // 形式を切り替えるプリセットでは、その形式に対応する搬送波・帯域などを先に適用する。
+    const base = retarget(defaults, standard, format, preset.diff.tape?.format !== undefined || fm);
     const crt = params ? $state.snapshot(params.crt) : null;
     const image = params ? $state.snapshot(params.image) : null;
-    params = applyDiff(base, presets[i].diff);
+    params = applyDiff(base, preset.diff);
     // ブラウン管の設定は表示環境、画像の配置は入力の設定なので VHS のプリセットでは変えない
     if (crt && params) params.crt = crt;
     if (image && params) params.image = image;
@@ -371,14 +392,36 @@
       <span>{stats?.source ?? "…"}</span>
       {#if stats}
         <span>{stats.fields_per_sec.toFixed(1)} fields/s</span>
-        <span>
-          処理 {(stats.camera_ms + stats.encode_ms + stats.tape_ms + stats.rf_ms + stats.decode_ms + stats.capture_ms).toFixed(2)} ms
-          ({stats.camera_ms > 0.01 ? `cam ${stats.camera_ms.toFixed(2)} / ` : ""}enc {stats.encode_ms.toFixed(2)} / tape {stats.tape_ms.toFixed(2)}{stats.rf_ms > 0.01
-            ? ` / rf ${stats.rf_ms.toFixed(2)}`
-            : ""} / dec {stats.decode_ms.toFixed(2)}{stats.capture_ms > 0.01 ? ` / cap ${stats.capture_ms.toFixed(2)}` : ""}{stats.crt_ms > 0.01
-            ? ` / crt ${stats.crt_ms.toFixed(2)}`
-            : ""})
-        </span>
+        <div class="perf-display">
+          <span class="perf-summary">
+            処理 {(stats.camera_ms + stats.encode_ms + stats.tape_ms + stats.rf_ms + stats.decode_ms + stats.capture_ms).toFixed(2)} ms
+            ({stats.camera_ms > 0.01 ? `cam ${stats.camera_ms.toFixed(2)} / ` : ""}enc {stats.encode_ms.toFixed(2)} / tape {stats.tape_ms.toFixed(2)}{stats.rf_ms > 0.01
+              ? ` / rf ${stats.rf_ms.toFixed(2)}`
+              : ""} / dec {stats.decode_ms.toFixed(2)}{stats.capture_ms > 0.01 ? ` / cap ${stats.capture_ms.toFixed(2)}` : ""}{stats.crt_ms > 0.01
+              ? ` / crt ${stats.crt_ms.toFixed(2)}`
+              : ""})
+          </span>
+          <div
+            class="perf-chart"
+            title={`各区間は1フィールドの処理時間。上限は方式から換算した1フィールド分 (${fieldBudgetMs.toFixed(2)} ms)。`}
+            role="img"
+            aria-label={`1フィールドの処理時間 ${performanceTotalMs.toFixed(2)} ミリ秒、上限 ${fieldBudgetMs.toFixed(2)} ミリ秒`}
+          >
+            <div class="perf-track" class:over-budget={performanceOverBudget}>
+              {#each performanceSegments as segment (segment.key)}
+                <span
+                  class={`perf-segment perf-${segment.key}`}
+                  style={`flex: 0 0 ${(segment.ms / fieldBudgetMs) * 100}%`}
+                  title={`${segment.label}: ${segment.ms.toFixed(2)} ms`}
+                  aria-hidden="true"
+                ></span>
+              {/each}
+            </div>
+            <span class="perf-total" class:over-budget-text={performanceOverBudget}>
+              {performanceTotalMs.toFixed(2)} / {fieldBudgetMs.toFixed(2)} ms
+            </span>
+          </div>
+        </div>
         {#if stats.codec_q != null && stats.codec_kbit != null}
           <span title="キャプチャ圧縮の量子化スケールと直前フレームの符号量">
             q {stats.codec_q.toFixed(1)} · {stats.codec_kbit.toFixed(0)} kbit/frame
@@ -463,13 +506,13 @@
                 <input
                   type="text"
                   disabled={off}
-                  placeholder="内蔵 5×7 ドット"
+                  placeholder="内蔵 VCR-JP ドットフォント"
                   value={getPath(params, c.path)}
                   onchange={(e) => setPath(params, c.path, (e.target as HTMLInputElement).value.trim())}
                 />
                 <span class="btns">
                   <button class="small" disabled={off} onclick={() => pickFont(c.path)} title="フォントファイルを選ぶ">…</button>
-                  <button class="small" disabled={off} onclick={() => setPath(params, c.path, "")} title="内蔵フォントに戻す">内蔵</button>
+                  <button class="small" disabled={off} onclick={() => setPath(params, c.path, "")} title="内蔵 VCR-JP フォントに戻す">内蔵</button>
                 </span>
               </div>
               {#if fontStatus && !off}
@@ -633,6 +676,55 @@
     gap: 14px;
     font-variant-numeric: tabular-nums;
   }
+  .perf-display {
+    flex: 1 1 500px;
+    min-width: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    align-items: center;
+    gap: 12px;
+  }
+  .perf-summary {
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  .perf-chart {
+    min-width: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 8px;
+  }
+  .perf-total {
+    white-space: nowrap;
+  }
+  .perf-track {
+    position: relative;
+    display: flex;
+    height: 8px;
+    min-width: 0;
+    overflow: hidden;
+    border-radius: 4px;
+    background: #30333c;
+    box-shadow: inset 0 0 0 1px #414550;
+  }
+  .perf-track.over-budget {
+    box-shadow: inset 0 0 0 1px var(--danger);
+  }
+  .perf-segment {
+    height: 100%;
+    flex-shrink: 0;
+  }
+  .perf-camera { background: #6da7ff; }
+  .perf-encode { background: #b78cff; }
+  .perf-tape { background: #e6a34a; }
+  .perf-rf { background: #f0d35c; }
+  .perf-decode { background: #5ec8d5; }
+  .perf-capture { background: #75c98b; }
+  .perf-crt { background: #ef7885; }
+  .perf-total.over-budget-text { color: var(--danger); }
   .spacer {
     flex: 1;
   }

@@ -248,6 +248,8 @@ pub enum MagneticModel {
     /// tanh による無ヒステリシス飽和
     #[default]
     Tanh,
+    /// Jiles-Atherton ヒステリシス (FM RF の PoC)
+    JilesAtherton,
 }
 
 /// テープのフォーマット (表示・既定値の選択用のラベル。信号処理は下の数値パラメータで決まる)
@@ -699,6 +701,10 @@ impl Default for ImageParams {
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OsdMode {
+    /// アナログ映像処理を通さず、最終画面に直接重ねる
+    Direct,
+    /// キャプチャ処理の直前に重ねる
+    Capture,
     /// デッキが再生出力 (コンポジット) に重畳する
     #[default]
     Composite,
@@ -720,12 +726,14 @@ pub struct OsdParams {
     pub opacity: f32,
     /// `{date}` `{time}` などの起点となる日時 ("YYYY-MM-DD HH:MM:SS")
     pub start_datetime: String,
-    /// フォントファイル (.ttf / .otf / .ttc) のパス。空なら内蔵の 5×7 ドットフォント
+    /// フォントファイル (.ttf / .otf / .ttc) のパス。空なら内蔵の VCR-JP フォント
     pub font: String,
     /// .ttc 内のフォント番号
     pub font_index: u32,
     /// 外部フォントを 1 em あたり何ドットで表示するか (0 = なめらかに描く)
     pub font_dots: u32,
+    /// ドット表示時に SAA5050 風の斜め補間をする
+    pub font_rounding: bool,
 }
 
 impl Default for OsdParams {
@@ -742,6 +750,7 @@ impl Default for OsdParams {
             font: String::new(),
             font_index: 0,
             font_dots: 16,
+            font_rounding: true,
         }
     }
 }
