@@ -287,7 +287,13 @@ impl Pipeline {
                 self.rf.process(&mut self.field, &p.rf, p.seed);
             }
             t3 = Instant::now();
-            self.decoder.decode_field(&self.field, &p.decoder, p.output.deinterlace, &mut self.output);
+            self.decoder.decode_field(
+                &self.field,
+                &p.decoder,
+                p.output.deinterlace,
+                p.tape.enabled && !digital,
+                &mut self.output,
+            );
         } else {
             // コンポジットを通さない: 映像をデジタルのまま出す (DV なら FireWire 取り込み)
             let deck_osd = osd == Some(OsdMode::Composite);

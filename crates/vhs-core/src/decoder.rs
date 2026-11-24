@@ -10,6 +10,7 @@
 
 use crate::filter::{Biquad, Cascade, fractional_shift};
 use crate::frame::{Field, RgbaFrame};
+use crate::nr::NoiseReduction;
 use crate::params::{Deinterlace, DecoderParams, YcSeparation};
 use crate::timing::*;
 use rayon::prelude::*;
@@ -35,6 +36,11 @@ pub struct Decoder {
     /// 3 次元 Y/C 分離の画面バッファ: 過去のフィールドの AFC 補正後のコンポジット信号
     /// (新しい順、フィールド番号付き。最大 [`FIELD_STORE`] フィールド)
     history: Vec<(u64, Vec<f32>)>,
+    /// 復調した輝度・色差信号 (active_width × field_lines)。NR と RGB 変換で共有する
+    nr_y: Vec<f32>,
+    nr_u: Vec<f32>,
+    nr_v: Vec<f32>,
+    noise_reduction: NoiseReduction,
 }
 
 /// 画面バッファに持つフィールド数 (PAL の 2 フレーム = 4 フィールド前まで)
@@ -81,6 +87,10 @@ impl Decoder {
             bursts: vec![Burst::default(); s.field_lines],
             lines: vec![LineRef::default(); s.field_lines],
             history: Vec::new(),
+            nr_y: vec![0.0; na],
+            nr_u: vec![0.0; na],
+            nr_v: vec![0.0; na],
+            noise_reduction: NoiseReduction::default(),
         }
     }
 }
@@ -139,7 +149,14 @@ pub(crate) fn pal_ident(mus: &[Option<f32>], s: &Standard) -> f32 {
 }
 
 impl Decoder {
-    pub fn decode_field(&mut self, field: &Field, p: &DecoderParams, deint: Deinterlace, out: &mut RgbaFrame) {
+    pub fn decode_field(
+        &mut self,
+        field: &Field,
+        p: &DecoderParams,
+        deint: Deinterlace,
+        playback_nr: bool,
+        out: &mut RgbaFrame,
+    ) {
         let s = field.std;
         let (aw, fl, ls) = (s.active_width, s.field_lines, s.line_samples);
         assert_eq!((out.width, out.height), s.image_size());
@@ -285,6 +302,49 @@ impl Decoder {
             }
         });
 
+        // --- VCR playback NR in recovered baseband Y/C ---
+        for l in 0..fl {
+            let y_line = &self.luma[l * ls..(l + 1) * ls];
+            let (da, db) = (&self.det_a[l * aw..(l + 1) * aw], &self.det_b[l * aw..(l + 1) * aw]);
+            let LineRef { sv, gain, .. } = self.lines[l];
+            let prev = (pal && p.pal_delay_line && l > 0).then(|| {
+                let r = self.lines[l - 1];
+                (&self.det_a[(l - 1) * aw..l * aw], &self.det_b[(l - 1) * aw..l * aw], r.sv * r.gain, r.gain)
+            });
+            for x in 0..aw {
+                let i = l * aw + x;
+                self.nr_y[i] = y_line[x + active_start] - lv.black;
+                if pal {
+                    let (mut v, mut u) = (da[x] * sv * gain, db[x] * gain);
+                    if let Some((pa, pb, pvg, pug)) = prev {
+                        v = 0.5 * (v + pa[x] * pvg);
+                        u = 0.5 * (u + pb[x] * pug);
+                    }
+                    self.nr_u[i] = u;
+                    self.nr_v[i] = v;
+                } else {
+                    self.nr_u[i] = da[x] * gain;
+                    self.nr_v[i] = db[x] * gain;
+                }
+            }
+        }
+        if playback_nr {
+            self.noise_reduction.process(
+                field.index,
+                aw,
+                fl,
+                &mut self.nr_y,
+                &mut self.nr_u,
+                &mut self.nr_v,
+                p.ynr_strength,
+                p.dnr_strength,
+                p.dnr_motion_threshold_ire,
+                p.nr_bits,
+            );
+        } else {
+            self.noise_reduction.reset();
+        }
+
         // --- RGB へ変換して書き込む ---
         let parity = field.parity as usize;
         let row_bytes = aw * 4;
@@ -298,31 +358,19 @@ impl Decoder {
                 _ => {}
             }
         }
-        let (luma, det_a, det_b) = (&self.luma, &self.det_a, &self.det_b);
-        let delay_line = pal && p.pal_delay_line;
+        let (nr_y, nr_u, nr_v) = (&self.nr_y, &self.nr_u, &self.nr_v);
         targets.into_par_iter().enumerate().for_each(|(l, mut dsts)| {
-            let y = &luma[l * ls..(l + 1) * ls];
-            let (da, db) = (&det_a[l * aw..(l + 1) * aw], &det_b[l * aw..(l + 1) * aw]);
-            let LineRef { sv, gain, .. } = lines[l];
-            // 1H 遅延線: 前のラインの色差 (V の符号はそのラインの PAL スイッチで戻す)
-            let prev = (delay_line && l > 0).then(|| {
-                let r = lines[l - 1];
-                (&det_a[(l - 1) * aw..l * aw], &det_b[(l - 1) * aw..l * aw], r.sv * r.gain, r.gain)
-            });
+            let y = &nr_y[l * aw..(l + 1) * aw];
+            let u = &nr_u[l * aw..(l + 1) * aw];
+            let v = &nr_v[l * aw..(l + 1) * aw];
             let mut rgba_buf = [0u8; MAX_ACTIVE_WIDTH * 4];
             let rgba = &mut rgba_buf[..aw * 4];
             for x in 0..aw {
-                let yy = (y[x + active_start] - lv.black) / lv.span() * p.contrast + p.brightness;
+                let yy = y[x] / lv.span() * p.contrast + p.brightness;
                 let (r, g, b) = if pal {
-                    let (mut v, mut u) = (da[x] * sv * gain, db[x] * gain);
-                    if let Some((pa, pb, pvg, pug)) = prev {
-                        v = 0.5 * (v + pa[x] * pvg);
-                        u = 0.5 * (u + pb[x] * pug);
-                    }
-                    (yy + 1.140 * v, yy - 0.395 * u - 0.581 * v, yy + 2.032 * u)
+                    (yy + 1.140 * v[x], yy - 0.395 * u[x] - 0.581 * v[x], yy + 2.032 * u[x])
                 } else {
-                    let (i, q) = (da[x] * gain, db[x] * gain);
-                    (yy + 0.956 * i + 0.619 * q, yy - 0.272 * i - 0.647 * q, yy - 1.106 * i + 1.703 * q)
+                    (yy + 0.956 * u[x] + 0.619 * v[x], yy - 0.272 * u[x] - 0.647 * v[x], yy - 1.106 * u[x] + 1.703 * v[x])
                 };
                 let o = x * 4;
                 rgba[o] = to_u8(r);

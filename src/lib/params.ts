@@ -153,6 +153,10 @@ export type Params = {
     h_pll: number;
     burst_pll: number;
     pal_delay_line: boolean;
+    ynr_strength: number;
+    dnr_strength: number;
+    dnr_motion_threshold_ire: number;
+    nr_bits: number;
     contrast: number;
     brightness: number;
     saturation: number;
@@ -556,6 +560,16 @@ export const groups: Group[] = [
     ],
   },
   {
+    title: "再生 NR (高級 VCR)",
+    note: "YNR は 1H のライン相関を使う HQ 回路、3D-DNR は約 1 フレームの映像メモリを使うデジタル再生回路の近似。動き部では残像を避けるため効きを下げる。",
+    controls: [
+      r("decoder.ynr_strength", "YNR (ライン相関)", 0, 1, 0.01),
+      r("decoder.dnr_strength", "デジタル 3D-DNR", 0, 1, 0.01),
+      r("decoder.dnr_motion_threshold_ire", "DNR: 動き判定", 0.5, 20, 0.5, "IRE"),
+      r("decoder.nr_bits", "NR ADC/DAC ビット数 (0 = 量子化なし)", 0, 10, 1, "bit"),
+    ],
+  },
+  {
     title: "受像機 (デコーダ)",
     controls: [
       {
@@ -824,6 +838,14 @@ export const help: Record<string, string> = {
     "3 次元 Y/C 分離で動きとみなすフレーム間差。小さいと雑音でもラインくし形に逃げ、大きいと動く部分にクロスカラーの残像が出る。",
   "decoder.frame_buffer_bits":
     "3 次元 Y/C 分離の画面バッファのビット数 (同期先端〜ピークを量子化)。少ないと静止部分にも量子化雑音や色の等高線が乗る。0 で量子化しない。",
+  "decoder.ynr_strength":
+    "高級 VHS の YNR を模した再生輝度ノイズ低減。1H 遅延線の再帰的なライン相関で平坦部のノイズを抑え、差が大きい縦エッジでは効きを弱める。",
+  "decoder.dnr_strength":
+    "デッキ側のデジタル 3D-DNR。約 1 フレーム前の同じフィールド位相と輝度・色差を比べ、静止部分を時間方向に平均する。動きの誤判定や強い設定では残像が出る。",
+  "decoder.dnr_motion_threshold_ire":
+    "DNR の動き判定しきい値。大きくすると動きを静止とみなしてノイズは減るが残像が増え、小さくすると残像は減るが動き部での NR が弱くなる。",
+  "decoder.nr_bits":
+    "再生 NR 回路の ADC と DAC のビット数。JVC の資料に沿った初期値は 6 bit。少ないほど量子化段差が見え、0 は量子化なし。NR を両方 0 にすると量子化も通らない。",
   "decoder.chroma_bw_mhz": "受像機で復調した後の色差の帯域。小さいほど色がにじむ。",
   "decoder.burst_pll":
     "色副搬送波の PLL がバーストに追従する速さ (ライン単位)。1 = ラインごとに即時同期。" +
@@ -1020,6 +1042,10 @@ const activeWhen: Record<string, (p: Params) => boolean> = {
   "decoder.motion_adaptive": comb3d,
   "decoder.motion_threshold_ire": (p) => comb3d(p) && p.decoder.motion_adaptive,
   "decoder.frame_buffer_bits": comb3d,
+  "decoder.ynr_strength": analogTape,
+  "decoder.dnr_strength": analogTape,
+  "decoder.dnr_motion_threshold_ire": (p) => analogTape(p) && p.decoder.dnr_strength > 0,
+  "decoder.nr_bits": analogTape,
   "decoder.pal_delay_line": (p) => p.standard === "pal",
 
   // キャプチャ

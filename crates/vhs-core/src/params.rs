@@ -585,6 +585,14 @@ pub struct DecoderParams {
     /// PAL: 1H 遅延線で前のラインと色差を平均する (位相誤差が色相ずれではなく彩度低下になる)。
     /// 切ると「シンプル PAL」になり、位相誤差がハノーバーバー (ライン交互の色相ずれ) として見える
     pub pal_delay_line: bool,
+    /// VHS HQ playback YNR strength (0 = bypass, 1 = strongest limited setting).
+    pub ynr_strength: f32,
+    /// Frame-cyclic playback DNR strength (0 = bypass, 1 = strongest setting).
+    pub dnr_strength: f32,
+    /// Motion threshold for the digital frame-cyclic DNR [IRE].
+    pub dnr_motion_threshold_ire: f32,
+    /// ADC/DAC resolution around playback NR (0 = ideal / no quantization).
+    pub nr_bits: u32,
     pub contrast: f32,
     pub brightness: f32,
     pub saturation: f32,
@@ -604,6 +612,10 @@ impl Default for DecoderParams {
             h_pll: 0.25,
             burst_pll: 1.0,
             pal_delay_line: true,
+            ynr_strength: 0.0,
+            dnr_strength: 0.0,
+            dnr_motion_threshold_ire: 6.0,
+            nr_bits: 6,
             contrast: 1.0,
             brightness: 0.0,
             saturation: 1.0,

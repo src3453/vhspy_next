@@ -21,6 +21,7 @@ pub mod osd;
 pub mod params;
 pub mod pattern;
 pub mod pipeline;
+mod nr;
 pub mod rf;
 pub mod rng;
 pub mod tape;
