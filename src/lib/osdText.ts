@@ -268,7 +268,7 @@ export const controlLabels: Record<string, string> = {
   "decoder.pal_delay_line": "PAL ﾁｴﾝｾﾝ",
   "decoder.contrast": "ｺﾝﾄﾗｽﾄ",
   "decoder.brightness": "ｱｶﾙｻ",
-  "decoder.saturation": "ｲﾛﾉｺｲｻ",
+  "decoder.saturation": "ｲﾛﾉ ｺｻ",
   "decoder.hue_deg": "ｼｷｿｳ",
   "output.deinterlace": "ｲﾝﾀｰﾚｰｽ",
 
