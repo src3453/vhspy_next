@@ -62,6 +62,12 @@ export type Params = {
     camera_gamma: number;
   };
   encoder: { enabled: boolean; luma_bw_mhz: number; i_bw_mhz: number; q_bw_mhz: number; uv_bw_mhz: number; chroma_gain: number };
+  signal: {
+    vertical_sync: { jitter: number; attenuation_pct: number; noise_ire: number };
+    horizontal_sync: { jitter: number; attenuation_pct: number; noise_ire: number };
+    color_burst: { jitter: number; attenuation_pct: number; noise_ire: number };
+    chroma_subcarrier: { jitter: number; attenuation_pct: number; noise_ire: number };
+  };
   tape: {
     enabled: boolean;
     format: TapeFormat;
@@ -193,7 +199,24 @@ export type Params = {
     mono: boolean;
     codec_kbps: number;
   };
-  output: { deinterlace: "weave" | "bob"; connection: "composite" | "s_video" };
+  output: {
+    deinterlace: "weave" | "bob" | "blend" | "motion_adaptive_blend" | "yadif" | "qtgmc";
+    deinterlace_params: {
+      weave_temporal_weight_pct: number;
+      bob_blend_pct: number;
+      blend_strength_pct: number;
+      motion_adaptive_threshold: number;
+      motion_adaptive_blend_pct: number;
+      yadif_motion_threshold: number;
+      yadif_search_radius: number;
+      yadif_temporal_weight_pct: number;
+      qtgmc_block_size: number;
+      qtgmc_search_radius: number;
+      qtgmc_temporal_weight_pct: number;
+      qtgmc_sharpness_pct: number;
+    };
+    connection: "composite" | "s_video";
+  };
   osd: {
     enabled: boolean;
     mode: "composite" | "tape";
@@ -560,6 +583,24 @@ export const groups: Group[] = [
     ],
   },
   {
+    title: "信号劣化 (同期・色信号)",
+    note: "送出側の各信号要素に個別の揺れ・レベル減衰・雑音を加える。垂直同期のエミュレーションは未完成で、垂直帰線区間や同期パルス列は再現しない。垂直同期の減衰・雑音は簡易なロック外れモデルによる画像の上下ずれで表す。",
+    controls: [
+      r("signal.vertical_sync.jitter", "垂直同期ジッタ", 0, 5, 0.05, "field line"),
+      r("signal.vertical_sync.attenuation_pct", "垂直同期レベル減衰", 0, 100, 1, "%"),
+      r("signal.vertical_sync.noise_ire", "垂直同期雑音", 0, 40, 0.1, "IRE rms"),
+      r("signal.horizontal_sync.jitter", "水平同期ジッタ", 0, 12, 0.1, "smp"),
+      r("signal.horizontal_sync.attenuation_pct", "水平同期レベル減衰", 0, 100, 1, "%"),
+      r("signal.horizontal_sync.noise_ire", "水平同期雑音", 0, 40, 0.1, "IRE rms"),
+      r("signal.color_burst.jitter", "カラーバースト位相ジッタ", 0, 90, 0.5, "° rms"),
+      r("signal.color_burst.attenuation_pct", "カラーバーストレベル減衰", 0, 100, 1, "%"),
+      r("signal.color_burst.noise_ire", "カラーバースト雑音", 0, 20, 0.1, "IRE rms"),
+      r("signal.chroma_subcarrier.jitter", "色副搬送波位相ジッタ", 0, 90, 0.5, "° rms"),
+      r("signal.chroma_subcarrier.attenuation_pct", "色副搬送波レベル減衰", 0, 100, 1, "%"),
+      r("signal.chroma_subcarrier.noise_ire", "色副搬送波雑音", 0, 20, 0.1, "IRE rms"),
+    ],
+  },
+  {
     title: "再生 NR (高級 VCR)",
     note: "YNR は 1H のライン相関を使う HQ 回路、3D-DNR は約 1 フレームの映像メモリを使うデジタル再生回路の近似。動き部では残像を避けるため効きを下げる。",
     controls: [
@@ -593,10 +634,35 @@ export const groups: Group[] = [
       r("decoder.brightness", "明るさ", -0.5, 0.5, 0.01),
       r("decoder.saturation", "色の濃さ", 0, 3, 0.01),
       r("decoder.hue_deg", "色相", -180, 180, 1, "°"),
+    ],
+  },
+  {
+    title: "出力 (インターレース解除)",
+    note: "方式ごとに調整項目が切り替わります。Weave と Bob はフィールド合成量、動き適応系は動き判定や補間、QTGMC は未完成の軽量実装の動き探索を調整します。",
+    controls: [
       {
-        kind: "select", path: "output.deinterlace", label: "インターレース",
-        options: [{ value: "weave", label: "Weave" }, { value: "bob", label: "Bob" }],
+        kind: "select", path: "output.deinterlace", label: "方式",
+        options: [
+          { value: "weave", label: "Weave" },
+          { value: "bob", label: "Bob" },
+          { value: "blend", label: "Blending" },
+          { value: "motion_adaptive_blend", label: "Motion-adaptive Blending" },
+          { value: "yadif", label: "Yadif (Yadifmod2)" },
+          { value: "qtgmc", label: "QTGMC (簡易版・未完成)" },
+        ],
       },
+      r("output.deinterlace_params.weave_temporal_weight_pct", "Weave: 前フィールド保持", 0, 100, 1, "%"),
+      r("output.deinterlace_params.bob_blend_pct", "Bob: 隣接ライン補間", 0, 100, 1, "%"),
+      r("output.deinterlace_params.blend_strength_pct", "Blending: 平均量", 0, 100, 1, "%"),
+      r("output.deinterlace_params.motion_adaptive_threshold", "M-A Blend: 動きしきい値", 1, 64, 1, "階調"),
+      r("output.deinterlace_params.motion_adaptive_blend_pct", "M-A Blend: 動き部の平均量", 0, 100, 1, "%"),
+      r("output.deinterlace_params.yadif_motion_threshold", "Yadif: 動きしきい値", 1, 64, 1, "階調"),
+      r("output.deinterlace_params.yadif_search_radius", "Yadif: エッジ探索半径", 1, 8, 1, "px"),
+      r("output.deinterlace_params.yadif_temporal_weight_pct", "Yadif: 静止部の時間合成", 0, 100, 1, "%"),
+      r("output.deinterlace_params.qtgmc_block_size", "QTGMC: 動き探索ブロック", 8, 32, 4, "px"),
+      r("output.deinterlace_params.qtgmc_search_radius", "QTGMC: 動き探索半径", 0, 6, 1, "px/field line"),
+      r("output.deinterlace_params.qtgmc_temporal_weight_pct", "QTGMC: 時間合成", 0, 100, 1, "%"),
+      r("output.deinterlace_params.qtgmc_sharpness_pct", "QTGMC: シャープネス", 0, 50, 1, "%"),
     ],
   },
   {
@@ -824,6 +890,18 @@ export const help: Record<string, string> = {
   "encoder.i_bw_mhz": "I 信号 (橙〜青緑方向の色差) の帯域。NTSC 規格は 1.3 MHz。",
   "encoder.q_bw_mhz": "Q 信号 (紫〜黄緑方向の色差) の帯域。NTSC 規格は 0.6 MHz。",
   "encoder.chroma_gain": "送出時の色信号の振幅倍率。大きいとテープでの色飽和が起きやすい。",
+  "signal.vertical_sync.jitter": "フィールドごとの垂直位置の揺れ (rms)。1 field line は表示画像の 2 ライン分。",
+  "signal.vertical_sync.attenuation_pct": "垂直同期エミュレーションは簡易モデル。同期パルス列そのものはなく、振幅減衰でロックを失うと画像が上下にずれる。",
+  "signal.vertical_sync.noise_ire": "垂直同期エミュレーションは簡易モデル。同期パルス列そのものはなく、雑音でロックを失うと画像が上下にずれる。",
+  "signal.horizontal_sync.jitter": "ラインごとの水平同期後縁の揺れ (rms)。水平 AFC が追従しきれないと画像が左右に揺れる。",
+  "signal.horizontal_sync.attenuation_pct": "水平同期パルスの振幅を下げる。弱すぎると水平 AFC が同期を見失う。",
+  "signal.horizontal_sync.noise_ire": "水平同期パルスに加える雑音 (rms)。同期検出が不安定になり、水平位置が揺れる。",
+  "signal.color_burst.jitter": "ラインごとのバースト位相の揺れ (rms)。受像機の色副搬送波 PLL が追従し、色相の揺れになる。",
+  "signal.color_burst.attenuation_pct": "受像機が色副搬送波の位相・振幅基準に使うカラーバーストの振幅を下げる。ACC やカラーキラーの動作に影響する。",
+  "signal.color_burst.noise_ire": "カラーバースト区間に加える雑音 (rms)。PLL の位相推定が不安定になる。",
+  "signal.chroma_subcarrier.jitter": "映像中の色副搬送波のラインごとの位相揺れ (rms)。バーストは変えず、色相や彩度に揺れが出る。",
+  "signal.chroma_subcarrier.attenuation_pct": "映像中の色副搬送波の振幅を下げる。色が薄くなる。",
+  "signal.chroma_subcarrier.noise_ire": "映像中の色副搬送波に加える雑音 (rms)。色の粒状ノイズになる。",
 
   // デコーダ
   "decoder.yc_separation":
@@ -879,7 +957,32 @@ export const help: Record<string, string> = {
   "decoder.brightness": "受像機の明るさ (黒レベルのオフセット)。",
   "decoder.saturation": "受像機の色の濃さ。",
   "decoder.hue_deg": "受像機の色相 (ティント)。NTSC 特有の色ずれを再現・補正できる。",
-  "output.deinterlace": "Weave: 2 フィールドを交互に織り込む (動きに櫛状のずれ)。Bob: 各フィールドのラインを 2 倍に伸ばす。",
+  "output.deinterlace":
+    "Weave は前フィールドと交互に織り込む。Bob は現フィールドのラインを複製。Blending は隣接ラインの平均。Motion-adaptive Blending は静止部を織り込み、動き部を平均する。Yadif (Yadifmod2) はフィールド単位の静止判定とエッジ方向補間を使うネイティブ実装。QTGMC は未完成の軽量な試作実装。ブロック動き補償とエッジ方向補間のみで、標準QTGMCの全工程、高精度の多段動き推定、時間ノイズ除去、ソースマッチングは未実装。",
+  "output.deinterlace_params.weave_temporal_weight_pct":
+    "前フィールドを保持する割合。100% で通常の Weave。下げると前フィールドと現フィールド由来の空間補間を混ぜ、櫛状ノイズを弱めます。",
+  "output.deinterlace_params.bob_blend_pct":
+    "Bob の欠落ラインを、現フィールドの最近傍ラインから上下ラインの平均へ近づける量。0% はライン複製、100% は線形補間です。",
+  "output.deinterlace_params.blend_strength_pct":
+    "Blending の補間量。0% は Bob と同じ最近傍ライン、100% は隣接する現フィールドラインの平均です。",
+  "output.deinterlace_params.motion_adaptive_threshold":
+    "同じ位置の2フィールド前との差がこの値を超えると動きと判定します。小さいほど動き判定が増え、残像は減りますが空間補間が増えます。",
+  "output.deinterlace_params.motion_adaptive_blend_pct":
+    "動きと判定した部分の空間補間量。0% は最近傍ライン、100% は上下ラインの平均です。静止部では前フィールドを使います。",
+  "output.deinterlace_params.yadif_motion_threshold":
+    "同じ位置の2フィールド前との差がこの値以下なら静止とみなします。小さくすると時間残像を抑え、大きくすると前フィールドを使う領域が増えます。",
+  "output.deinterlace_params.yadif_search_radius":
+    "欠落ラインを補うとき、上下ラインの対応を探す水平方向の範囲。大きくすると斜めの輪郭に合わせやすくなります。",
+  "output.deinterlace_params.yadif_temporal_weight_pct":
+    "静止と判定した部分における前フィールドの混合量。0% は空間補間のみ、100% は前フィールドをそのまま使います。",
+  "output.deinterlace_params.qtgmc_block_size":
+    "QTGMC風の動き推定に使うブロック幅。高さは幅の半分です。大きいと滑らかな領域に強く、小さいと局所的な動きに追従しやすくなります。",
+  "output.deinterlace_params.qtgmc_search_radius":
+    "ブロック動き推定の探索範囲。水平方向は画素、垂直方向はフィールドライン単位です。大きいほど大きな移動を追えますが処理が重くなります。",
+  "output.deinterlace_params.qtgmc_temporal_weight_pct":
+    "動き補償した前フィールドの混合量。下げると時間残像を抑え、上げると静止部のちらつきやノイズを減らしやすくなります。",
+  "output.deinterlace_params.qtgmc_sharpness_pct":
+    "エッジ方向補間の後に加える輪郭強調。大きくすると細部が立ちますが、リンギングやノイズも目立ちます。",
 
   // コンポジットの有無
   "encoder.enabled":
@@ -1030,6 +1133,7 @@ const activeWhen: Record<string, (p: Params) => boolean> = {
   "rf.sound_beat": (p) => p.rf.enabled,
 
   // エンコーダ
+  "signal.": composite,
   "encoder.luma_bw_mhz": composite,
   "encoder.chroma_gain": composite,
   "encoder.i_bw_mhz": (p) => composite(p) && p.standard === "ntsc",
@@ -1047,6 +1151,18 @@ const activeWhen: Record<string, (p: Params) => boolean> = {
   "decoder.dnr_motion_threshold_ire": (p) => analogTape(p) && p.decoder.dnr_strength > 0,
   "decoder.nr_bits": analogTape,
   "decoder.pal_delay_line": (p) => p.standard === "pal",
+  "output.deinterlace_params.weave_temporal_weight_pct": (p) => p.output.deinterlace === "weave",
+  "output.deinterlace_params.bob_blend_pct": (p) => p.output.deinterlace === "bob",
+  "output.deinterlace_params.blend_strength_pct": (p) => p.output.deinterlace === "blend",
+  "output.deinterlace_params.motion_adaptive_threshold": (p) => p.output.deinterlace === "motion_adaptive_blend",
+  "output.deinterlace_params.motion_adaptive_blend_pct": (p) => p.output.deinterlace === "motion_adaptive_blend",
+  "output.deinterlace_params.yadif_motion_threshold": (p) => p.output.deinterlace === "yadif",
+  "output.deinterlace_params.yadif_search_radius": (p) => p.output.deinterlace === "yadif",
+  "output.deinterlace_params.yadif_temporal_weight_pct": (p) => p.output.deinterlace === "yadif",
+  "output.deinterlace_params.qtgmc_block_size": (p) => p.output.deinterlace === "qtgmc",
+  "output.deinterlace_params.qtgmc_search_radius": (p) => p.output.deinterlace === "qtgmc",
+  "output.deinterlace_params.qtgmc_temporal_weight_pct": (p) => p.output.deinterlace === "qtgmc",
+  "output.deinterlace_params.qtgmc_sharpness_pct": (p) => p.output.deinterlace === "qtgmc",
 
   // キャプチャ
   "capture.": (p) => p.capture.enabled,

@@ -11,7 +11,7 @@
 use crate::filter::{Biquad, Cascade, fractional_shift};
 use crate::frame::{Field, RgbaFrame};
 use crate::nr::NoiseReduction;
-use crate::params::{Deinterlace, DecoderParams, YcSeparation};
+use crate::params::{DecoderParams, YcSeparation};
 use crate::timing::*;
 use rayon::prelude::*;
 
@@ -153,7 +153,6 @@ impl Decoder {
         &mut self,
         field: &Field,
         p: &DecoderParams,
-        deint: Deinterlace,
         playback_nr: bool,
         out: &mut RgbaFrame,
     ) {
@@ -348,23 +347,15 @@ impl Decoder {
         // --- RGB へ変換して書き込む ---
         let parity = field.parity as usize;
         let row_bytes = aw * 4;
-        let rows: Vec<(usize, &mut [u8])> = out.data.chunks_mut(row_bytes).enumerate().collect();
-        // 書き込み先のフィールドライン番号ごとに行をまとめる
-        let mut targets: Vec<Vec<&mut [u8]>> = (0..fl).map(|_| Vec::new()).collect();
-        for (row, buf) in rows {
-            match deint {
-                Deinterlace::Weave if row % 2 == parity => targets[row / 2].push(buf),
-                Deinterlace::Bob => targets[row / 2].push(buf),
-                _ => {}
-            }
-        }
         let (nr_y, nr_u, nr_v) = (&self.nr_y, &self.nr_u, &self.nr_v);
-        targets.into_par_iter().enumerate().for_each(|(l, mut dsts)| {
+        out.data.par_chunks_mut(row_bytes).enumerate().for_each(|(row, dst)| {
+            if row % 2 != parity {
+                return;
+            }
+            let l = row / 2;
             let y = &nr_y[l * aw..(l + 1) * aw];
             let u = &nr_u[l * aw..(l + 1) * aw];
             let v = &nr_v[l * aw..(l + 1) * aw];
-            let mut rgba_buf = [0u8; MAX_ACTIVE_WIDTH * 4];
-            let rgba = &mut rgba_buf[..aw * 4];
             for x in 0..aw {
                 let yy = y[x] / lv.span() * p.contrast + p.brightness;
                 let (r, g, b) = if pal {
@@ -373,13 +364,10 @@ impl Decoder {
                     (yy + 0.956 * u[x] + 0.619 * v[x], yy - 0.272 * u[x] - 0.647 * v[x], yy - 1.106 * u[x] + 1.703 * v[x])
                 };
                 let o = x * 4;
-                rgba[o] = to_u8(r);
-                rgba[o + 1] = to_u8(g);
-                rgba[o + 2] = to_u8(b);
-                rgba[o + 3] = 255;
-            }
-            for d in dsts.iter_mut() {
-                d.copy_from_slice(rgba);
+                dst[o] = to_u8(r);
+                dst[o + 1] = to_u8(g);
+                dst[o + 2] = to_u8(b);
+                dst[o + 3] = 255;
             }
         });
     }

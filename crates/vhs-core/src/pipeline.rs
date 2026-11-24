@@ -4,11 +4,12 @@ use crate::adjust::InputAdjust;
 use crate::camera::{CameraInput, CameraSim};
 use crate::capture::{CaptureSim, CodecStats};
 use crate::decoder::Decoder;
+use crate::deinterlace::Deinterlacer;
 use crate::dv::{DvSim, DvStats};
-use crate::encoder::{encode_field, encode_field_yc};
+use crate::encoder::{encode_field_with_signal, encode_field_yc_with_signal};
 use crate::frame::{Field, LinearFrame, RgbFrame, RgbaFrame, VideoFrame};
 use crate::osd::Osd;
-use crate::params::{Connection, Deinterlace, OsdMode, OsdParams, Params};
+use crate::params::{Connection, OsdMode, OsdParams, Params};
 use crate::rf::RfSim;
 use crate::tape::TapeSim;
 use crate::tbc::Tbc;
@@ -52,6 +53,7 @@ pub struct Pipeline {
     /// デッキ → テレビ (テープの後) の RF
     rf: RfSim,
     decoder: Decoder,
+    deinterlacer: Deinterlacer,
     capture: CaptureSim,
     osd: Osd,
     /// デッキのメニュー表示 (キャラクタジェネレータ)。テープ再生後のコンポジット信号に重畳する
@@ -82,6 +84,7 @@ impl Pipeline {
             rf_broadcast: RfSim::default(),
             rf: RfSim::default(),
             decoder: Decoder::new(std),
+            deinterlacer: Deinterlacer::new(w, h),
             capture: CaptureSim::default(),
             osd: Osd::new(std),
             menu: Osd::with_vcr_face(std),
@@ -252,9 +255,9 @@ impl Pipeline {
             if digital {
                 // DV デッキはデジタルの映像から直接 Y/C (またはコンポジット) を作る
                 self.field.set_separate(svideo);
-                encode_field_yc(input, &mut self.field, &p.encoder);
+                encode_field_yc_with_signal(input, &mut self.field, &p.encoder, &p.signal, p.seed);
             } else {
-                encode_field(input, &mut self.field, &p.encoder);
+                encode_field_with_signal(input, &mut self.field, &p.encoder, &p.signal, p.seed);
             }
             t1 = Instant::now();
             // 放送受信: 受信時の劣化ごとテープに記録される (デッキ→テレビの RF とは独立した雑音)。
@@ -287,14 +290,20 @@ impl Pipeline {
             self.decoder.decode_field(
                 &self.field,
                 &p.decoder,
-                p.output.deinterlace,
                 p.tape.enabled && !digital,
                 &mut self.output,
             );
         } else {
             // コンポジットを通さない: 映像をデジタルのまま出す (DV なら FireWire 取り込み)
-            write_field(input, self.field.parity, p.output.deinterlace, &mut self.output);
+            write_field(input, self.field.parity, &mut self.output);
         }
+        self.deinterlacer.process_field(
+            &mut self.output,
+            self.field_index,
+            self.field.parity,
+            p.output.deinterlace,
+            &p.output.deinterlace_params,
+        );
         let t4 = Instant::now();
         // コンポジット経路がない場合だけ、OSD をデジタル映像へ直接重ねる。
         if !p.encoder.enabled {
@@ -334,18 +343,16 @@ impl Pipeline {
     }
 }
 
-/// 映像信号 (0..1) の今のフィールドのラインを出力画像に書く。受像機の `decode_field` と同じく、
-/// 織り込み (Weave) では反対のフィールドのラインを残し、Bob では今のフィールドのラインを 2 回使う
-fn write_field(src: &VideoFrame, parity: u8, deint: Deinterlace, out: &mut RgbaFrame) {
+/// 映像信号 (0..1) の今のフィールドのラインを出力画像へ書く。
+fn write_field(src: &VideoFrame, parity: u8, out: &mut RgbaFrame) {
     let (w, h) = (out.width, out.height);
     debug_assert_eq!((src.width, src.height), (w, h));
     let parity = parity as usize;
     out.data.par_chunks_mut(w * 4).enumerate().for_each(|(row, o)| {
-        let sr = match deint {
-            Deinterlace::Weave if row % 2 != parity => return,
-            Deinterlace::Weave => row,
-            Deinterlace::Bob => (row / 2 * 2 + parity).min(h - 1),
-        };
+        if row % 2 != parity {
+            return;
+        }
+        let sr = row.min(h - 1);
         let s = &src.data[sr * w * 3..(sr + 1) * w * 3];
         for (o, s) in o.chunks_exact_mut(4).zip(s.chunks_exact(3)) {
             for c in 0..3 {

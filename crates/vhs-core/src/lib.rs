@@ -13,6 +13,7 @@ pub mod audio;
 pub mod camera;
 pub mod capture;
 pub mod decoder;
+pub mod deinterlace;
 pub mod dv;
 pub mod encoder;
 pub mod filter;

@@ -15,6 +15,8 @@ pub struct Params {
     /// 撮像管カメラ (入力映像の画質調整の後)
     pub camera: CameraParams,
     pub encoder: EncoderParams,
+    /// 送出側コンポジット信号の同期・色信号の劣化
+    pub signal: SignalParams,
     pub tape: TapeParams,
     /// DV の記録・再生 (tape.format が DV / Digital8 のとき)
     pub dv: DvParams,
@@ -36,6 +38,35 @@ pub struct Params {
     pub image: ImageParams,
     /// 乱数シード (同じシードなら同じ劣化パターン)
     pub seed: u64,
+}
+
+/// 送出側の個別信号要素 (ジッタ・レベル減衰・雑音)。減衰は 0..100 [%]。
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SignalElementParams {
+    /// 時間・位相の揺らぎ (信号要素ごとに単位が異なる)
+    pub jitter: f32,
+    /// 信号振幅の減衰 [%]
+    pub attenuation_pct: f32,
+    /// 加算雑音の rms [IRE]
+    pub noise_ire: f32,
+}
+
+/// コンポジット信号内の同期・色信号ごとの劣化。
+///
+/// Field は有効映像ラインのみを保持する。垂直帰線波形は省略されているため、垂直同期の
+/// 減衰・雑音は受像機の同期ロックを失わせ、フィールドの上下位置ずれとして表現する。
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SignalParams {
+    /// 垂直同期: ジッタ [フィールドライン]、同期レベル減衰、同期雑音
+    pub vertical_sync: SignalElementParams,
+    /// 水平同期: ジッタ [サンプル]、パルス振幅減衰、雑音
+    pub horizontal_sync: SignalElementParams,
+    /// カラーバースト: 位相ジッタ [度]、バースト振幅減衰、雑音
+    pub color_burst: SignalElementParams,
+    /// 色副搬送波 (有効映像中): 位相ジッタ [度]、色信号減衰、雑音
+    pub chroma_subcarrier: SignalElementParams,
 }
 
 /// 入力映像の画質調整。昔のビデオカメラの甘いレンズ・強い輪郭強調・色の癖などを作る。
@@ -632,6 +663,14 @@ pub enum Deinterlace {
     Weave,
     /// 現フィールドのラインを 2 倍に引き伸ばす
     Bob,
+    /// 隣接するフィールドラインを平均して補間
+    Blend,
+    /// 静止部は前フィールドを使い、動き部は空間補間
+    MotionAdaptiveBlend,
+    /// 時間方向の動き検出とエッジ方向の空間補間
+    Yadif,
+    /// 動き補償と時間・空間補間を組み合わせる高品質モード
+    Qtgmc,
 }
 
 /// 再生機 → 受像機の接続
@@ -649,8 +688,58 @@ pub enum Connection {
 #[serde(default)]
 pub struct OutputParams {
     pub deinterlace: Deinterlace,
+    pub deinterlace_params: DeinterlaceParams,
     /// 再生機 → 受像機の接続
     pub connection: Connection,
+}
+
+/// 方式別のインターレース解除調整値。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DeinterlaceParams {
+    /// Weave の前フィールド保持率 [%]
+    pub weave_temporal_weight_pct: f32,
+    /// Bob の隣接ライン補間量 [%]
+    pub bob_blend_pct: f32,
+    /// Blending の隣接ライン平均量 [%]
+    pub blend_strength_pct: f32,
+    /// 動き適応 Blending の動き判定しきい値 (8-bit 輝度差)
+    pub motion_adaptive_threshold: f32,
+    /// 動き適応 Blending の動き部分の隣接ライン平均量 [%]
+    pub motion_adaptive_blend_pct: f32,
+    /// Yadif の動き判定しきい値 (8-bit 輝度差)
+    pub yadif_motion_threshold: f32,
+    /// Yadif の水平方向のエッジ探索半径 [px]
+    pub yadif_search_radius: u32,
+    /// Yadif の静止部における時間方向の混合量 [%]
+    pub yadif_temporal_weight_pct: f32,
+    /// QTGMC 風実装の動き探索ブロック幅 [px] (高さは半分)
+    pub qtgmc_block_size: u32,
+    /// QTGMC 風実装の動き探索半径 [px / field line]
+    pub qtgmc_search_radius: u32,
+    /// QTGMC 風実装の動き補償フレーム混合量 [%]
+    pub qtgmc_temporal_weight_pct: f32,
+    /// QTGMC 風実装のエッジ強調量 [%]
+    pub qtgmc_sharpness_pct: f32,
+}
+
+impl Default for DeinterlaceParams {
+    fn default() -> Self {
+        Self {
+            weave_temporal_weight_pct: 100.0,
+            bob_blend_pct: 0.0,
+            blend_strength_pct: 100.0,
+            motion_adaptive_threshold: 10.0,
+            motion_adaptive_blend_pct: 100.0,
+            yadif_motion_threshold: 10.0,
+            yadif_search_radius: 3,
+            yadif_temporal_weight_pct: 100.0,
+            qtgmc_block_size: 16,
+            qtgmc_search_radius: 2,
+            qtgmc_temporal_weight_pct: 88.0,
+            qtgmc_sharpness_pct: 12.0,
+        }
+    }
 }
 
 /// ブラウン管シミュレーション。RetroArch の slang シェーダープリセット (.slangp) を
