@@ -5,6 +5,8 @@
   import { onMount } from "svelte";
   import { groups, help, getPath, setPath, isActive, presets, applyDiff, retarget, type Params } from "#lib/params.ts";
   import Scopes from "#lib/Scopes.svelte";
+  import Immersive from "#lib/Immersive.svelte";
+  import { getCurrentWindow } from "@tauri-apps/api/window";
 
   type Stats = {
     source: string;
@@ -27,7 +29,7 @@
   type ExportProgress = { done: number; total: number | null; finished: boolean; error: string | null };
 
   let params = $state<Params | null>(null);
-  let defaults: Params | null = null;
+  let defaults = $state.raw<Params | null>(null);
   let stats = $state<Stats | null>(null);
   let cameras = $state<string[]>([]);
   let camera = $state("");
@@ -197,6 +199,36 @@
     };
   });
 
+  /** 値を変える。方式・フォーマットの切り替えは、それに合う値 (帯域・搬送波・電源周波数など) もまとめて合わせる */
+  function setControl(path: string, v: unknown) {
+    if (!params) return;
+    if (path === "standard" || path === "tape.format") {
+      // $state のプロキシは structuredClone できないので、スナップショットを渡す
+      const snap = $state.snapshot(params) as Params;
+      setPath(snap, path, v);
+      params = retarget(snap, snap.standard, snap.tape.format, path === "tape.format");
+    } else setPath(params, path, v);
+  }
+
+  // イマーシブモード: UI を隠して全画面にし、デッキのメニュー表示 (映像信号に重畳) で操作する
+  let immersive = $state(false);
+  async function setImmersive(on: boolean) {
+    immersive = on;
+    try {
+      await getCurrentWindow().setFullscreen(on);
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  function onGlobalKey(e: KeyboardEvent) {
+    // イマーシブ中のキーは Immersive が受ける
+    if (!immersive && e.key === "F11") {
+      e.preventDefault();
+      setImmersive(true);
+    }
+  }
+
   function newSeed() {
     if (params) params.seed = Math.floor(Math.random() * 2 ** 31);
   }
@@ -287,7 +319,31 @@
   }
 </script>
 
-<main>
+<svelte:window onkeydown={onGlobalKey} />
+
+{#if immersive && params}
+  <Immersive
+    {params}
+    {defaults}
+    source={stats?.source ?? ""}
+    recording={!!stats?.recording}
+    {message}
+    {cameras}
+    bind:camera
+    actions={{
+      openPattern,
+      openCamera,
+      openFile,
+      refreshCameras: () => run(refreshCameras),
+      toggleRecording,
+      applyPreset,
+      setControl,
+      exit: () => setImmersive(false),
+    }}
+  />
+{/if}
+
+<main class:immersive>
   <section class="stage">
     <div class="toolbar">
       <button onclick={openPattern}>テストパターン</button>
@@ -302,6 +358,7 @@
         {stats?.recording ? "■ 録画停止" : "● 録画"}
       </button>
       <button onclick={startExport} disabled={!!exporting}>動画を書き出し…</button>
+      <button onclick={() => setImmersive(true)} title="UI を隠して全画面にし、デッキのメニュー表示 (OSD) で操作する (F11)">イマーシブ</button>
     </div>
 
     <div class="screen">
@@ -439,16 +496,7 @@
                 <select
                   disabled={off}
                   value={getPath(params, c.path)}
-                  onchange={(e) => {
-                    const v = (e.target as HTMLSelectElement).value;
-                    // 方式・フォーマットの切り替えは、それに合う値 (帯域・搬送波・電源周波数など) もまとめて合わせる
-                    // ($state のプロキシは structuredClone できないので、スナップショットを渡す)
-                    if (c.path === "standard" || c.path === "tape.format") {
-                      const snap = $state.snapshot(params) as Params;
-                      setPath(snap, c.path, v);
-                      params = retarget(snap, snap.standard, snap.tape.format, c.path === "tape.format");
-                    } else setPath(params, c.path, v);
-                  }}
+                  onchange={(e) => setControl(c.path, (e.target as HTMLSelectElement).value)}
                 >
                   {#each c.options as o}<option value={o.value}>{o.label}</option>{/each}
                 </select>
@@ -752,5 +800,19 @@
   }
   .name.changed {
     color: var(--accent);
+  }
+  /* イマーシブモード: 映像だけを全画面に出す */
+  main.immersive {
+    grid-template-columns: 1fr;
+    background: #000;
+  }
+  main.immersive .toolbar,
+  main.immersive .status,
+  main.immersive .panel,
+  main.immersive :global(.scopes) {
+    display: none;
+  }
+  main.immersive .screen {
+    padding: 0;
   }
 </style>

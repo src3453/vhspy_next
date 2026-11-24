@@ -38,6 +38,8 @@ pub struct Osd {
     /// 読み込み済みフォントの設定 (パス, 番号, ドット数)
     face_key: Option<(String, u32, u32)>,
     face_error: Option<String>,
+    /// 書体を固定する (`OsdParams` のフォント設定を無視する。デッキのメニュー表示用)
+    fixed_face: bool,
     /// (文字, サイズ) → (文字マスク, 縁取りマスク)
     cache: HashMap<(char, u32), Arc<(Mask, Mask)>>,
 }
@@ -61,8 +63,14 @@ impl Osd {
             face: Face::Builtin,
             face_key: None,
             face_error: None,
+            fixed_face: false,
             cache: HashMap::new(),
         }
+    }
+
+    /// 書体を固定した OSD (デッキのメニュー表示用。内蔵の VCR 風ドットフォントを使う)
+    pub fn with_vcr_face(std: &'static Standard) -> Self {
+        Self { face: face::vcr(std.sample_aspect()), fixed_face: true, ..Self::new(std) }
     }
 }
 
@@ -89,6 +97,9 @@ impl Osd {
 
     /// フォント設定が変わっていれば読み直す
     fn update_face(&mut self, p: &OsdParams) -> bool {
+        if self.fixed_face {
+            return false;
+        }
         let path = p.font.trim();
         let key = (path.to_string(), p.font_index, p.font_dots.min(64));
         if self.face_key.as_ref() == Some(&key) {

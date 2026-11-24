@@ -2,6 +2,7 @@
 //!
 //! cargo run -p vhs-core --release --example render -- in.png out.png [params.json] [fields] [pan_px]
 //!   pan_px: 1 フィールドごとに画像を横へずらす量 (動き補償・圧縮の確認用)
+//!   環境変数 VHS_MENU: デッキのメニュー表示 (OSD マークアップ) を重ねる
 //!   in が .hdr / .exr ならシーンリニアな HDR 入力として扱う (撮像管カメラに白を超える光が届く)
 //! cargo run -p vhs-core --release --example render -- --bench [fields] [params.json]
 
@@ -100,6 +101,8 @@ fn main() {
     };
     let out_path = args.get(1).cloned().unwrap_or_else(|| "out.png".into());
     let mut p = Pipeline::new(params);
+    // VHS_MENU にマークアップを入れるとデッキのメニュー表示を重ねる
+    p.set_menu(std::env::var("VHS_MENU").ok());
     // 状態 (AFC, ジッタ, レート制御) が落ち着くまで数フィールド回す
     let fields: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(8);
     let pan: f32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0.0);

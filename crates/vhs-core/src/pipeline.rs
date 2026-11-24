@@ -8,7 +8,7 @@ use crate::dv::{DvSim, DvStats};
 use crate::encoder::{encode_field, encode_field_yc};
 use crate::frame::{Field, LinearFrame, RgbFrame, RgbaFrame, VideoFrame};
 use crate::osd::Osd;
-use crate::params::{Connection, Deinterlace, OsdMode, Params};
+use crate::params::{Connection, Deinterlace, OsdMode, OsdParams, Params};
 use crate::rf::RfSim;
 use crate::tape::TapeSim;
 use crate::tbc::Tbc;
@@ -54,6 +54,10 @@ pub struct Pipeline {
     decoder: Decoder,
     capture: CaptureSim,
     osd: Osd,
+    /// デッキのメニュー表示 (キャラクタジェネレータ)。再生出力のコンポジット / S 映像に重畳する
+    menu: Osd,
+    /// メニュー表示の内容 (None なら表示しない)
+    menu_params: Option<OsdParams>,
     /// エンコーダに渡す映像信号の作業領域 (カメラなしの入力、OSD の焼き込み)
     video: VideoFrame,
     /// コンポジットを通さないときにデッキの OSD を重ねる作業領域
@@ -82,6 +86,8 @@ impl Pipeline {
             decoder: Decoder::new(std),
             capture: CaptureSim::default(),
             osd: Osd::new(std),
+            menu: Osd::with_vcr_face(std),
+            menu_params: None,
             video: VideoFrame::new(w, h),
             deck: VideoFrame::new(w, h),
             output: RgbaFrame::new(w, h),
@@ -99,11 +105,20 @@ impl Pipeline {
     pub fn set_params(&mut self, params: Params) {
         if params.standard != self.params.standard {
             let index = self.field_index;
+            let menu = self.menu_params.take();
             *self = Self::new(params);
             self.field_index = index;
+            self.menu_params = menu;
         } else {
             self.params = params;
         }
+    }
+
+    /// デッキのメニュー表示 (OSD マークアップ) を設定する。None で消す。
+    /// 内蔵の VCR 風ドットフォントで描き、デッキの再生出力 (コンポジット / S 映像) に重畳する。
+    /// 座標系・タグは通常の OSD と同じ ([`crate::osd::markup`])。
+    pub fn set_menu(&mut self, markup: Option<String>) {
+        self.menu_params = markup.map(|markup| OsdParams { enabled: true, markup, scale: 2, ..OsdParams::default() });
     }
 
     /// 現在のテレビ方式
@@ -199,6 +214,7 @@ impl Pipeline {
         let p = &self.params;
         let osd = (p.osd.enabled && self.osd.update(&p.osd, self.field_index)).then_some(p.osd.mode);
         let opacity = p.osd.opacity.clamp(0.0, 1.0);
+        let menu = self.menu_params.as_ref().is_some_and(|m| self.menu.update(m, self.field_index));
 
         let tc = Instant::now();
         // 撮像管カメラ (OSD の日付などはカメラの後段で焼き込まれる)
@@ -262,6 +278,10 @@ impl Pipeline {
             if osd == Some(OsdMode::Composite) {
                 self.osd.insert_composite(&mut self.field, opacity);
             }
+            // デッキのメニューは文字発生器が最後に重ねる
+            if menu {
+                self.menu.insert_composite(&mut self.field, 1.0);
+            }
             t2 = Instant::now();
             if p.rf.enabled && p.rf.placement.after_tape() {
                 self.rf.process(&mut self.field, &p.rf, p.seed);
@@ -270,9 +290,15 @@ impl Pipeline {
             self.decoder.decode_field(&self.field, &p.decoder, p.output.deinterlace, &mut self.output);
         } else {
             // コンポジットを通さない: 映像をデジタルのまま出す (DV なら FireWire 取り込み)
-            let frame = if osd == Some(OsdMode::Composite) {
+            let deck_osd = osd == Some(OsdMode::Composite);
+            let frame = if deck_osd || menu {
                 self.deck.data.copy_from_slice(&input.data);
-                self.osd.burn_into(&mut self.deck, opacity);
+                if deck_osd {
+                    self.osd.burn_into(&mut self.deck, opacity);
+                }
+                if menu {
+                    self.menu.burn_into(&mut self.deck, 1.0);
+                }
                 &self.deck
             } else {
                 input

@@ -65,6 +65,9 @@ pub struct Shared {
     pub viewport_height: AtomicU32,
     /// CRT シェーダーを読み直す
     pub crt_reload: AtomicBool,
+    /// デッキのメニュー表示 (イマーシブモードの OSD)。再生出力の信号に重畳する
+    menu: Mutex<Option<String>>,
+    menu_version: AtomicU64,
 }
 
 #[derive(Clone, Debug)]
@@ -123,6 +126,8 @@ impl Engine {
             crt_info: Mutex::new(CrtInfo::default()),
             viewport_height: AtomicU32::new(0),
             crt_reload: AtomicBool::new(false),
+            menu: Mutex::new(None),
+            menu_version: AtomicU64::new(0),
         });
         let (tx, rx) = channel();
         let sh = shared.clone();
@@ -146,6 +151,12 @@ impl Engine {
 
     pub fn stop_recording(&self) -> Result<(), String> {
         self.call(Cmd::StopRecording)
+    }
+
+    /// デッキのメニュー表示 (OSD マークアップ) を設定する。None で消す
+    pub fn set_menu(&self, markup: Option<String>) {
+        *self.shared.menu.lock().unwrap() = markup;
+        self.shared.menu_version.fetch_add(1, Ordering::Release);
     }
 
     pub fn set_params(&self, p: Params) {
@@ -255,6 +266,7 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
     let mut crt = Crt::new(true);
     let mut crt_seen = 0;
     let mut seen_version = 0;
+    let mut seen_menu = 0;
     let mut tv = pipeline.standard();
     // 方式が変わったときに開き直すため、今の入力の指定を覚えておく
     let mut spec = SourceSpec::Pattern;
@@ -305,6 +317,13 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     let _ = reply.send(r);
                 }
             }
+        }
+
+        // ---- メニュー表示 ----
+        let v = shared.menu_version.load(Ordering::Acquire);
+        if v != seen_menu {
+            seen_menu = v;
+            pipeline.set_menu(shared.menu.lock().unwrap().clone());
         }
 
         // ---- パラメータ反映 ----

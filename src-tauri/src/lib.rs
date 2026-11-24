@@ -37,6 +37,12 @@ fn set_params(engine: State<'_, Engine>, params: Params) {
     engine.set_params(params);
 }
 
+/// デッキのメニュー表示 (OSD マークアップ)。None で消す
+#[tauri::command]
+fn set_menu_osd(engine: State<'_, Engine>, markup: Option<String>) {
+    engine.set_menu(markup);
+}
+
 #[tauri::command]
 async fn list_cameras() -> Result<Vec<String>, String> {
     ffmpeg::list_cameras()
@@ -139,6 +145,7 @@ pub fn run() {
             get_params,
             default_params,
             set_params,
+            set_menu_osd,
             list_cameras,
             open_source,
             get_frame,

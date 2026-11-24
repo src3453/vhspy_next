@@ -68,12 +68,32 @@ npm run tauri dev
 入力はテストパターン、カメラ (DirectShow。OBS 仮想カメラも可)、動画、静止画。
 録画とオフライン書き出し (音声付き) は ffmpeg (libx264) で行う。
 
+### イマーシブモード
+
+ツールバーの「イマーシブ」か F11 で、UI を隠して映像だけを全画面に出し、デッキのメニュー表示で操作する。
+メニューはビデオデッキのキャラクタジェネレータのように再生出力 (コンポジット / S 映像) に重畳するので、
+RF・受像機・CRT シェーダーの劣化を映像と一緒に受ける (録画にも映る)。文字は内蔵の VCR-JP フォント
+(`crates/vhs-core/fonts/vcr-jp.ttf`、半角カナ対応) を SAA5050 風に斜めを補間して描く。
+
+| キー | メニューなし | メニュー中 |
+| --- | --- | --- |
+| Enter / M | メニューを開く | 決定 (M は閉じる) |
+| ↑ ↓ | トラッキング | 項目の選択 |
+| ← → | | 値の変更 (Shift で 10 倍) |
+| Esc / Backspace | 終了 (Esc) | 戻る |
+| Space | 入力・カウンタを表示 | |
+| F11 | 終了 | 終了 |
+
+マウスはクリックでメニューの開閉、ホイールで選択。範囲のある値は Enter で既定値に戻る。
+
 ### 開発用
 
 ```powershell
 cargo test -p vhs-core --release
 cargo run -p vhs-core --release --example render -- --bench
 cargo run -p vhs-core --release --example render -- input.png out.png [params.json] [fields] [pan_px]
+# デッキのメニュー表示を重ねて確かめる (OSD マークアップ)
+$env:VHS_MENU = '<pos=40,40><bg=black>ﾒﾆｭｰ MENU</bg>'; cargo run -p vhs-core --release --example render -- --pattern out.png
 # 音声だけ: f32le / 48 kHz / ステレオを標準入出力で
 ffmpeg -i in.mp4 -vn -ac 2 -ar 48000 -f f32le - | cargo run -p vhs-core --release --example audio -- [params.json] | ffmpeg -f f32le -ar 48000 -ac 2 -i - out.wav
 ```
