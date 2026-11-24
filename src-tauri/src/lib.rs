@@ -1,3 +1,4 @@
+mod crt;
 mod engine;
 mod ffmpeg;
 
@@ -71,6 +72,24 @@ fn get_stats(engine: State<'_, Engine>) -> Stats {
     engine.shared.stats.lock().unwrap().clone()
 }
 
+/// CRT シェーダーの状態 (読み込んだプリセットとそのパラメータ)
+#[tauri::command]
+fn get_crt_info(engine: State<'_, Engine>) -> crt::CrtInfo {
+    engine.shared.crt_info.lock().unwrap().clone()
+}
+
+/// CRT シェーダーを読み直す
+#[tauri::command]
+fn reload_crt(engine: State<'_, Engine>) {
+    engine.shared.crt_reload.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// プレビュー画面の高さ [物理 px]。CRT シェーダーはこの大きさで描く
+#[tauri::command]
+fn set_viewport(engine: State<'_, Engine>, height: u32) {
+    engine.shared.viewport_height.store(height, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[tauri::command]
 async fn start_recording(engine: State<'_, Engine>, path: PathBuf) -> Result<(), String> {
     engine.start_recording(path)
@@ -130,6 +149,9 @@ pub fn run() {
             save_preset,
             load_preset,
             check_font,
+            get_crt_info,
+            reload_crt,
+            set_viewport,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -117,6 +117,9 @@ fn main() {
             let kind = if c.intra_frame { 'I' } else { 'P' };
             println!("field {i}: {kind} q={:.1} {:.0} kbit", c.q, c.bits as f64 / 1e3);
         }
+        if let Some(d) = p.dv_stats().filter(|_| i + 4 >= fields) {
+            println!("field {i}: DV qno={:.2} truncated={} lost_mbs={} corrupt_mbs={}", d.qno_mean, d.truncated_blocks, d.lost_mbs, d.corrupt_mbs);
+        }
     }
     let out = p.output();
     // 表示用に 4:3 (NTSC なら 640x480) へリサイズ

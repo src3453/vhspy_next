@@ -5,7 +5,9 @@
 //! 1. 2 倍オーバーサンプリング: Hi8 (白 7.7 MHz) でも搬送波と側波帯がナイキスト周波数に収まるようにする
 //! 2. 周波数変調: シンクチップ〜ホワイトピークを各フォーマットの搬送波周波数に割り当てる。
 //!    エンファシスで白のエッジが行き過ぎると、ホワイトピークより高い周波数まで振れる
-//! 3. 低域変換クロマの重畳: 実機では色は FM 信号をバイアス代わりに同じトラックへ記録される
+//! 3. 低域変換クロマの重畳と磁性体の伝達特性: 実機では色は FM 信号をバイアス代わりに同じトラックへ
+//!    記録される。和の瞬時値が磁性体で飽和すると、搬送波とクロマの相互変調積が搬送波の近くに立ち
+//!    (伝送路の傾きで AM が PM に変わり)、輝度のモアレになる
 //! 4. 再生の伝送路: ヘッド・テープの高域損失 (ローパス)、クロマを分けるハイパス、RF ノイズ。
 //!    RF レベル (トラッキング・しわ・ドロップアウト) は搬送波の振幅として効く
 //! 5. リミッタ + 周期計測型の復調: ゼロ交差の間隔から瞬時周波数を求めて輝度に戻す。
@@ -13,6 +15,7 @@
 //!    (白のエッジの右に黒い筋 = ベアディング)。搬送波が消えるとノイズのゼロ交差を拾い、白黒の砂嵐になる
 
 use crate::filter::Cascade;
+use super::magnetic::MagneticTransfer;
 use crate::rng::Rng;
 use crate::timing::{Levels, MAX_LINE_SAMPLES};
 
@@ -39,6 +42,8 @@ pub struct FmChannel {
     /// 低域変換クロマの周波数 [Hz] と、振幅の倍率 [1/IRE]
     cu_freq: f32,
     cu_gain: f32,
+    /// 磁性体の伝達特性 (搬送波の振幅 = 1 の尺度)
+    mag: MagneticTransfer,
     /// 伝送路と復調後のフィルタの遅れ [オーバーサンプリング後のサンプル]。出力を前にずらして打ち消す
     delay: f32,
 }
@@ -171,6 +176,8 @@ pub struct FmConfig {
     pub color_under_hz: f32,
     /// バースト振幅の色信号が、搬送波振幅 1 に対してこの振幅で記録される
     pub color_under_level: f32,
+    /// 磁性体の伝達特性 (飽和レベルは搬送波の振幅 = 1 の尺度)
+    pub mag: MagneticTransfer,
 }
 
 impl FmChannel {
@@ -195,6 +202,7 @@ impl FmChannel {
             noise: c.noise * (0.5 * fs2 / bw).sqrt(),
             cu_freq: c.color_under_hz,
             cu_gain: c.color_under_level / c.levels.burst.max(1e-3),
+            mag: c.mag,
         }
     }
 
@@ -268,17 +276,18 @@ impl FmChannel {
                     }
                 }
             }
-            let mut x = a * fast_cos(ct, phase);
+            // 記録: 搬送波 + 低域変換クロマを磁性体の伝達特性に通す
+            let mut rec = fast_cos(ct, phase);
             if has_cu && m >= PRE_ROLL * OVERSAMPLE {
                 let j = src.min(n - 1);
                 cu_phase += dcu;
                 if cu_phase > TAU {
                     cu_phase -= TAU;
                 }
-                // 低域変換クロマも同じトラックに記録されるので、RF レベルの影響を同じだけ受ける
-                x += a * self.cu_gain * (cu_i[j] * fast_cos(ct, cu_phase) - cu_q[j] * fast_sin(ct, cu_phase));
+                rec += self.cu_gain * (cu_i[j] * fast_cos(ct, cu_phase) - cu_q[j] * fast_sin(ct, cu_phase));
             }
-            x += self.noise * rng.normal();
+            // 再生: 同じトラックなので、クロマも RF レベルの影響を同じだけ受ける
+            let x = a * self.mag.transfer(rec) + self.noise * rng.normal();
             rf[m] = hp.process(lp.process(x));
         }
 
@@ -339,6 +348,7 @@ mod tests {
             noise,
             color_under_hz: 629e3,
             color_under_level: 0.0,
+            mag: MagneticTransfer::new(crate::params::MagneticModel::Linear, 1.0),
         })
     }
 

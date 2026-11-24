@@ -2,7 +2,10 @@
 // Rust 側 (crates/vhs-core/src/params.rs) を変更したらここも合わせる。
 
 export type Standard = "ntsc" | "pal";
-export type TapeFormat = "vhs" | "svhs" | "beta" | "super_beta" | "video8" | "hi8" | "custom";
+export type TapeFormat = "vhs" | "svhs" | "beta" | "super_beta" | "video8" | "hi8" | "dv" | "digital8" | "custom";
+/** DV 方式 (デジタル記録) のフォーマット */
+type DigitalFormat = "dv" | "digital8";
+export const isDigitalFormat = (f: TapeFormat): f is DigitalFormat => f === "dv" || f === "digital8";
 
 export type Params = {
   /** テレビ方式 */
@@ -41,7 +44,7 @@ export type Params = {
     white_clip: number;
     camera_gamma: number;
   };
-  encoder: { luma_bw_mhz: number; i_bw_mhz: number; q_bw_mhz: number; uv_bw_mhz: number; chroma_gain: number };
+  encoder: { enabled: boolean; luma_bw_mhz: number; i_bw_mhz: number; q_bw_mhz: number; uv_bw_mhz: number; chroma_gain: number };
   tape: {
     enabled: boolean;
     format: TapeFormat;
@@ -66,12 +69,28 @@ export type Params = {
     chroma_delay_samples: number;
     magnetic_model: "linear" | "tanh";
     saturation_ire: number;
+    rf_saturation: number;
     dropout_rate: number;
     dropout_length: number;
     dropout_compensation: boolean;
     crease_rate: number;
     crease_fields: number;
     head_clog_rate: number;
+  };
+  dv: {
+    dct_248: boolean;
+    bitrate_scale: number;
+    error_rate: number;
+    burst_rate: number;
+    burst_length: number;
+    noise_rate: number;
+    noise_length: number;
+    noise_density: number;
+    ecc: boolean;
+    ecc_miss: number;
+    head_clog_rate: number;
+    head_clog_frames: number;
+    concealment: boolean;
   };
   transport: {
     jitter_samples: number;
@@ -86,6 +105,16 @@ export type Params = {
     tracking_speed: number;
     vertical_jitter: number;
   };
+  tbc: {
+    enabled: boolean;
+    window_samples: number;
+    gate_samples: number;
+    reacquire_lines: number;
+    error_rate: number;
+    residual_samples: number;
+    bits: number;
+    regenerate_sync: boolean;
+  };
   rf: {
     enabled: boolean;
     placement: "before_tape" | "after_tape" | "both";
@@ -97,7 +126,10 @@ export type Params = {
     sound_beat: number;
   };
   decoder: {
-    yc_separation: "notch" | "comb";
+    yc_separation: "notch" | "comb" | "comb3d";
+    motion_threshold_ire: number;
+    motion_adaptive: boolean;
+    frame_buffer_bits: number;
     chroma_bw_mhz: number;
     acc: boolean;
     color_killer: boolean;
@@ -151,6 +183,16 @@ export type Params = {
     font: string;
     font_index: number;
     font_dots: number;
+  };
+  /** ブラウン管 (RetroArch slang シェーダー)。GUI 側の専用パネルで操作する */
+  crt: {
+    enabled: boolean;
+    /** .slangp のパス */
+    preset: string;
+    /** 録画・書き出しの高さ [px] (幅は 4:3) */
+    height: number;
+    /** シェーダーパラメータの上書き */
+    params: Record<string, number>;
   };
   seed: number;
 };
@@ -274,6 +316,8 @@ export const groups: Group[] = [
           { value: "super_beta", label: "SuperBeta" },
           { value: "video8", label: "Video8" },
           { value: "hi8", label: "Hi8" },
+          { value: "dv", label: "DV (MiniDV)" },
+          { value: "digital8", label: "Digital8" },
           { value: "custom", label: "カスタム" },
         ],
       },
@@ -300,6 +344,28 @@ export const groups: Group[] = [
     ],
   },
   {
+    title: "DV (MiniDV / Digital8)",
+    note:
+      "フォーマットが DV / Digital8 のとき、アナログのテープ処理の代わりに使う。25 Mbps・4:1:1 (PAL は 4:2:0) の " +
+      "DCT 圧縮で、5 マクロブロックごとに符号量が一定なので、細かい絵柄の周りだけブロックノイズが出る。" +
+      "「コンポジット信号を通す」をオフにすると FireWire 取り込み (デジタルのまま)、オンならデッキのアナログ出力。",
+    controls: [
+      r("dv.bitrate_scale", "符号量 (1 = 25 Mbps)", 0.1, 2, 0.01, "×"),
+      b("dv.dct_248", "動きのあるブロックを 2-4-8 DCT"),
+      r("dv.noise_rate", "バーストノイズ (データ化け)", 0, 60, 0.1, "回/s"),
+      r("dv.noise_length", "バーストノイズの長さ", 1, 400, 1, "MB"),
+      r("dv.noise_density", "区間内のバイト誤り率", 0, 0.5, 0.001),
+      b("dv.ecc", "誤り訂正 (ECC)"),
+      r("dv.ecc_miss", "誤りの見逃し", 0, 1, 0.01),
+      b("dv.concealment", "エラー修整 (前のフレームで埋める)"),
+      r("dv.error_rate", "ブロックの読み取りエラー", 0, 0.05, 0.0005),
+      r("dv.burst_rate", "ドロップアウト (読めない区間)", 0, 30, 0.1, "回/s"),
+      r("dv.burst_length", "ドロップアウトの長さ", 1, 27, 1, "seg"),
+      r("dv.head_clog_rate", "ヘッド目詰まり", 0, 30, 0.5, "回/分"),
+      r("dv.head_clog_frames", "目詰まりの長さ", 1, 120, 1, "frame"),
+    ],
+  },
+  {
     title: "テープ: 輝度 (FM 記録)",
     controls: [
       b("tape.enabled", "テープを通す"),
@@ -320,11 +386,18 @@ export const groups: Group[] = [
       r("tape.chroma_noise_ire", "クロマノイズ", 0, 20, 0.1, "IRE"),
       r("tape.chroma_phase_noise_deg", "位相ノイズ", 0, 45, 0.5, "°"),
       r("tape.chroma_delay_samples", "Y/C 遅延", -10, 20, 1, "smp"),
+    ],
+  },
+  {
+    title: "テープ: 磁性体",
+    note: "記録するすべての信号 (FM 輝度の RF・低域変換クロマ・リニア音声) に同じ伝達特性が掛かる。",
+    controls: [
       {
         kind: "select", path: "tape.magnetic_model", label: "磁性体モデル",
         options: [{ value: "tanh", label: "tanh 飽和" }, { value: "linear", label: "線形" }],
       },
-      r("tape.saturation_ire", "飽和レベル", 5, 150, 1, "IRE"),
+      r("tape.saturation_ire", "色の飽和レベル", 5, 150, 1, "IRE"),
+      r("tape.rf_saturation", "RF の飽和レベル", 0.2, 5, 0.05),
     ],
   },
   {
@@ -361,6 +434,20 @@ export const groups: Group[] = [
     ],
   },
   {
+    title: "TBC (タイムベースコレクタ)",
+    note: "再生信号をラインメモリに取り込み、同期を検出して時間軸の揺れを取り除く。同期を見失う・誤検出するとラインが横に飛ぶ (TBC エラー)。",
+    controls: [
+      b("tbc.enabled", "TBC を通す"),
+      r("tbc.window_samples", "補正範囲", 0, 80, 0.5, "smp"),
+      r("tbc.gate_samples", "同期ゲート幅", 0.5, 40, 0.5, "smp"),
+      r("tbc.reacquire_lines", "再捕捉までのライン数", 0, 30, 1, "line"),
+      r("tbc.error_rate", "同期の誤検出", 0, 0.05, 0.0005),
+      r("tbc.residual_samples", "残留ジッタ", 0, 1, 0.01, "smp"),
+      r("tbc.bits", "A/D ビット数 (0 = なし)", 0, 12, 1, "bit"),
+      b("tbc.regenerate_sync", "同期を作り直す"),
+    ],
+  },
+  {
     title: "RF 接続 (アンテナ端子)",
     note: "チューナ経由で受けたときの劣化。放送受信 (録画前) / デッキ→テレビ (再生後) / 両方を選べる。",
     controls: [
@@ -383,7 +470,9 @@ export const groups: Group[] = [
   },
   {
     title: "エンコーダ (送出側)",
+    note: "コンポジット信号を通さないと、カメラ・OSD・DV・キャプチャだけを通す (アナログのテープ・RF・TBC・受像機は飛ばす)。",
     controls: [
+      b("encoder.enabled", "コンポジット信号 (NTSC / PAL) を通す"),
       r("encoder.luma_bw_mhz", "輝度帯域", 1, 6, 0.05, "MHz"),
       r("encoder.i_bw_mhz", "I 帯域", 0.2, 3, 0.05, "MHz"),
       r("encoder.q_bw_mhz", "Q 帯域", 0.1, 3, 0.05, "MHz"),
@@ -396,8 +485,15 @@ export const groups: Group[] = [
     controls: [
       {
         kind: "select", path: "decoder.yc_separation", label: "Y/C 分離",
-        options: [{ value: "notch", label: "ノッチ (ドットクロール)" }, { value: "comb", label: "くし形 (NTSC 1H / PAL 2H)" }],
+        options: [
+          { value: "notch", label: "ノッチ (ドットクロール)" },
+          { value: "comb", label: "くし形 (NTSC 1H / PAL 2H)" },
+          { value: "comb3d", label: "3 次元 (画面バッファ)" },
+        ],
       },
+      b("decoder.motion_adaptive", "3D: 動き適応"),
+      r("decoder.motion_threshold_ire", "3D: 動き検出しきい値", 0.5, 20, 0.5, "IRE"),
+      r("decoder.frame_buffer_bits", "3D: バッファのビット数 (0 = なし)", 0, 12, 1, "bit"),
       r("decoder.chroma_bw_mhz", "色差帯域", 0.2, 3, 0.05, "MHz"),
       b("decoder.acc", "ACC"),
       b("decoder.color_killer", "カラーキラー"),
@@ -544,8 +640,14 @@ export const help: Record<string, string> = {
   "tape.chroma_noise_ire": "色信号の振幅ノイズ (rms)。色ムラ・色の粒状ノイズになる。",
   "tape.chroma_phase_noise_deg": "再生時の色位相の揺らぎ (rms)。ラインごとに色相がぶれる。",
   "tape.chroma_delay_samples": "輝度に対する色の位置ずれ。正で色が右にずれる。",
-  "tape.magnetic_model": "磁性体の伝達特性。tanh は強い色が飽和して頭打ちになる。線形は飽和なし。",
-  "tape.saturation_ire": "磁気飽和が始まる色の振幅。小さいほど鮮やかな色が早く潰れる (tanh のみ)。",
+  "tape.magnetic_model":
+    "磁性体の伝達特性。記録するすべての信号に掛かる。tanh は記録レベルが大きいと磁化が飽和する: " +
+    "強い色が頭打ちになり、FM の搬送波と色の相互変調で鮮やかな色の部分に輝度のモアレが出て、" +
+    "リニア音声は大きい音が潰れる (テープコンプレッション)。線形は飽和なし。",
+  "tape.saturation_ire": "低域変換クロマの磁気飽和が始まる色の振幅。小さいほど鮮やかな色が早く潰れる (tanh のみ)。",
+  "tape.rf_saturation":
+    "FM 輝度の RF (搬送波の振幅 = 1) の飽和レベル。小さいほど搬送波と色の相互変調が強くなり、" +
+    "鮮やかな色の部分に細かいモアレが出る。搬送波も縮むのでノイズがやや増える (tanh のみ)。",
 
   // テープ: ドロップアウト
   "tape.dropout_rate": "1 ラインあたりのドロップアウト (磁性体の欠落による白や黒の横筋) の発生確率。",
@@ -569,6 +671,20 @@ export const help: Record<string, string> = {
   "transport.tracking_error": "トラッキングのずれ。大きいほどノイズバーが太く濃くなる。",
   "transport.tracking_speed": "ノイズバーが画面を移動する速さ。負で上向き。",
   "transport.vertical_jitter": "画面全体の上下の揺れ (rms)。安物デッキの V ジッタ。",
+
+  // TBC
+  "tbc.enabled": "再生機のタイムベースコレクタ。ジッタ・ワウフラッタ・スキュー・ヘッド切替の曲がりを取り除く。",
+  "tbc.window_samples": "補正できる時間軸のずれ (ラインメモリの余裕)。超えた分はそのまま残る。",
+  "tbc.gate_samples":
+    "前のラインの同期位置からこの範囲だけで次の同期を探す。狭いと急なずれ (ヘッド切替・ノイズバー) で同期を見失い、" +
+    "前のラインの補正量のままになってラインがずれる。",
+  "tbc.reacquire_lines": "同期を見失ってから探す範囲を広げて捕まえ直すまでのライン数。大きいほどずれたラインが長く続く。",
+  "tbc.error_rate": "ノイズで同期を誤検出する確率 (1 ラインあたり)。誤った位置が基準になるので、数ライン続けて横に飛ぶ。",
+  "tbc.residual_samples": "補正後に残る書き込みクロックの揺れ (rms)。",
+  "tbc.bits": "ラインメモリの A/D 変換のビット数。小さいほど階調が粗くなる。0 で量子化しない。",
+  "tbc.regenerate_sync":
+    "同期・ブランキングを作り直して出力する。TBC が誤ったずれは受像機の AFC でももう直らない。" +
+    "オフだと元の同期をそのまま通す (受像機の AFC が TBC の誤りを一部打ち消す)。",
 
   // RF
   "rf.enabled": "デッキの RF 出力 (アンテナ端子) をテレビのチューナで受けた状態にする。",
@@ -596,7 +712,16 @@ export const help: Record<string, string> = {
   // デコーダ
   "decoder.yc_separation":
     "輝度と色の分離方式。ノッチは安価な方式でドットクロールや虹色のクロスカラーが出る。" +
-    "くし形はそれらを抑えるが、縦方向の色の境目がにじむ (PAL は 2 ライン離れたラインと比べるので、にじみが大きい)。",
+    "くし形はそれらを抑えるが、縦方向の色の境目がにじむ (PAL は 2 ライン離れたラインと比べるので、にじみが大きい)。" +
+    "3 次元は画面バッファ (フレームメモリ) に持った前のフレーム (NTSC 1 フレーム / PAL 2 フレーム前) と比べるので、" +
+    "静止部分ではクロスカラーもにじみもほぼ出ない。テープ再生のように時間軸や色の位相がフレームごとに揺れると効きが落ちる。",
+  "decoder.motion_adaptive":
+    "3 次元 Y/C 分離の動き適応。動きを検出した部分だけラインくし形に切り替える。" +
+    "切ると常にフレームくし形になり、動く部分に前のフレームの絵が色の縞・二重像として残る。",
+  "decoder.motion_threshold_ire":
+    "3 次元 Y/C 分離で動きとみなすフレーム間差。小さいと雑音でもラインくし形に逃げ、大きいと動く部分にクロスカラーの残像が出る。",
+  "decoder.frame_buffer_bits":
+    "3 次元 Y/C 分離の画面バッファのビット数 (同期先端〜ピークを量子化)。少ないと静止部分にも量子化雑音や色の等高線が乗る。0 で量子化しない。",
   "decoder.chroma_bw_mhz": "受像機で復調した後の色差の帯域。小さいほど色がにじむ。",
   "decoder.burst_pll":
     "色副搬送波の PLL がバーストに追従する速さ (ライン単位)。1 = ラインごとに即時同期。" +
@@ -608,7 +733,8 @@ export const help: Record<string, string> = {
   // テープのフォーマット
   "tape.format":
     "テープのフォーマット。VHS / ベータ / Video8 は同じ方式 (FM 輝度 + 低域変換クロマ) で、搬送波周波数と帯域が違う。" +
-    "S-VHS / Hi8 は搬送波を上げて輝度帯域を広げた高画質版で、S 映像でつなぐのが普通。",
+    "S-VHS / Hi8 は搬送波を上げて輝度帯域を広げた高画質版で、S 映像でつなぐのが普通。" +
+    "DV (MiniDV) / Digital8 はデジタル記録で、アナログのテープ処理の代わりに「DV」の設定で処理する。",
   "tape.luma_model":
     "FM を計算: 輝度で搬送波を周波数変調し、ヘッド・テープの伝送路とノイズを通して、ゼロ交差の間隔から復調する。" +
     "ベアディング・砂嵐・RF レベルの低下が自然に出る (重い)。簡易: 帯域制限と加算ノイズで近似する (軽い)。",
@@ -630,6 +756,34 @@ export const help: Record<string, string> = {
   "decoder.saturation": "受像機の色の濃さ。",
   "decoder.hue_deg": "受像機の色相 (ティント)。NTSC 特有の色ずれを再現・補正できる。",
   "output.deinterlace": "Weave: 2 フィールドを交互に織り込む (動きに櫛状のずれ)。Bob: 各フィールドのラインを 2 倍に伸ばす。",
+
+  // コンポジットの有無
+  "encoder.enabled":
+    "オフにすると NTSC / PAL の信号を作らず、映像をデジタルのまま流す。撮像管カメラや OSD、DV、キャプチャだけを試すとき用。" +
+    "DV と組み合わせると FireWire (i.LINK) 取り込みと同じ経路になる。",
+
+  // DV
+  "dv.bitrate_scale":
+    "1 セグメント (5 マクロブロック) に割り当てる符号量の倍率。1 が規格どおり (25 Mbps)。" +
+    "下げると、細かい絵柄やノイズの多い所のブロックノイズ・モスキートノイズが目立つ。",
+  "dv.dct_248":
+    "上下のライン (別フィールド) の食い違いが大きいブロックを、2 フィールドの和と差に分けて変換する。" +
+    "切ると動きのある所の横縞 (コーミング) を 8×8 のまま符号化して粗くなる。",
+  "dv.noise_rate":
+    "テープのデータが化けるバーストノイズの頻度。読み取り順に連続したマクロブロックにバイト誤りが乗る。" +
+    "誤り訂正で直せない分は修整されるか、見逃されて化けたまま (縞・格子・色のずれたブロック) 復号される。",
+  "dv.noise_length": "バーストノイズ 1 回の平均の長さ (マクロブロック数)。長いとトラックをまたいで画面の離れた場所にも散る。",
+  "dv.noise_density":
+    "バーストノイズの区間で 1 バイトが化ける確率。マクロブロック (77 バイト) あたり 4 バイトまでは誤り訂正で直る。",
+  "dv.ecc": "誤り訂正 (内符号のリード・ソロモン)。オフにすると誤りはすべて化けたまま復号される (壊れたファイルの再生に近い)。",
+  "dv.ecc_miss": "訂正しきれない誤りを検出し損ねる確率。検出できた誤りは前のフレームで埋められる。",
+  "dv.concealment":
+    "読めないブロックを前のフレームの同じ位置で埋める。動く映像ではモザイク状の残像になる。" +
+    "切ると壊れたブロックがでたらめな色のまま出る。",
+  "dv.error_rate": "マクロブロックごとの読み取りエラー (検出されて修整される) の確率 [1/フレーム]。",
+  "dv.burst_rate": "テープの傷などでセグメント単位に読めない区間 (ドロップアウト) の頻度。",
+  "dv.head_clog_rate":
+    "ヘッドの目詰まり。片方のヘッドなら 1 本おきのトラック (画面に散らばったブロック) が、両方なら画面全体が前のフレームで止まる。",
 
   // キャプチャ
   "capture.enabled": "受像した映像をキャプチャ機器でデジタル化・圧縮した状態にする。",
@@ -691,7 +845,15 @@ type FormatSpec = {
   connection: "composite" | "s_video";
   extra?: DeepPartial<Params>;
 };
-const formatSpecs: Record<Exclude<TapeFormat, "custom">, FormatSpec> = {
+// DV 方式のフォーマットの値。デッキのアナログ出力は S 映像が普通
+// (DV はコンポジット信号を通すかどうかで FireWire / アナログ出力を選ぶので、その設定には触れない)
+const digitalSpecs: Record<DigitalFormat, DeepPartial<Params>> = {
+  dv: { dv: { burst_rate: 0, noise_rate: 0 } },
+  // Hi8 のテープ (蒸着テープが多い) は傷・ドロップアウトが出やすい
+  digital8: { dv: { burst_rate: 0.3, noise_rate: 0.5 } },
+};
+
+const formatSpecs: Record<Exclude<TapeFormat, "custom" | DigitalFormat>, FormatSpec> = {
   vhs: {
     fm: { ntsc: [3.4, 4.4], pal: [3.8, 4.8] }, colorUnder: { ntsc: 629, pal: 627 },
     lumaBw: 3.0, channel: 5.5, noise: 0.05, connection: "composite",
@@ -725,6 +887,11 @@ const formatSpecs: Record<Exclude<TapeFormat, "custom">, FormatSpec> = {
 /// `full` = false なら、テレビ方式で変わる値 (搬送波周波数・低域変換周波数) だけを返す
 export function formatDiff(format: TapeFormat, standard: Standard, full = true): DeepPartial<Params> {
   if (format === "custom") return { tape: { format } };
+  if (isDigitalFormat(format)) {
+    // テレビ方式で変わる値はない (720×480 4:1:1 / 720×576 4:2:0 は vhs-core が方式から決める)
+    if (!full) return { tape: { format } };
+    return { tape: { format }, output: { connection: "s_video" }, ...digitalSpecs[format] };
+  }
   const f = formatSpecs[format];
   const [sync, white] = f.fm[standard];
   if (!full) return { tape: { fm_sync_mhz: sync, fm_white_mhz: white, color_under_khz: f.colorUnder[standard] } };
@@ -800,6 +967,18 @@ export const presets: { name: string; diff: DeepPartial<Params> }[] = [
     },
   },
   {
+    name: "TBC 付き S-VHS デッキ",
+    diff: { tbc: { enabled: true } },
+  },
+  {
+    name: "TBC が暴れる劣化テープ",
+    diff: {
+      tape: { luma_noise_ire: 5, dropout_rate: 0.015, dropout_length: 80 },
+      transport: { jitter_samples: 2.5, head_switch_offset: 24, tracking_error: 0.45, skew_samples: 12 },
+      tbc: { enabled: true, window_samples: 20, gate_samples: 4, reacquire_lines: 6, error_rate: 0.004 },
+    },
+  },
+  {
     name: "Hi-Fi デッキ",
     diff: { audio: { mode: "hifi", hifi_buzz: 0.15 } },
   },
@@ -841,6 +1020,34 @@ export const presets: { name: string; diff: DeepPartial<Params> }[] = [
   {
     name: "放送受信 (テープなし)",
     diff: { tape: { enabled: false } },
+  },
+  {
+    name: "MiniDV カムコーダ (FireWire 取り込み)",
+    diff: { tape: { format: "dv" }, encoder: { enabled: false }, audio: { enabled: false } },
+  },
+  {
+    name: "MiniDV をアナログ出力 (S 映像)",
+    diff: { tape: { format: "dv" }, output: { connection: "s_video" }, audio: { enabled: false } },
+  },
+  {
+    name: "劣化した MiniDV テープ",
+    diff: {
+      tape: { format: "dv" }, encoder: { enabled: false },
+      dv: { noise_rate: 3, noise_length: 30, noise_density: 0.08, ecc_miss: 0.15, burst_rate: 0.5, head_clog_rate: 1 },
+      audio: { enabled: false },
+    },
+  },
+  {
+    name: "壊れた DV ファイル (誤り訂正なし)",
+    diff: {
+      tape: { format: "dv" }, encoder: { enabled: false },
+      dv: { noise_rate: 4, noise_length: 60, noise_density: 0.03, ecc: false, concealment: false },
+      audio: { enabled: false },
+    },
+  },
+  {
+    name: "撮像管カメラだけ (信号処理なし)",
+    diff: { camera: { enabled: true }, encoder: { enabled: false }, tape: { enabled: false } },
   },
   {
     name: "PAL VHS (シンプル PAL 受像機)",

@@ -86,3 +86,12 @@ fn golden_ntsc_fm_svideo() {
     p.rf.enabled = false;
     run("ntsc_fm_svideo", p);
 }
+
+#[test]
+fn golden_ntsc_tbc() {
+    let mut p = full();
+    p.transport.jitter_samples = 2.0;
+    p.tbc.enabled = true;
+    p.tbc.error_rate = 0.005;
+    run("ntsc_tbc", p);
+}

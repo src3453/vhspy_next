@@ -7,6 +7,9 @@
 //!      FM 伝送は 2 通り: Simple (加算ノイズと確率的なベアディングで近似) と Fm (変調・伝送路・復調を計算、[`fm`])
 //!    - 色: バンドパス → 低域変換 (複素包絡線で等価的に扱う) → 狭帯域化 → 磁気飽和 → AM/位相ノイズ
 //!      → 再生時の高域変換
+//!    - 磁性体の伝達特性 ([`magnetic`]) は記録するすべての信号に掛ける: クロマの包絡線の圧縮に加えて、
+//!      FM の RF (搬送波 + 低域変換クロマ) の瞬時値にも掛ける。Fm モデルでは実際に RF に通し、
+//!      Simple モデルでは搬送波の圧縮 (S/N の低下) と相互変調 (2 × 低域変換周波数のモアレ) で近似する
 //! 2. 媒体の欠陥: ドロップアウトとドロップアウト補償 (DOC)、しわ (クリース)、ヘッド目詰まり
 //!    (しわと目詰まりは再生 RF レベルの低下として扱い、ノイズ・ドロップアウト・時間軸の乱れに波及させる)
 //! 3. 走行系: ジッタ、ワウフラッタ、スキュー、ヘッド切替、トラッキングずれ (時間軸誤差として
@@ -77,6 +80,46 @@ impl ChromaRec {
         bi += self.n_i.process(rng.normal()) * self.cn;
         bq += self.n_q.process(rng.normal()) * self.cn;
         (bi, bq)
+    }
+}
+
+/// Simple モデルで FM の RF に掛かる磁性体の伝達特性を近似する係数
+#[derive(Clone, Copy)]
+struct SimpleRf {
+    /// 搬送波が飽和で縮んだぶんの S/N の低下 (輝度ノイズの倍率)
+    noise_gain: f32,
+    /// 相互変調による輝度の揺れの係数 [1/IRE]。クロマの複素包絡線の 2 乗に掛ける
+    imd: f32,
+    /// 低域変換周波数の 1 サンプルあたりの位相の進み [rad]
+    dcu: f32,
+}
+
+impl SimpleRf {
+    fn new(mag: MagneticTransfer, tp: &TapeParams, s: &Standard) -> Self {
+        use std::f32::consts::TAU;
+        let dcu = TAU * tp.color_under_khz * 1e3 / s.fs;
+        if mag.is_linear() {
+            return Self { noise_gain: 1.0, imd: 0.0, dcu };
+        }
+        // 搬送波 (振幅 1) の基本波の振幅 = 飽和後の再生 RF レベル
+        const N: usize = 64;
+        let fund = (0..N)
+            .map(|k| {
+                let th = TAU * (k as f32 + 0.5) / N as f32;
+                mag.transfer(th.cos()) * th.cos()
+            })
+            .sum::<f32>()
+            * 2.0
+            / N as f32;
+        // 3 次の相互変調: x = cos a + b cos c を S tanh(x / S) に通すと、a ± 2c に振幅 b² / (4 S²) の側波帯が立つ。
+        // 対称な側波帯は AM でリミッタに消されるが、伝送路の傾きで半分ほどが PM になり、
+        // 周波数偏移 r · 2 f_cu として復調される
+        let sat = mag.saturation();
+        let k_cu = tp.color_under_level.max(0.0) / s.ire.burst.max(1e-3);
+        let dev_hz = (tp.fm_white_mhz - tp.fm_sync_mhz).max(0.1) * 1e6;
+        let ire_per_hz = (s.ire.white - s.ire.sync) / dev_hz;
+        let imd = 0.5 * k_cu * k_cu / (4.0 * sat * sat) * 2.0 * tp.color_under_khz * 1e3 * ire_per_hz;
+        Self { noise_gain: 1.0 / fund.max(0.05), imd, dcu }
     }
 }
 
@@ -195,7 +238,10 @@ impl TapeSim {
         let c_bp = Cascade::new(&[Biquad::bandpass_at(s.fsc, 2.5, fs)]);
         let c_lp = Cascade::butter_lowpass_at(2, tp.chroma_bw_khz * 1e3, fs);
         let cn_lp = Cascade::butter_lowpass_at(2, tp.chroma_bw_khz * 1e3, fs);
-        let mag = MagneticTransfer::new(tp.magnetic_model, tp.saturation_ire);
+        let mag = MagneticTransfer::new(tp.magnetic_model, tp.saturation_ire.max(1.0));
+        // FM の RF の伝達特性 (搬送波の振幅 = 1 の尺度)
+        let rf_mag = MagneticTransfer::new(tp.magnetic_model, tp.rf_saturation.max(0.05));
+        let simple_rf = SimpleRf::new(rf_mag, tp, s);
         let fm = (tp.luma_model == LumaModel::Fm).then(|| {
             FmChannel::new(&FmConfig {
                 fs,
@@ -207,6 +253,7 @@ impl TapeSim {
                 noise: tp.fm_noise.max(0.0),
                 color_under_hz: tp.color_under_khz * 1e3,
                 color_under_level: tp.color_under_level.max(0.0),
+                mag: rf_mag,
             })
         });
         let drops = &self.drops;
@@ -237,6 +284,7 @@ impl TapeSim {
                 let dphi = rng.normal() * phase_noise * noise_gain.min(4.0);
                 let (cd, sd) = (dphi.cos(), dphi.sin());
                 let mut beard_left = 0u32;
+                let mut cu_phase = rng.uniform() * std::f32::consts::TAU;
 
                 co.fill(0.0);
                 // 再生クロマを (遅延をつけて) 書き込む
@@ -293,17 +341,33 @@ impl TapeSim {
                         // 過変調でキャリアが消え、復調出力が黒側へ跳ねる
                         beard_left = 4 + (rng.uniform() * 24.0 * tp.bearding_strength) as u32;
                     }
-                    let noise = noise_lp.process(rng.normal()) * luma_noise_norm * tp.luma_noise_ire * noise_gain;
-                    let mut yd = de.process(pe + noise);
+                    let noise = noise_lp.process(rng.normal())
+                        * luma_noise_norm
+                        * tp.luma_noise_ire
+                        * noise_gain
+                        * simple_rf.noise_gain;
+
+                    // ---- 色 (低域変換) ----
+                    let (bi, bq) = chroma.step(xv, (n + base) & 3, &mut rng);
+                    put_chroma(co, n, bi, bq);
+
+                    // 搬送波とクロマの相互変調: (bi + j bq)² e^{j 2 ω_cu t} の実部に比例する輝度の揺れ
+                    cu_phase += simple_rf.dcu;
+                    if cu_phase > std::f32::consts::TAU {
+                        cu_phase -= std::f32::consts::TAU;
+                    }
+                    let imd = if simple_rf.imd > 0.0 {
+                        let (s2, c2) = (2.0 * cu_phase).sin_cos();
+                        simple_rf.imd * ((bi * bi - bq * bq) * c2 - 2.0 * bi * bq * s2)
+                    } else {
+                        0.0
+                    };
+                    let mut yd = de.process(pe + noise + imd);
                     if beard_left > 0 {
                         yd = yd * 0.15 - 5.0;
                         beard_left -= 1;
                     }
                     yo[n] = sharp.process(yd);
-
-                    // ---- 色 (低域変換) ----
-                    let (bi, bq) = chroma.step(xv, (n + base) & 3, &mut rng);
-                    put_chroma(co, n, bi, bq);
                 }
             });
     }

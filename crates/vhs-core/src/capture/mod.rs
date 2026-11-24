@@ -11,7 +11,7 @@
 //!
 //! コマ落ち (取り込みが間に合わず前のフレームを繰り返す) もここで扱う。
 
-mod codec;
+pub(crate) mod codec;
 
 use crate::frame::RgbaFrame;
 use crate::params::{CaptureLevels, CaptureParams, ChromaSubsampling};

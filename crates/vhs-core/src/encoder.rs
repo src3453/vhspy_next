@@ -14,8 +14,19 @@ use rayon::prelude::*;
 /// I/Q 軸は U/V 軸から 33° 回転している
 const IQ_ROT: f32 = 33.0 * std::f32::consts::PI / 180.0;
 
-/// `frame` は `field.std.image_size()` の大きさであること。
+/// `frame` は `field.std.image_size()` の大きさであること。コンポジット信号を `field.data` に書く。
 pub fn encode_field(frame: &VideoFrame, field: &mut Field, p: &EncoderParams) {
+    encode(frame, field, p, false);
+}
+
+/// `field.separate` なら Y/C を分けたまま (S 映像) 書く: `data` = Y (同期付き)、`chroma` = C (バースト付き)。
+/// テープを通さずに S 映像で出す機器 (DV デッキなど) 用
+pub fn encode_field_yc(frame: &VideoFrame, field: &mut Field, p: &EncoderParams) {
+    let split = field.separate;
+    encode(frame, field, p, split);
+}
+
+fn encode(frame: &VideoFrame, field: &mut Field, p: &EncoderParams, split: bool) {
     let s = field.std;
     let (aw, fl) = s.image_size();
     assert_eq!((frame.width, frame.height), (aw, fl));
@@ -43,7 +54,15 @@ pub fn encode_field(frame: &VideoFrame, field: &mut Field, p: &EncoderParams) {
     let cg = p.chroma_gain;
     let burst_half = lv.burst * std::f32::consts::FRAC_1_SQRT_2;
 
-    field.data.par_chunks_mut(s.line_samples).enumerate().for_each(|(l, out)| {
+    let ls = s.line_samples;
+    let mut no_chroma = Vec::new();
+    let chroma_out: Vec<Option<&mut [f32]>> = if split {
+        field.chroma.chunks_mut(ls).map(Some).collect()
+    } else {
+        no_chroma.resize_with(field.data.len() / ls, || None);
+        no_chroma
+    };
+    field.data.par_chunks_mut(ls).zip(chroma_out).enumerate().for_each(|(l, (out, mut c_out))| {
         let row = 2 * l + parity as usize;
         let src = &frame.data[row * aw * 3..(row + 1) * aw * 3];
         let base = s.line_phase_base(l, frame_no, parity);
@@ -72,16 +91,22 @@ pub fn encode_field(frame: &VideoFrame, field: &mut Field, p: &EncoderParams) {
             let q = q_lp.process(q);
 
             let k = (n + base) & 3;
-            let mut s = y + cg * (q * sin_iq[k] + i * cos_iq[k]);
+            let mut c = cg * (q * sin_iq[k] + i * cos_iq[k]);
             if burst.contains(&n) {
                 if pal {
                     // -U 軸から V 側へ ±45°
-                    s += burst_half * (sv * COS4[k] - SIN4[k]);
+                    c += burst_half * (sv * COS4[k] - SIN4[k]);
                 } else {
-                    s -= lv.burst * SIN4[k];
+                    c -= lv.burst * SIN4[k];
                 }
             }
-            *o = s;
+            match c_out.as_deref_mut() {
+                Some(co) => {
+                    *o = y;
+                    co[n] = c;
+                }
+                None => *o = y + c,
+            }
         }
     });
 }

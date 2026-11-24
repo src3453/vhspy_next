@@ -2,7 +2,7 @@
 //!
 //! 信号の流れ:
 //! ```text
-//! RgbFrame / LinearFrame(HDR) ─ camera (撮像管) ─ VideoFrame(f32) ─ encoder ─▶ Field(コンポジット, 4fsc) ─ (rf) ─ tape ─▶ (rf) ─▶ Field ─ decoder ─▶ RgbaFrame
+//! RgbFrame / LinearFrame(HDR) ─ camera (撮像管) ─ VideoFrame(f32) ─ encoder ─▶ Field(コンポジット, 4fsc) ─ (rf) ─ tape ─ (tbc) ─▶ (rf) ─▶ Field ─ decoder ─▶ RgbaFrame
 //!          ─ capture (YCbCr・色差間引き・DCT 圧縮) ─▶ RgbaFrame
 //! ```
 //! 音声は `audio` (テープ音声トラック → 再生機 → キャプチャ ADC) で別に処理する。
@@ -12,6 +12,7 @@ pub mod audio;
 pub mod camera;
 pub mod capture;
 pub mod decoder;
+pub mod dv;
 pub mod encoder;
 pub mod filter;
 pub mod frame;
@@ -22,6 +23,7 @@ pub mod pipeline;
 pub mod rf;
 pub mod rng;
 pub mod tape;
+pub mod tbc;
 pub mod timing;
 
 pub use frame::{LinearFrame, RgbFrame, RgbaFrame, VideoFrame};
@@ -67,6 +69,37 @@ mod tests {
     }
 
     /// RF の配置 (テープの前 / 後 / 両方) で出力が変わり、両方では 2 回とも効くこと
+    #[test]
+    fn digital_paths_preserve_color() {
+        // コンポジットなし (カメラ・OSD だけ) と DV (FireWire / S 映像のアナログ出力) で色が保たれること
+        for standard in [TvStandard::Ntsc, TvStandard::Pal] {
+            let (w, h) = standard.spec().image_size();
+            let mut input = RgbFrame::new(w, h);
+            for px in input.data.chunks_exact_mut(3) {
+                px.copy_from_slice(&[200, 120, 40]);
+            }
+            for (dv, composite, tol) in [(false, false, 1), (true, false, 3), (true, true, 12)] {
+                let mut p = Params { standard, ..Params::default() };
+                p.encoder.enabled = composite;
+                p.tape.enabled = dv;
+                p.tape.format = params::TapeFormat::Dv;
+                p.output.connection = params::Connection::SVideo;
+                p.decoder.yc_separation = params::YcSeparation::Comb;
+                let mut pl = Pipeline::new(p);
+                for _ in 0..4 {
+                    pl.process_field(&input);
+                }
+                assert_eq!(pl.dv_stats().is_some(), dv);
+                let out = pl.output();
+                let i = (h / 2 * w + w / 2) * 4;
+                for (c, want) in [200, 120, 40].iter().enumerate() {
+                    let d = (out.data[i + c] as i32 - want).abs();
+                    assert!(d <= tol, "{standard:?} dv={dv} composite={composite}: ch{c} {} vs {want}", out.data[i + c]);
+                }
+            }
+        }
+    }
+
     #[test]
     fn rf_placement_changes_output() {
         use params::RfPlacement::*;
@@ -196,6 +229,110 @@ mod tests {
         let (ha, _) = hue_of(pixel(&pl, h / 2, w / 2));
         let (hb, _) = hue_of(pixel(&pl, h / 2 + 2, w / 2));
         assert!((ha - h0).abs() > 20.0 && (ha - hb).abs() < 4.0, "NTSC: {ha} {hb} vs {h0}");
+    }
+
+    /// 3 次元 Y/C 分離: 静止画では色が保たれ、ラインごとに変わる細かい輝度の模様もクロスカラーにならない。
+    /// 急に絵が変わっても (動き検出でラインくし形に切り替わり) 前の色が残らない
+    #[test]
+    fn comb3d_separation() {
+        for pal in [false, true] {
+            let mut p = if pal { pal_clean() } else { Params::default() };
+            p.tape.enabled = false;
+            p.decoder.yc_separation = params::YcSeparation::Comb3d;
+            for rgb in COLORS {
+                let pl = run_flat(&p, rgb, 10);
+                let (w, h) = pl.output_size();
+                for row in [h / 2, h / 2 + 1] {
+                    let got = pixel(&pl, row, w / 2);
+                    for c in 0..3 {
+                        assert!((got[c] - rgb[c] as i32).abs() <= 10, "pal={pal} input {rgb:?} got {got:?}");
+                    }
+                }
+            }
+
+            // ラインごとに位相の変わる副搬送波付近の灰色の模様 (くし形でも取り切れない)
+            let s = p.standard.spec();
+            let (w, h) = s.image_size();
+            let period = s.fs / (s.fsc * 0.9);
+            let mut tex = RgbFrame::new(w, h);
+            for (i, px) in tex.data.chunks_exact_mut(3).enumerate() {
+                let (x, y) = ((i % w) as f32, (i / w) as f32);
+                let v = (128.0 + 60.0 * (std::f32::consts::TAU * x / period + 1.3 * y * y).sin()) as u8;
+                px.copy_from_slice(&[v, v, v]);
+            }
+            let false_color = |sep: params::YcSeparation| {
+                let mut q = p.clone();
+                q.decoder.yc_separation = sep;
+                let mut pl = Pipeline::new(q);
+                for _ in 0..10 {
+                    pl.process_field(&tex);
+                }
+                let mut sum = 0.0;
+                let mut n = 0.0;
+                for row in h / 3..h * 2 / 3 {
+                    for col in w / 3..w * 2 / 3 {
+                        let c = pixel(&pl, row, col);
+                        sum += ((c[0] - c[1]).abs() + (c[1] - c[2]).abs() + (c[2] - c[0]).abs()) as f64;
+                        n += 1.0;
+                    }
+                }
+                sum / n
+            };
+            let (c3, c2) = (false_color(params::YcSeparation::Comb3d), false_color(params::YcSeparation::Comb));
+            assert!(c3 < c2 * 0.3, "pal={pal}: cross color 3d {c3} vs line comb {c2}");
+
+            // 赤 → 青へ切り替えた直後のフィールドも青
+            let mut pl = Pipeline::new(p.clone());
+            let (red, blue) = (flat_in(s, [200, 40, 40]), flat_in(s, [40, 40, 200]));
+            for _ in 0..8 {
+                pl.process_field(&red);
+            }
+            pl.process_field(&blue);
+            let row = h / 2 + (pl.field_index() as usize - 1) % 2;
+            let got = pixel(&pl, row, w / 2);
+            assert!(got[2] > 150 && got[0] < 90, "pal={pal}: after cut got {got:?}");
+
+            // 動き適応なし: 静止画は正しく出る
+            let mut q = p.clone();
+            q.decoder.motion_adaptive = false;
+            for rgb in COLORS {
+                let pl = run_flat(&q, rgb, 10);
+                let got = pixel(&pl, h / 2 + 1, w / 2);
+                for c in 0..3 {
+                    assert!((got[c] - rgb[c] as i32).abs() <= 10, "pal={pal} no motion adaptation: {rgb:?} got {got:?}");
+                }
+            }
+            // 切り替え直後は前の絵とのフレームくし形になり、色が崩れる (ただし黒く潰れはしない)
+            let mut pl = Pipeline::new(q);
+            for _ in 0..8 {
+                pl.process_field(&red);
+            }
+            pl.process_field(&blue);
+            let bad = pixel(&pl, row, w / 2);
+            let dist = (0..3).map(|c| (bad[c] - [40, 40, 200][c]).abs()).max().unwrap();
+            assert!(dist > 30, "pal={pal}: no motion adaptation, after cut got {bad:?}");
+            assert!(bad.iter().sum::<i32>() > 120, "pal={pal}: no motion adaptation, after cut got {bad:?}");
+
+            // バッファのビット数が少ないと静止画でも量子化雑音が乗る (ゆるやかな傾斜で見る)
+            let mut ramp = RgbFrame::new(w, h);
+            for (i, px) in ramp.data.chunks_exact_mut(3).enumerate() {
+                let v = (60.0 + 120.0 * (i % w) as f32 / w as f32) as u8;
+                px.copy_from_slice(&[v, v / 2 + 40, 200 - v / 2]);
+            }
+            let roughness = |bits: u32| {
+                let mut q = p.clone();
+                q.decoder.frame_buffer_bits = bits;
+                let mut pl = Pipeline::new(q);
+                for _ in 0..10 {
+                    pl.process_field(&ramp);
+                }
+                let row = h / 2 + (pl.field_index() as usize - 1) % 2;
+                let px: Vec<[i32; 3]> = (w / 4..w * 3 / 4).map(|x| pixel(&pl, row, x)).collect();
+                px.windows(2).map(|a| (0..3).map(|c| (a[1][c] - a[0][c]).pow(2)).sum::<i32>() as f64).sum::<f64>()
+            };
+            let (r4, r10) = (roughness(4), roughness(10));
+            assert!(r4 > r10 * 2.0, "pal={pal}: 4-bit {r4} vs 10-bit {r10}");
+        }
     }
 
     /// 色副搬送波 PLL をゆっくりにしても、位相の乱れがなければライン当たりの位相の進みを正しく予測して色が保たれる

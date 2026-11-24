@@ -1,7 +1,8 @@
 //! コンポジット (NTSC / PAL) → RGB の受像機モデル。
 //!
 //! - 水平 AFC: 同期の後縁を検出し、時定数付きで追従する (遅い時間軸変動は吸収、速い変動は残る)
-//! - Y/C 分離: ノッチ (ドットクロール/クロスカラーが出る) またはくし形 (NTSC 1H / PAL 2H)
+//! - Y/C 分離: ノッチ (ドットクロール/クロスカラーが出る)、くし形 (NTSC 1H / PAL 2H)、
+//!   または 3 次元 (画面バッファとのフレームくし形。動く部分はラインくし形に切り替える動き適応型)
 //! - 色副搬送波 PLL: ラインごとのバースト位相に追従係数付きで同期する
 //! - NTSC は I/Q、PAL は U/V を同期検波。ACC とカラーキラー付き
 //! - PAL: スウィンギングバーストから PAL スイッチの向きを決め (アイデント)、
@@ -31,7 +32,13 @@ pub struct Decoder {
     bursts: Vec<Burst>,
     /// ラインごとの検波条件
     lines: Vec<LineRef>,
+    /// 3 次元 Y/C 分離の画面バッファ: 過去のフィールドの AFC 補正後のコンポジット信号
+    /// (新しい順、フィールド番号付き。最大 [`FIELD_STORE`] フィールド)
+    history: Vec<(u64, Vec<f32>)>,
 }
+
+/// 画面バッファに持つフィールド数 (PAL の 2 フレーム = 4 フィールド前まで)
+const FIELD_STORE: usize = 4;
 
 #[derive(Clone, Copy, Default)]
 struct Burst {
@@ -73,6 +80,7 @@ impl Decoder {
             det_b: vec![0.0; na],
             bursts: vec![Burst::default(); s.field_lines],
             lines: vec![LineRef::default(); s.field_lines],
+            history: Vec::new(),
         }
     }
 }
@@ -167,7 +175,21 @@ impl Decoder {
         let c_bp = Cascade::new(&[Biquad::bandpass_at(s.fsc, 1.5, s.fs)]);
         // くし形の相手: 副搬送波が 180° ずれたライン (NTSC は 1H、PAL は V の符号も揃う 2H 前)
         let comb_lag = if pal { 2 } else { 1 };
+        let use_3d = p.yc_separation == YcSeparation::Comb3d && !separate;
         let use_comb = p.yc_separation == YcSeparation::Comb;
+        // フレームくし形の相手: 副搬送波が 180° ずれた同じ位置のライン
+        // (NTSC は 1 フレーム = 2 フィールド前、PAL は 2 フレーム = 4 フィールド前で V の符号も揃う)。
+        // 早送りやシークでフィールドが飛んだときは使わない (ラインくし形のまま)
+        let frame_lag: u64 = if pal { 4 } else { 2 };
+        let frame_ref = if use_3d {
+            field.index.checked_sub(frame_lag).and_then(|want| {
+                self.history.iter().find(|(i, _)| *i == want).map(|(_, v)| v.as_slice())
+            })
+        } else {
+            None
+        };
+        // 動き適応なし (None) なら常にフレームくし形
+        let motion_thr = p.motion_adaptive.then(|| p.motion_threshold_ire.max(1e-3));
         let (aligned, aligned_c) = (&self.aligned, &self.aligned_c);
         let burst_gate = s.burst_start..s.burst_end + 16;
         self.luma
@@ -185,7 +207,11 @@ impl Decoder {
                         y[n] = x[n];
                         c[n] = bp.process(xc[n]);
                     }
-                } else if use_comb && l >= comb_lag {
+                } else if let Some(fr) = frame_ref {
+                    let xf = &fr[l * ls..(l + 1) * ls];
+                    let prev = (l >= comb_lag).then(|| &aligned[(l - comb_lag) * ls..(l - comb_lag + 1) * ls]);
+                    separate_3d(x, xf, prev, y, c, c_bp, motion_thr);
+                } else if (use_comb || use_3d) && l >= comb_lag {
                     let prev = &aligned[(l - comb_lag) * ls..(l - comb_lag + 1) * ls];
                     let mut bp = c_bp;
                     for n in 0..ls {
@@ -217,6 +243,17 @@ impl Decoder {
                 }
                 *burst = Burst { zr, zi, amp };
             });
+
+        // 画面バッファを更新する (3 次元 Y/C 分離のときだけ持つ)
+        if use_3d {
+            let mut buf = if self.history.len() >= FIELD_STORE { self.history.pop().unwrap().1 } else { Vec::new() };
+            buf.clear();
+            buf.extend_from_slice(&self.aligned);
+            quantize_buffer(&mut buf, p.frame_buffer_bits, &lv);
+            self.history.insert(0, (field.index, buf));
+        } else {
+            self.history.clear();
+        }
 
         // --- 色副搬送波 PLL と PAL アイデント (逐次) ---
         self.lock_subcarrier(s, p);
@@ -354,6 +391,81 @@ impl Decoder {
             }
             self.lines[l] = LineRef { phase, sv, gain };
         }
+    }
+}
+
+/// 画面バッファへ書き込むときの量子化 (フレームメモリの A/D 変換)。
+/// 範囲は同期先端から、白 + 色の振幅のぶんのピーク (NTSC なら約 -40〜150 IRE) まで。範囲外は張り付く
+fn quantize_buffer(buf: &mut [f32], bits: u32, lv: &Levels) {
+    if bits == 0 {
+        return;
+    }
+    let bits = bits.min(16);
+    let lo = lv.sync;
+    let hi = lv.white + 0.35 * (lv.white - lv.sync);
+    let steps = ((1u32 << bits) - 1) as f32;
+    let (scale, inv) = (steps / (hi - lo), (hi - lo) / steps);
+    buf.par_iter_mut().for_each(|v| {
+        let q = ((*v - lo) * scale).round().clamp(0.0, steps);
+        *v = lo + q * inv;
+    });
+}
+
+/// 動き適応型 3 次元 Y/C 分離 (1 ライン)。
+///
+/// - フレームくし形: 静止部分では `x - xf` が色だけの 2 倍になるので C = (x - xf) / 2、Y = (x + xf) / 2。
+///   帯域を削らないので、細かい輝度の模様もクロスカラーにならず、色の縦のにじみもない
+/// - 動き検出: フレーム間差から副搬送波 (fsc とその付近) を落とした低域成分の大きさ。
+///   静止部分では色の差だけになり 0 に近く、動く部分では輝度の差が残る
+/// - 動きの量に応じて、ラインくし形 (`prev` がなければバンドパス) の C と混ぜる
+fn separate_3d(
+    x: &[f32],
+    xf: &[f32],
+    prev: Option<&[f32]>,
+    y: &mut [f32],
+    c: &mut [f32],
+    c_bp: Cascade,
+    thr: Option<f32>,
+) {
+    let n_len = x.len();
+    let Some(thr) = thr else {
+        // 動き適応なし: 純粋なフレームくし形
+        for n in 0..n_len {
+            c[n] = 0.5 * (x[n] - xf[n]);
+            y[n] = x[n] - c[n];
+        }
+        return;
+    };
+    // フレーム間差を 4 サンプル (副搬送波 1 周期) の箱形フィルタ 2 段 (三角窓 7 タップ、fsc と 2fsc に零点) で
+    // 低域だけにし、その絶対値を y に一時的に置く
+    const TRI: [f32; 7] = [1.0, 2.0, 3.0, 4.0, 3.0, 2.0, 1.0];
+    for n in 0..n_len {
+        let mut acc = 0.0;
+        for (k, w) in TRI.iter().enumerate() {
+            let i = (n + k).saturating_sub(3).min(n_len - 1);
+            acc += w * (x[i] - xf[i]);
+        }
+        y[n] = (acc / 16.0).abs();
+    }
+    // 動きの量を横に広げて (±6 サンプルの最大値) c に置く。境目でぱらつかないように
+    const R: usize = 6;
+    for n in 0..n_len {
+        let lo = n.saturating_sub(R);
+        let hi = (n + R + 1).min(n_len);
+        c[n] = y[lo..hi].iter().cloned().fold(0.0, f32::max);
+    }
+    let mut bp = c_bp;
+    for n in 0..n_len {
+        // 0: 静止 (フレームくし形)、1: 動き (ラインくし形)
+        let k = ((c[n] - thr) / thr).clamp(0.0, 1.0);
+        let c2 = match prev {
+            Some(pv) => bp.process(0.5 * (x[n] - pv[n])),
+            None => bp.process(x[n]),
+        };
+        let c3 = 0.5 * (x[n] - xf[n]);
+        let cc = c3 + k * (c2 - c3);
+        c[n] = cc;
+        y[n] = x[n] - cc;
     }
 }
 

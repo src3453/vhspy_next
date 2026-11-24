@@ -14,7 +14,11 @@ pub struct Params {
     pub camera: CameraParams,
     pub encoder: EncoderParams,
     pub tape: TapeParams,
+    /// DV の記録・再生 (tape.format が DV / Digital8 のとき)
+    pub dv: DvParams,
     pub transport: TransportParams,
+    /// 再生機のタイムベースコレクタ (テープの後、受像機の前)
+    pub tbc: TbcParams,
     /// VCR → TV の RF (アンテナ) 接続
     pub rf: RfParams,
     pub decoder: DecoderParams,
@@ -24,6 +28,8 @@ pub struct Params {
     pub audio: AudioParams,
     pub output: OutputParams,
     pub osd: OsdParams,
+    /// ブラウン管の表示 (RetroArch slang シェーダー)。vhs-core 自体は使わず、GUI 側の GPU 処理で適用する
+    pub crt: CrtParams,
     /// 乱数シード (同じシードなら同じ劣化パターン)
     pub seed: u64,
 }
@@ -152,6 +158,10 @@ impl Default for CameraParams {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct EncoderParams {
+    /// コンポジット信号 (NTSC / PAL) に変換して、受像機で復調する。
+    /// オフにすると映像はデジタルのまま (カメラ・OSD・DV・キャプチャだけを通す)。
+    /// アナログのテープ・RF・TBC・受像機は飛ばす。DV なら FireWire で取り込んだのと同じ経路になる
+    pub enabled: bool,
     /// 輝度帯域 [MHz]
     pub luma_bw_mhz: f32,
     /// I 信号帯域 [MHz]
@@ -166,7 +176,7 @@ pub struct EncoderParams {
 
 impl Default for EncoderParams {
     fn default() -> Self {
-        Self { luma_bw_mhz: 4.2, i_bw_mhz: 1.3, q_bw_mhz: 0.6, uv_bw_mhz: 1.3, chroma_gain: 1.0 }
+        Self { enabled: true, luma_bw_mhz: 4.2, i_bw_mhz: 1.3, q_bw_mhz: 0.6, uv_bw_mhz: 1.3, chroma_gain: 1.0 }
     }
 }
 
@@ -192,8 +202,72 @@ pub enum TapeFormat {
     SuperBeta,
     Video8,
     Hi8,
+    /// DV (MiniDV)。デジタル記録なので、アナログのテープ処理の代わりに `dv` の設定で処理する
+    Dv,
+    /// Digital8 (Hi8 のテープに DV 方式で記録)
+    Digital8,
     /// 数値を個別に調整したもの
     Custom,
+}
+
+impl TapeFormat {
+    /// デジタル記録 (DV 方式) のフォーマットか
+    pub fn is_digital(self) -> bool {
+        matches!(self, TapeFormat::Dv | TapeFormat::Digital8)
+    }
+}
+
+/// DV の記録・再生。符号化 (25 Mbps 固定長) とテープのエラーの出方を決める
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DvParams {
+    /// 動きのあるブロックを 2-4-8 DCT (フィールドの和と差) で符号化する
+    pub dct_248: bool,
+    /// 符号量の倍率 (1 = 規格どおりの 25 Mbps)。下げると複雑な絵柄の周りのブロックノイズが目立つ
+    pub bitrate_scale: f32,
+    /// マクロブロック (DIF ブロック) ごとの読み取りエラーの確率 [1/フレーム]
+    pub error_rate: f32,
+    /// ドロップアウト (テープの傷などで読めない区間。検出して修整される) の頻度 [回/秒]
+    pub burst_rate: f32,
+    /// ドロップアウト 1 回の平均の長さ [セグメント]
+    pub burst_length: f32,
+    /// バーストノイズ (データ化け) の頻度 [回/秒]
+    pub noise_rate: f32,
+    /// バーストノイズ 1 回の平均の長さ [マクロブロック]。読み取り順に続き、トラックをまたぐこともある
+    pub noise_length: f32,
+    /// バーストノイズの区間内のバイト誤り率 (0..1)
+    pub noise_density: f32,
+    /// 誤り訂正 (内符号)。マクロブロックごとに数バイトまでの誤りは直し、それ以上は検出して修整に回す。
+    /// オフだと誤りはすべて化けたまま復号される
+    pub ecc: bool,
+    /// 訂正しきれない誤りを検出し損ねる確率 (化けたまま復号される)
+    pub ecc_miss: f32,
+    /// ヘッドの目詰まりの頻度 [回/分]。片方なら 1 本おきのトラック、両方なら全体が読めない
+    pub head_clog_rate: f32,
+    /// 目詰まり 1 回の平均の長さ [フレーム]
+    pub head_clog_frames: f32,
+    /// エラー修整 (読めないブロックを前のフレームで埋める)。オフだと壊れたブロックがそのまま出る
+    pub concealment: bool,
+}
+
+impl Default for DvParams {
+    fn default() -> Self {
+        Self {
+            dct_248: true,
+            bitrate_scale: 1.0,
+            error_rate: 0.0,
+            burst_rate: 0.0,
+            burst_length: 4.0,
+            noise_rate: 0.0,
+            noise_length: 20.0,
+            noise_density: 0.05,
+            ecc: true,
+            ecc_miss: 0.05,
+            head_clog_rate: 0.0,
+            head_clog_frames: 8.0,
+            concealment: true,
+        }
+    }
 }
 
 /// 輝度の FM 記録のモデル
@@ -263,6 +337,9 @@ pub struct TapeParams {
     pub magnetic_model: MagneticModel,
     /// 磁気飽和の起点となるクロマ振幅 [IRE]
     pub saturation_ire: f32,
+    /// FM 輝度の RF の飽和レベル (記録搬送波の振幅 = 1 に対する比)。
+    /// 搬送波と低域変換クロマの相互変調 (輝度のモアレ) と搬送波の歪みになる (磁性体モデルが線形なら無効)
+    pub rf_saturation: f32,
 
     // --- ドロップアウト ---
     /// 1 ラインあたりのドロップアウト発生確率
@@ -307,6 +384,7 @@ impl Default for TapeParams {
             chroma_delay_samples: 3,
             magnetic_model: MagneticModel::Tanh,
             saturation_ire: 50.0,
+            rf_saturation: 1.5,
             dropout_rate: 0.002,
             dropout_length: 40.0,
             dropout_compensation: true,
@@ -363,6 +441,45 @@ impl Default for TransportParams {
     }
 }
 
+/// タイムベースコレクタ (TBC)。再生信号をデジタル化し、ラインごとに水平同期を検出して
+/// 基準のクロックで読み出し直すことで、ジッタ・スキュー・ヘッド切替の曲がりを取り除く。
+/// 同期を検出できない・誤検出したラインは補正を誤り、横ずれ (TBC エラー) として残る
+/// (同期を作り直すので受像機の AFC ではもう直せない)
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct TbcParams {
+    pub enabled: bool,
+    /// 補正できる範囲 (ラインメモリの余裕) [±サンプル]。超えた分はそのまま残る
+    pub window_samples: f32,
+    /// 同期を探すゲートの幅 [±サンプル]。前のラインの同期位置からこれ以上離れた同期は無視する
+    pub gate_samples: f32,
+    /// 同期を見失ってからゲートを開いて再捕捉するまでのライン数 (それまでは前の補正量を保持)
+    pub reacquire_lines: u32,
+    /// 同期の誤検出 (ノイズで誤トリガ) の確率 [1/ライン]
+    pub error_rate: f32,
+    /// 補正後に残る書き込みクロックのジッタ (rms) [サンプル]
+    pub residual_samples: f32,
+    /// A/D 変換の量子化ビット数 (0 で量子化しない)
+    pub bits: u32,
+    /// 同期・ブランキングを作り直す (オフだと元の同期をそのまま通す)
+    pub regenerate_sync: bool,
+}
+
+impl Default for TbcParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            window_samples: 30.0,
+            gate_samples: 8.0,
+            reacquire_lines: 3,
+            error_rate: 0.0,
+            residual_samples: 0.03,
+            bits: 8,
+            regenerate_sync: true,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum YcSeparation {
@@ -371,6 +488,11 @@ pub enum YcSeparation {
     Notch,
     /// ラインくし形フィルタ (NTSC は 1H、PAL は 2H)
     Comb,
+    /// 3 次元 (フレームくし形) Y/C 分離。画面バッファに持った前のフレーム
+    /// (副搬送波が 180° ずれた NTSC 1 フレーム / PAL 2 フレーム前) と比べて分離する。
+    /// 動きのある部分はラインくし形に切り替える (動き適応)
+    #[serde(rename = "comb3d")]
+    Comb3d,
 }
 
 /// 受像機 (NTSC / PAL デコーダ)
@@ -378,6 +500,15 @@ pub enum YcSeparation {
 #[serde(default)]
 pub struct DecoderParams {
     pub yc_separation: YcSeparation,
+    /// 3 次元 Y/C 分離の動き検出のしきい値 [IRE]。フレーム間差 (色副搬送波を除いたもの) がこれを超えると
+    /// ラインくし形へ移り始め、2 倍で完全に切り替わる。大きいほど動きに鈍く、動く部分にクロスカラーの残像が出る
+    pub motion_threshold_ire: f32,
+    /// 3 次元 Y/C 分離の動き適応 (動き検出でラインくし形へ切り替える)。切ると常にフレームくし形になり、
+    /// 動く部分の輪郭に前のフレームの絵が色の縞・二重像として残る
+    pub motion_adaptive: bool,
+    /// 3 次元 Y/C 分離の画面バッファ (フレームメモリ) のビット数。同期先端〜ピークを量子化する。
+    /// 少ないと静止部分でもフレーム間差に量子化誤差が出て、色と輝度に細かい雑音・等高線が乗る。0 で量子化しない
+    pub frame_buffer_bits: u32,
     /// 復調後の色差帯域 [MHz]
     pub chroma_bw_mhz: f32,
     /// 自動色レベル調整 (バースト振幅で正規化)
@@ -403,6 +534,9 @@ impl Default for DecoderParams {
     fn default() -> Self {
         Self {
             yc_separation: YcSeparation::Notch,
+            motion_threshold_ire: 3.0,
+            motion_adaptive: true,
+            frame_buffer_bits: 8,
             chroma_bw_mhz: 1.3,
             acc: true,
             color_killer: true,
@@ -444,6 +578,26 @@ pub struct OutputParams {
     pub deinterlace: Deinterlace,
     /// 再生機 → 受像機の接続
     pub connection: Connection,
+}
+
+/// ブラウン管シミュレーション。RetroArch の slang シェーダープリセット (.slangp) を
+/// 最終出力に掛ける (crt-royale, crt-guest-advanced など)。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CrtParams {
+    pub enabled: bool,
+    /// プリセット (.slangp) のパス
+    pub preset: String,
+    /// 出力の高さ [px]。幅は 4:3 で決める (正方画素)
+    pub height: u32,
+    /// シェーダーパラメータの上書き (プリセットの既定値から変えたものだけ)
+    pub params: std::collections::BTreeMap<String, f32>,
+}
+
+impl Default for CrtParams {
+    fn default() -> Self {
+        Self { enabled: false, preset: String::new(), height: 1080, params: Default::default() }
+    }
 }
 
 /// OSD の合成先

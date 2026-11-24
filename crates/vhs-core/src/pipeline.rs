@@ -3,13 +3,16 @@
 use crate::camera::{CameraInput, CameraSim};
 use crate::capture::{CaptureSim, CodecStats};
 use crate::decoder::Decoder;
-use crate::encoder::encode_field;
+use crate::dv::{DvSim, DvStats};
+use crate::encoder::{encode_field, encode_field_yc};
 use crate::frame::{Field, LinearFrame, RgbFrame, RgbaFrame, VideoFrame};
 use crate::osd::Osd;
-use crate::params::{Connection, OsdMode, Params};
+use crate::params::{Connection, Deinterlace, OsdMode, Params};
 use crate::rf::RfSim;
 use crate::tape::TapeSim;
+use crate::tbc::Tbc;
 use crate::timing::Standard;
+use rayon::prelude::*;
 use std::time::{Duration, Instant};
 
 /// 放送受信側の RF の乱数系列をデッキ→テレビ側と分けるための値
@@ -36,6 +39,9 @@ pub struct Pipeline {
     camera: CameraSim,
     field: Field,
     tape: TapeSim,
+    /// DV の記録・再生 (デジタルのフォーマットのとき、アナログのテープの代わり)
+    dv: DvSim,
+    tbc: Tbc,
     /// 放送受信 (テープの前) の RF
     rf_broadcast: RfSim,
     /// デッキ → テレビ (テープの後) の RF
@@ -45,6 +51,8 @@ pub struct Pipeline {
     osd: Osd,
     /// エンコーダに渡す映像信号の作業領域 (カメラなしの入力、OSD の焼き込み)
     video: VideoFrame,
+    /// コンポジットを通さないときにデッキの OSD を重ねる作業領域
+    deck: VideoFrame,
     output: RgbaFrame,
     field_index: u64,
     pub timings: StageTimings,
@@ -61,12 +69,15 @@ impl Pipeline {
             camera,
             field: Field::new(std),
             tape: TapeSim::new(std),
+            dv: DvSim::new(std),
+            tbc: Tbc::new(std),
             rf_broadcast: RfSim::default(),
             rf: RfSim::default(),
             decoder: Decoder::new(std),
             capture: CaptureSim::default(),
             osd: Osd::new(std),
             video: VideoFrame::new(w, h),
+            deck: VideoFrame::new(w, h),
             output: RgbaFrame::new(w, h),
             field_index: 0,
             timings: StageTimings::default(),
@@ -115,6 +126,11 @@ impl Pipeline {
     /// 直前のフレームの圧縮の状態 (キャプチャ有効時)
     pub fn codec_stats(&self) -> Option<CodecStats> {
         (self.params.capture.enabled && self.params.capture.codec).then(|| self.capture.codec_stats())
+    }
+
+    /// 直前のフレームの DV の符号化・エラーの状態 (DV のフォーマットのとき)
+    pub fn dv_stats(&self) -> Option<DvStats> {
+        (self.params.tape.enabled && self.params.tape.format.is_digital()).then_some(self.dv.stats)
     }
 
     pub fn field_index(&self) -> u64 {
@@ -176,32 +192,64 @@ impl Pipeline {
             Some(cam) if p.camera.enabled && !burn => cam,
             _ => &self.video,
         };
+        // DV: カメラの映像をデジタルのまま記録・再生する (アナログのテープ処理の代わり)
+        let digital = p.tape.enabled && p.tape.format.is_digital();
         let t0 = Instant::now();
-        encode_field(input, &mut self.field, &p.encoder);
-        let t1 = Instant::now();
-        // 放送受信: 受信時の劣化ごとテープに記録される (デッキ→テレビの RF とは独立した雑音)
-        if p.rf.enabled && p.rf.placement.before_tape() {
-            self.rf_broadcast.process(&mut self.field, &p.rf, p.seed ^ RF_BROADCAST_SEED);
-        }
-        let t1r = Instant::now();
-        // S 映像はテープの再生出力を受像機へ直接つなぐときだけ (テープなし・テープ後の RF 接続はコンポジット)
-        self.field.set_separate(
-            p.output.connection == Connection::SVideo
+        let input = if digital {
+            self.dv.process(input, self.field.parity, self.field.frame, &p.dv, p.seed)
+        } else {
+            input
+        };
+        let t_dv = Instant::now();
+        let (mut t1, mut t1r, mut t2, mut t3) = (t_dv, t_dv, t_dv, t_dv);
+        if p.encoder.enabled {
+            // S 映像はテープの再生出力を受像機へ直接つなぐときだけ (テープなし・テープ後の RF 接続はコンポジット)
+            let svideo = p.output.connection == Connection::SVideo
                 && p.tape.enabled
-                && !(p.rf.enabled && p.rf.placement.after_tape()),
-        );
-        if p.tape.enabled {
-            self.tape.process(&mut self.field, &p.tape, &p.transport, p.seed);
+                && !(p.rf.enabled && p.rf.placement.after_tape());
+            if digital {
+                // DV デッキはデジタルの映像から直接 Y/C (またはコンポジット) を作る
+                self.field.set_separate(svideo);
+                encode_field_yc(input, &mut self.field, &p.encoder);
+            } else {
+                encode_field(input, &mut self.field, &p.encoder);
+            }
+            t1 = Instant::now();
+            // 放送受信: 受信時の劣化ごとテープに記録される (デッキ→テレビの RF とは独立した雑音)。
+            // DV はカメラの映像を直接記録するので対象外
+            if p.rf.enabled && p.rf.placement.before_tape() && !digital {
+                self.rf_broadcast.process(&mut self.field, &p.rf, p.seed ^ RF_BROADCAST_SEED);
+            }
+            t1r = Instant::now();
+            // アナログのテープは再生時に Y/C を分けて出す
+            self.field.set_separate(svideo);
+            if p.tape.enabled && !digital {
+                self.tape.process(&mut self.field, &p.tape, &p.transport, p.seed);
+                // 再生機の TBC (デッキの OSD はその後で重ねる)
+                if p.tbc.enabled {
+                    self.tbc.process(&mut self.field, &p.tbc, p.seed);
+                }
+            }
+            if osd == Some(OsdMode::Composite) {
+                self.osd.insert_composite(&mut self.field, opacity);
+            }
+            t2 = Instant::now();
+            if p.rf.enabled && p.rf.placement.after_tape() {
+                self.rf.process(&mut self.field, &p.rf, p.seed);
+            }
+            t3 = Instant::now();
+            self.decoder.decode_field(&self.field, &p.decoder, p.output.deinterlace, &mut self.output);
+        } else {
+            // コンポジットを通さない: 映像をデジタルのまま出す (DV なら FireWire 取り込み)
+            let frame = if osd == Some(OsdMode::Composite) {
+                self.deck.data.copy_from_slice(&input.data);
+                self.osd.burn_into(&mut self.deck, opacity);
+                &self.deck
+            } else {
+                input
+            };
+            write_field(frame, self.field.parity, p.output.deinterlace, &mut self.output);
         }
-        if osd == Some(OsdMode::Composite) {
-            self.osd.insert_composite(&mut self.field, opacity);
-        }
-        let t2 = Instant::now();
-        if p.rf.enabled && p.rf.placement.after_tape() {
-            self.rf.process(&mut self.field, &p.rf, p.seed);
-        }
-        let t3 = Instant::now();
-        self.decoder.decode_field(&self.field, &p.decoder, p.output.deinterlace, &mut self.output);
         let t4 = Instant::now();
         if p.capture.enabled {
             self.capture.process(&self.output, &p.capture, p.seed, self.field_index, self.field.std.frame_rate());
@@ -209,7 +257,7 @@ impl Pipeline {
         let t5 = Instant::now();
 
         self.timings =
-            StageTimings { camera: t0 - tc, encode: t1 - t0, tape: t2 - t1r, rf: (t1r - t1) + (t3 - t2), decode: t4 - t3, capture: t5 - t4 };
+            StageTimings { camera: t0 - tc, encode: t1 - t_dv, tape: (t_dv - t0) + (t2 - t1r), rf: (t1r - t1) + (t3 - t2), decode: t4 - t3, capture: t5 - t4 };
         self.field_index += 1;
         self.output()
     }
@@ -218,4 +266,26 @@ impl Pipeline {
     pub fn composite(&self) -> &Field {
         &self.field
     }
+}
+
+/// 映像信号 (0..1) の今のフィールドのラインを出力画像に書く。受像機の `decode_field` と同じく、
+/// 織り込み (Weave) では反対のフィールドのラインを残し、Bob では今のフィールドのラインを 2 回使う
+fn write_field(src: &VideoFrame, parity: u8, deint: Deinterlace, out: &mut RgbaFrame) {
+    let (w, h) = (out.width, out.height);
+    debug_assert_eq!((src.width, src.height), (w, h));
+    let parity = parity as usize;
+    out.data.par_chunks_mut(w * 4).enumerate().for_each(|(row, o)| {
+        let sr = match deint {
+            Deinterlace::Weave if row % 2 != parity => return,
+            Deinterlace::Weave => row,
+            Deinterlace::Bob => (row / 2 * 2 + parity).min(h - 1),
+        };
+        let s = &src.data[sr * w * 3..(sr + 1) * w * 3];
+        for (o, s) in o.chunks_exact_mut(4).zip(s.chunks_exact(3)) {
+            for c in 0..3 {
+                o[c] = (s[c] * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+            }
+            o[3] = 255;
+        }
+    });
 }

@@ -286,13 +286,28 @@ pub struct Recorder {
     tx: Option<SyncSender<Vec<u8>>>,
     writer: Option<JoinHandle<()>>,
     pub path: PathBuf,
+    /// 入力フレームの (幅, 高さ)
+    pub size: (u32, u32),
 }
 
 impl Recorder {
     /// `audio` を指定するとその音声トラックを多重化する。
-    /// 入力はテレビ方式 `tv` の画像サイズ・フィールド周波数の RGBA
-    pub fn start(path: &Path, audio: Option<AudioTrack<'_>>, tv: &Standard) -> Result<Self, String> {
-        let (ow, oh) = tv.image_size();
+    /// 入力はテレビ方式 `tv` のフィールド周波数の RGBA。
+    /// `square` が None なら方式の画像サイズ (非正方画素) で、4:3 に引き伸ばして書き出す。
+    /// Some((幅, 高さ)) なら正方画素の画像 (CRT シェーダーの出力) としてそのまま書き出す
+    pub fn start(
+        path: &Path,
+        audio: Option<AudioTrack<'_>>,
+        tv: &Standard,
+        square: Option<(u32, u32)>,
+    ) -> Result<Self, String> {
+        let (ow, oh) = square.map_or_else(
+            || {
+                let (w, h) = tv.image_size();
+                (w as u32, h as u32)
+            },
+            |s| s,
+        );
         let mut cmd = command(&ffmpeg_path());
         cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
         cmd.args(["-f", "rawvideo", "-pix_fmt", "rgba", "-s", &format!("{ow}x{oh}")]);
@@ -305,9 +320,11 @@ impl Recorder {
                 cmd.args(["-ac", "1"]);
             }
         }
-        // 4:3 の正方画素 (NTSC なら 640x480) にして書き出す
-        let dw = (oh * 4 / 3 + 1) & !1;
-        cmd.args(["-vf", &format!("scale={dw}:{oh}:flags=bicubic,setsar=1")]);
+        if square.is_none() {
+            // 4:3 の正方画素 (NTSC なら 640x480) にして書き出す
+            let dw = (oh * 4 / 3 + 1) & !1;
+            cmd.args(["-vf", &format!("scale={dw}:{oh}:flags=bicubic,setsar=1")]);
+        }
         cmd.args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p"]);
         cmd.arg(path);
         cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
@@ -330,7 +347,7 @@ impl Recorder {
                 }
             }
         });
-        Ok(Self { child, tx: Some(tx), writer: Some(writer), path: path.to_path_buf() })
+        Ok(Self { child, tx: Some(tx), writer: Some(writer), path: path.to_path_buf(), size: (ow, oh) })
     }
 
     pub fn push(&self, rgba: &[u8]) -> bool {
@@ -378,7 +395,7 @@ mod tests {
         let has = process_audio(&input, &wav, latency, &AtomicBool::new(false), |b| proc.process(b)).unwrap();
         assert!(has);
         let tv = params.standard.spec();
-        let rec = Recorder::start(&out, Some(AudioTrack { path: &wav, kbps: 64, mono: true }), tv).unwrap();
+        let rec = Recorder::start(&out, Some(AudioTrack { path: &wav, kbps: 64, mono: true }), tv, None).unwrap();
         let (ow, oh) = tv.image_size();
         let frame = vec![128u8; ow * oh * 4];
         for _ in 0..120 {

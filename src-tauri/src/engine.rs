@@ -1,9 +1,10 @@
 //! 処理スレッド。入力の取得 → パイプライン → プレビュー/録画への出力を回す。
 
+use crate::crt::{Crt, CrtInfo};
 use crate::ffmpeg::{AUDIO_RATE, AudioTrack, FrameStream, Recorder, StreamSpec, probe_duration, process_audio};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,6 +19,7 @@ fn field_period(tv: &Standard) -> Duration {
 }
 
 /// フロントエンドへ渡すフレーム。先頭 16 バイトがヘッダ (id: u64, w: u32, h: u32)、以降 RGBA。
+/// CRT シェーダーを掛けたときは、その後ろに元の画像 (w: u32, h: u32, RGBA) が続く (スコープ用)。
 pub struct FrameSlot {
     pub id: u64,
     pub bytes: Vec<u8>,
@@ -33,6 +35,9 @@ pub struct Stats {
     pub rf_ms: f32,
     pub decode_ms: f32,
     pub capture_ms: f32,
+    pub crt_ms: f32,
+    /// CRT シェーダーの状態 (`get_crt_info`) が変わるたびに増える
+    pub crt_version: u64,
     /// キャプチャ圧縮の量子化スケールと直前フレームの符号量 [kbit]
     pub codec_q: Option<f32>,
     pub codec_kbit: Option<f32>,
@@ -54,6 +59,11 @@ pub struct Shared {
     pub frame: Mutex<FrameSlot>,
     pub stats: Mutex<Stats>,
     export_cancel: Mutex<Option<Arc<AtomicBool>>>,
+    pub crt_info: Mutex<CrtInfo>,
+    /// プレビュー画面の高さ [物理 px] (0 なら未設定)。CRT シェーダーはこの大きさで描くとマスクがきれいに出る
+    pub viewport_height: AtomicU32,
+    /// CRT シェーダーを読み直す
+    pub crt_reload: AtomicBool,
 }
 
 #[derive(Clone, Debug)]
@@ -114,6 +124,9 @@ impl Engine {
             frame: Mutex::new(FrameSlot { id: 0, bytes: Vec::new() }),
             stats: Mutex::new(Stats::default()),
             export_cancel: Mutex::new(None),
+            crt_info: Mutex::new(CrtInfo::default()),
+            viewport_height: AtomicU32::new(0),
+            crt_reload: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
         let sh = shared.clone();
@@ -208,7 +221,10 @@ fn export(app: &AppHandle, input: &Path, output: &Path, params: Params, cancel: 
 
     let stream =
         FrameStream::open(&StreamSpec::File { path: input.to_path_buf(), looped: false, realtime: false }, false, tv)?;
-    let rec = Recorder::start(output, audio, tv)?;
+    let mut crt = Crt::new(false);
+    let square = if crt.prepare(&params.crt)? { Some(Crt::output_size(params.crt.height)) } else { None };
+    let rec = Recorder::start(output, audio, tv, square)?;
+    let crt_params = params.crt.clone();
     let mut pipeline = Pipeline::new(params);
     let mut done = 0u64;
     for frame in stream.rx.iter() {
@@ -218,7 +234,14 @@ fn export(app: &AppHandle, input: &Path, output: &Path, params: Params, cancel: 
             return Err("キャンセルしました".into());
         }
         let out = pipeline.process_field(&frame);
-        if !rec.push(&out.data) {
+        let data = match crt.process(&crt_params, out, crt_params.height) {
+            Some((_, _, px)) => px,
+            None if square.is_some() => {
+                return Err(crt.info().error.clone().unwrap_or_else(|| "CRT シェーダーが使えません".into()));
+            }
+            None => &out.data,
+        };
+        if !rec.push(data) {
             return Err("エンコーダへの書き込みに失敗しました".into());
         }
         done += 1;
@@ -232,6 +255,9 @@ fn export(app: &AppHandle, input: &Path, output: &Path, params: Params, cancel: 
 
 fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
     let mut pipeline = Pipeline::new(shared.params.lock().unwrap().clone());
+    let mut crt_params = shared.params.lock().unwrap().crt.clone();
+    let mut crt = Crt::new(true);
+    let mut crt_seen = 0;
     let mut seen_version = 0;
     let mut tv = pipeline.standard();
     // 方式が変わったときに開き直すため、今の入力の指定を覚えておく
@@ -269,7 +295,9 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     if let Some(r) = recorder.take() {
                         let _ = r.finish();
                     }
-                    let r = Recorder::start(&path, None, tv).map(|r| {
+                    // CRT シェーダーが効いていればその出力 (正方画素) を録画する
+                    let square = crt.active(&crt_params).then(|| Crt::output_size(crt_params.height));
+                    let r = Recorder::start(&path, None, tv, square).map(|r| {
                         shared.stats.lock().unwrap().recording = Some(r.path.display().to_string());
                         recorder = Some(r);
                     });
@@ -287,7 +315,9 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
         let v = shared.params_version.load(Ordering::Acquire);
         if v != seen_version {
             seen_version = v;
-            pipeline.set_params(shared.params.lock().unwrap().clone());
+            let p = shared.params.lock().unwrap().clone();
+            crt_params = p.crt.clone();
+            pipeline.set_params(p);
             if !std::ptr::eq(pipeline.standard(), tv) {
                 // テレビ方式が変わった: 画像サイズ・フィールド周波数が変わるので入力を開き直す。
                 // 録画中のファイルは途中でサイズを変えられないので止める
@@ -345,23 +375,60 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
 
         // ---- 処理 ----
         let out = pipeline.process_field(input);
+
+        // ---- ブラウン管 ----
+        if shared.crt_reload.swap(false, Ordering::AcqRel) {
+            crt.reload();
+        }
+        // 録画中は録画の大きさ、そうでなければプレビュー画面の大きさで描く
+        let vh = shared.viewport_height.load(Ordering::Relaxed);
+        let height = match &recorder {
+            Some(r) => r.size.1,
+            None if vh > 0 => vh,
+            None => crt_params.height,
+        };
+        let t = Instant::now();
+        let shown = crt.process(&crt_params, out, height);
+        let crt_time = t.elapsed();
+        let (dw, dh, dpx) = shown.unwrap_or((out.width as u32, out.height as u32, &out.data));
+
         frame_id += 1;
         {
             let mut slot = shared.frame.lock().unwrap();
             slot.id = frame_id;
             slot.bytes.clear();
             slot.bytes.extend_from_slice(&frame_id.to_le_bytes());
-            slot.bytes.extend_from_slice(&(out.width as u32).to_le_bytes());
-            slot.bytes.extend_from_slice(&(out.height as u32).to_le_bytes());
-            slot.bytes.extend_from_slice(&out.data);
+            slot.bytes.extend_from_slice(&dw.to_le_bytes());
+            slot.bytes.extend_from_slice(&dh.to_le_bytes());
+            slot.bytes.extend_from_slice(dpx);
+            if shown.is_some() {
+                slot.bytes.extend_from_slice(&(out.width as u32).to_le_bytes());
+                slot.bytes.extend_from_slice(&(out.height as u32).to_le_bytes());
+                slot.bytes.extend_from_slice(&out.data);
+            }
         }
         if let Some(r) = &recorder {
-            if !r.push(&out.data) {
-                recorder = None;
+            let err = if r.size != (dw, dh) {
+                Some("CRT シェーダーの切り替えで画像の大きさが変わったため録画を停止しました")
+            } else if !r.push(dpx) {
+                Some("録画が中断されました")
+            } else {
+                None
+            };
+            if let Some(e) = err {
+                if let Some(r) = recorder.take() {
+                    let _ = r.finish();
+                }
                 let mut st = shared.stats.lock().unwrap();
                 st.recording = None;
-                st.error = Some("録画が中断されました".into());
+                st.error = Some(e.into());
             }
+        }
+
+        if crt.info_version != crt_seen {
+            crt_seen = crt.info_version;
+            *shared.crt_info.lock().unwrap() = crt.info().clone();
+            shared.stats.lock().unwrap().crt_version = crt_seen;
         }
 
         // ---- 統計 ----
@@ -377,6 +444,7 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
             st.rf_ms = t.rf.as_secs_f32() * 1e3;
             st.decode_ms = t.decode.as_secs_f32() * 1e3;
             st.capture_ms = t.capture.as_secs_f32() * 1e3;
+            st.crt_ms = crt_time.as_secs_f32() * 1e3;
             let cs = pipeline.codec_stats();
             st.codec_q = cs.map(|c| c.q);
             st.codec_kbit = cs.map(|c| c.bits as f32 / 1e3);
@@ -424,6 +492,45 @@ mod tests {
         assert_eq!(engine.shared.stats.lock().unwrap().error, None);
 
         p.standard = vhs_core::TvStandard::Ntsc;
+        engine.set_params(p);
+        assert_eq!(wait_size(&engine, (754, 480)), (754, 480));
+    }
+
+    /// CRT シェーダーを有効にすると、プレビューが画面の高さ (4:3 の正方画素) で描かれ、元の画像も付く。
+    /// GPU と slang プリセットが必要: `VHS_TEST_SLANGP=.../crt-royale.slangp cargo test -p vhs-next -- --ignored`
+    #[test]
+    #[ignore]
+    fn crt_shader_renders_at_viewport_size() {
+        let preset = std::env::var("VHS_TEST_SLANGP").expect("VHS_TEST_SLANGP");
+        let engine = Engine::start();
+        assert_eq!(wait_size(&engine, (754, 480)), (754, 480));
+        engine.shared.viewport_height.store(900, Ordering::Relaxed);
+        let mut p = Params::default();
+        p.crt.enabled = true;
+        p.crt.preset = preset.clone();
+        engine.set_params(p.clone());
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while wait_size(&engine, (1200, 900)) != (1200, 900) && Instant::now() < deadline {}
+        let info = engine.shared.crt_info.lock().unwrap().clone();
+        assert_eq!(info.error, None);
+        assert!(!info.params.is_empty());
+        assert_eq!(wait_size(&engine, (1200, 900)), (1200, 900));
+        {
+            let slot = engine.shared.frame.lock().unwrap();
+            assert_eq!(slot.bytes.len(), 16 + 1200 * 900 * 4 + 8 + 754 * 480 * 4);
+            // 真っ黒ではない
+            let mean = slot.bytes[16..16 + 1200 * 900 * 4].iter().map(|&b| b as u64).sum::<u64>() / (1200 * 900 * 4);
+            assert!(mean > 40, "mean {mean}");
+        }
+
+        // パラメータの上書き (存在しない名前は無視される) と無効化
+        let first = info.params.iter().find(|q| q.min != q.max).unwrap();
+        p.crt.params.insert(first.id.clone(), first.max);
+        p.crt.params.insert("no_such_param".into(), 1.0);
+        engine.set_params(p.clone());
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(engine.shared.stats.lock().unwrap().error, None);
+        p.crt.enabled = false;
         engine.set_params(p);
         assert_eq!(wait_size(&engine, (754, 480)), (754, 480));
     }

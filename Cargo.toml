@@ -16,6 +16,24 @@ serde_json = "1"
 [profile.dev.package.vhs-core]
 opt-level = 3
 
+# CRT シェーダーのコンパイル (glslang → naga) と GPU ドライバ層も最適化しないと読み込みが遅い
+[profile.dev.package.glslang]
+opt-level = 3
+[profile.dev.package.glslang-sys]
+opt-level = 3
+[profile.dev.package.naga]
+opt-level = 3
+[profile.dev.package.wgpu-core]
+opt-level = 3
+[profile.dev.package.wgpu-hal]
+opt-level = 3
+[profile.dev.package.librashader-reflect]
+opt-level = 3
+[profile.dev.package.librashader-preprocess]
+opt-level = 3
+[profile.dev.package.librashader-runtime-wgpu]
+opt-level = 3
+
 [profile.release]
 codegen-units = 1
 lto = true

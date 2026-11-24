@@ -3,7 +3,7 @@
 //! 映像と違って信号そのもの (サンプル列) を順に処理する。ステレオのインターリーブ f32 を受け取る。
 //!
 //! リニア (ノーマル) トラック:
-//!   モノラル化 → 録音レベル (磁気飽和) → 帯域制限 (低域カット・高域カット・ヘッドバンプ)
+//!   モノラル化 → 録音レベル (磁気飽和。映像と同じ磁性体モデル `tape.magnetic_model`) → 帯域制限 (低域カット・高域カット・ヘッドバンプ)
 //!   → ワウフラッタ (変調遅延線によるピッチの揺れ) → テープヒス → ドロップアウト (こもり・レベル低下)
 //! Hi-Fi トラック:
 //!   ステレオ・広帯域 → ワウフラッタ (弱め) → コンパンダによるノイズの浮き沈み
@@ -14,18 +14,10 @@
 use crate::filter::{Biquad, Cascade};
 use crate::params::{AudioMode, AudioParams, Params};
 use crate::rng::Rng;
+use crate::tape::magnetic::MagneticTransfer;
 use std::f32::consts::TAU;
 
 const DELAY_LEN: usize = 1 << 15;
-
-#[inline(always)]
-fn soft_clip(x: f32) -> f32 {
-    if x.abs() >= 3.0 {
-        return x.signum();
-    }
-    let x2 = x * x;
-    x * (27.0 + x2) / (27.0 + 9.0 * x2)
-}
 
 fn db(v: f32) -> f32 {
     if v <= -89.9 { 0.0 } else { 10f32.powf(v / 20.0) }
@@ -46,6 +38,8 @@ struct Channel {
 
 pub struct AudioProcessor {
     p: AudioParams,
+    /// リニアトラックの磁性体の伝達特性 (フルスケール = 1 の尺度)
+    mag: MagneticTransfer,
     fs: f32,
     /// 映像のフィールド周波数 [Hz] (Hi-Fi のヘッド切替の周期)
     field_rate: f32,
@@ -139,6 +133,7 @@ impl AudioProcessor {
             agc_gain: 1.0,
             comp_env: 0.0,
             hold_phase: 1.0,
+            mag: MagneticTransfer::new(params.tape.magnetic_model, 1.0),
             p,
         }
     }
@@ -154,7 +149,8 @@ impl AudioProcessor {
         let fs = self.fs;
         let linear = p.mode == AudioMode::Linear;
         let drive = 0.5 * db(p.drive_db).max(1e-3);
-        let drive_norm = 1.0 / soft_clip(drive).max(1e-3);
+        let mag = self.mag;
+        let drive_norm = 1.0 / mag.transfer(drive).max(1e-3);
         let hiss = if linear { db(p.hiss_db) } else { db(p.hiss_db - 25.0) };
         // 帯域制限した白色雑音の rms を戻す係数
         let hiss_norm = hiss * if linear { (0.5 * fs / (p.high_cut_hz * 1.2)).sqrt() } else { 1.2 };
@@ -181,8 +177,8 @@ impl AudioProcessor {
                 r = m;
             }
             if linear {
-                l = soft_clip(l * drive) * drive_norm;
-                r = soft_clip(r * drive) * drive_norm;
+                l = mag.transfer(l * drive) * drive_norm;
+                r = mag.transfer(r * drive) * drive_norm;
             }
 
             // ---- テープ速度の揺れ (遅延変調) ----

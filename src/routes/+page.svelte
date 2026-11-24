@@ -15,11 +15,15 @@
     rf_ms: number;
     decode_ms: number;
     capture_ms: number;
+    crt_ms: number;
+    crt_version: number;
     codec_q: number | null;
     codec_kbit: number | null;
     recording: string | null;
     error: string | null;
   };
+  type ShaderParam = { id: string; description: string; initial: number; min: number; max: number; step: number };
+  type CrtInfo = { preset: string; loading: boolean; error: string | null; gpu: string | null; params: ShaderParam[] };
   type ExportProgress = { done: number; total: number | null; finished: boolean; error: string | null };
 
   let params = $state<Params | null>(null);
@@ -31,6 +35,10 @@
   let exporting = $state<ExportProgress | null>(null);
   let canvas: HTMLCanvasElement;
   let scopes: Scopes | undefined = $state();
+  let crtInfo = $state<CrtInfo | null>(null);
+  let crtVersion = -1;
+  let crtFilter = $state("");
+  const CRT_HEIGHTS = [720, 960, 1080, 1440, 2160];
 
   const VIDEO_EXTS = ["mp4", "mkv", "mov", "avi", "webm", "m4v", "mpg", "ts"];
   const IMAGE_EXTS = ["png", "jpg", "jpeg", "bmp", "webp"];
@@ -111,13 +119,52 @@
     }
   }
 
+  async function pickCrtPreset() {
+    if (!params) return;
+    const cur = params.crt.preset;
+    const file = await open({
+      defaultPath: cur ? cur.replace(/[\\/][^\\/]*$/, "") : undefined,
+      filters: [
+        { name: "slang プリセット", extensions: ["slangp"] },
+        { name: "すべて", extensions: ["*"] },
+      ],
+    });
+    if (typeof file === "string") {
+      // 別のプリセットにはパラメータの上書きを持ち越さない
+      if (file !== params.crt.preset) params.crt.params = {};
+      params.crt.preset = file;
+      params.crt.enabled = true;
+    }
+  }
+
+  function crtValue(p: ShaderParam) {
+    return params?.crt.params[p.id] ?? p.initial;
+  }
+
+  function setCrtValue(p: ShaderParam, v: number | null) {
+    if (!params) return;
+    if (v === null || Math.abs(v - p.initial) < 1e-6) delete params.crt.params[p.id];
+    else params.crt.params[p.id] = v;
+  }
+
+  // 今のプリセットのパラメータ (min = max は見出し)。絞り込み中は見出しを省く
+  let crtVisible = $derived.by(() => {
+    const ps = crtInfo && params && crtInfo.preset === params.crt.preset ? crtInfo.params : [];
+    const q = crtFilter.trim().toLowerCase();
+    if (!q) return ps;
+    return ps.filter((p) => p.min !== p.max && (p.id.toLowerCase().includes(q) || p.description.toLowerCase().includes(q)));
+  });
+
   function applyPreset(i: number) {
     // 今のテレビ方式とテープのフォーマットは引き継ぐ (プリセットが指定していればそちら)
     if (!defaults) return;
     // FM モデルで使っていたときだけフォーマットの値をすべて引き継ぐ (簡易モデルの既定の見た目は変えない)
     const fm = params?.tape.luma_model === "fm";
     const base = retarget(defaults, params?.standard ?? "ntsc", params?.tape.format ?? "vhs", fm);
+    const crt = params ? $state.snapshot(params.crt) : null;
     params = applyDiff(base, presets[i].diff);
+    // ブラウン管の設定は表示環境なので VHS のプリセットでは変えない
+    if (crt && params) params.crt = crt;
   }
 
   async function pickFont(path: string) {
@@ -173,7 +220,15 @@
             }
             const px = new Uint8ClampedArray(buf, 16, w * h * 4);
             ctx.putImageData(new ImageData(px, w, h), 0, 0);
-            scopes?.push(px, w, h);
+            // CRT シェーダーを掛けたときは元の画像が後ろに付いている。スコープは元の画像で見る
+            const rawAt = 16 + w * h * 4;
+            if (buf.byteLength > rawAt + 8) {
+              const rw = view.getUint32(rawAt, true);
+              const rh = view.getUint32(rawAt + 4, true);
+              scopes?.push(new Uint8ClampedArray(buf, rawAt + 8, rw * rh * 4), rw, rh);
+            } else {
+              scopes?.push(px, w, h);
+            }
           }
         } catch (e) {
           console.error(e);
@@ -185,7 +240,22 @@
 
     const statTimer = setInterval(async () => {
       stats = await invoke<Stats>("get_stats");
+      if (stats.crt_version !== crtVersion) {
+        crtVersion = stats.crt_version;
+        crtInfo = await invoke<CrtInfo>("get_crt_info");
+      }
     }, 500);
+
+    // CRT シェーダーは画面上の実画素数で描く (マスクやスキャンラインを拡大縮小でつぶさないため)
+    let lastVh = 0;
+    const ro = new ResizeObserver(() => {
+      const vh = Math.round(canvas.getBoundingClientRect().height * devicePixelRatio);
+      if (vh > 0 && vh !== lastVh) {
+        lastVh = vh;
+        invoke("set_viewport", { height: vh });
+      }
+    });
+    ro.observe(canvas);
 
     const unlisten = listen<ExportProgress>("export-progress", (e) => {
       exporting = e.payload;
@@ -204,6 +274,7 @@
     return () => {
       alive = false;
       clearInterval(statTimer);
+      ro.disconnect();
       unlisten.then((f) => f());
     };
   });
@@ -245,7 +316,9 @@
           処理 {(stats.camera_ms + stats.encode_ms + stats.tape_ms + stats.rf_ms + stats.decode_ms + stats.capture_ms).toFixed(2)} ms
           ({stats.camera_ms > 0.01 ? `cam ${stats.camera_ms.toFixed(2)} / ` : ""}enc {stats.encode_ms.toFixed(2)} / tape {stats.tape_ms.toFixed(2)}{stats.rf_ms > 0.01
             ? ` / rf ${stats.rf_ms.toFixed(2)}`
-            : ""} / dec {stats.decode_ms.toFixed(2)}{stats.capture_ms > 0.01 ? ` / cap ${stats.capture_ms.toFixed(2)}` : ""})
+            : ""} / dec {stats.decode_ms.toFixed(2)}{stats.capture_ms > 0.01 ? ` / cap ${stats.capture_ms.toFixed(2)}` : ""}{stats.crt_ms > 0.01
+            ? ` / crt ${stats.crt_ms.toFixed(2)}`
+            : ""})
         </span>
         {#if stats.codec_q != null && stats.codec_kbit != null}
           <span title="キャプチャ圧縮の量子化スケールと直前フレームの符号量">
@@ -375,6 +448,80 @@
           {/each}
         </details>
       {/each}
+
+      <details open={params.crt.enabled}>
+        <summary>ブラウン管 (CRT シェーダー)</summary>
+        <p class="note">
+          RetroArch の slang シェーダープリセット (.slangp) を最終出力に掛ける (例: RetroArch の
+          shaders/shaders_slang/crt/crt-royale.slangp)。プレビューは画面の画素数、録画・書き出しは下の高さで描く。
+        </p>
+        <label class="row check">
+          <input type="checkbox" bind:checked={params.crt.enabled} />
+          <span>シェーダーを掛ける</span>
+        </label>
+        <div class="row">
+          <span class="name">プリセット</span>
+          <input
+            type="text"
+            placeholder="未選択"
+            value={params.crt.preset}
+            onchange={(e) => params && (params.crt.preset = (e.target as HTMLInputElement).value.trim())}
+            title={params.crt.preset}
+          />
+          <span class="btns">
+            <button class="small" onclick={pickCrtPreset} title=".slangp を選ぶ">…</button>
+            <button class="small" onclick={() => invoke("reload_crt")} title="シェーダーを読み直す">⟳</button>
+          </span>
+        </div>
+        <label class="row">
+          <span class="name">録画・書き出しの高さ</span>
+          <select bind:value={params.crt.height}>
+            {#each CRT_HEIGHTS as h}<option value={h}>{Math.round((h * 4) / 3)}×{h}</option>{/each}
+          </select>
+        </label>
+        {#if params.crt.enabled && params.crt.preset && crtInfo && crtInfo.preset === params.crt.preset}
+          {#if crtInfo.loading}
+            <p class="note">シェーダーを読み込み中…</p>
+          {:else if crtInfo.error}
+            <p class="note err">{crtInfo.error}</p>
+          {:else}
+            <p class="note">GPU: {crtInfo.gpu ?? "?"} · パラメータ {crtInfo.params.filter((p) => p.min !== p.max).length} 個</p>
+          {/if}
+        {/if}
+        {#if crtVisible.length > 0 || crtFilter}
+          <details>
+            <summary>シェーダーパラメータ</summary>
+            <div class="crt-tools">
+              <input type="search" placeholder="絞り込み" bind:value={crtFilter} />
+              <button
+                class="small"
+                onclick={() => params && (params.crt.params = {})}
+                disabled={Object.keys(params.crt.params).length === 0}
+                title="すべてプリセットの値に戻す">既定に戻す</button
+              >
+            </div>
+            {#each crtVisible as p (p.id)}
+              {#if p.min === p.max}
+                <p class="crt-head">{p.description}</p>
+              {:else}
+                <label class="row" title={`${p.id}\n(ダブルクリックでプリセットの値)`}>
+                  <span class="name" class:changed={p.id in params.crt.params}>{p.description}</span>
+                  <input
+                    type="range"
+                    min={p.min}
+                    max={p.max}
+                    step={p.step}
+                    value={crtValue(p)}
+                    oninput={(e) => setCrtValue(p, Number((e.target as HTMLInputElement).value))}
+                    ondblclick={() => setCrtValue(p, null)}
+                  />
+                  <span class="val">{fmt(crtValue(p), p.step)}</span>
+                </label>
+              {/if}
+            {/each}
+          </details>
+        {/if}
+      </details>
     {/if}
   </aside>
 </main>
@@ -401,12 +548,16 @@
   main {
     display: grid;
     grid-template-columns: 1fr 360px;
+    /* 行を画面の高さに固定する (auto だと中身に合わせて伸び、パネルのスクロールが効かない) */
+    grid-template-rows: minmax(0, 1fr);
     height: 100vh;
+    overflow: hidden;
   }
   .stage {
     display: flex;
     flex-direction: column;
     min-width: 0;
+    min-height: 0;
   }
   .toolbar,
   .status {
@@ -447,6 +598,7 @@
   .panel {
     background: var(--panel);
     border-left: 1px solid var(--line);
+    min-height: 0;
     overflow-y: auto;
     padding: 8px 10px 24px;
   }
@@ -553,5 +705,32 @@
   }
   .toolbar select {
     max-width: 220px;
+  }
+  .row input[type="text"] {
+    min-width: 0;
+  }
+  .crt-tools {
+    display: flex;
+    gap: 6px;
+    margin: 4px 0 6px;
+  }
+  .crt-tools input {
+    flex: 1;
+    min-width: 0;
+    background: #2a2d36;
+    color: var(--text);
+    border: 1px solid #3a3e4a;
+    border-radius: 4px;
+    padding: 3px 8px;
+    font: inherit;
+  }
+  .crt-head {
+    margin: 8px 0 2px;
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--text);
+  }
+  .name.changed {
+    color: var(--accent);
   }
 </style>
