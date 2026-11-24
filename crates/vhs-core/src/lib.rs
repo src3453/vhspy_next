@@ -2,12 +2,13 @@
 //!
 //! 信号の流れ:
 //! ```text
-//! RgbFrame / LinearFrame(HDR) ─ camera (撮像管) ─ VideoFrame(f32) ─ encoder ─▶ Field(コンポジット, 4fsc) ─ (rf) ─ tape ─ (tbc) ─▶ (rf) ─▶ Field ─ decoder ─▶ RgbaFrame
+//! RgbFrame / LinearFrame(HDR) ─ adjust (画質調整) ─ camera (撮像管) ─ VideoFrame(f32) ─ encoder ─▶ Field(コンポジット, 4fsc) ─ (rf) ─ tape ─ (tbc) ─▶ (rf) ─▶ Field ─ decoder ─▶ RgbaFrame
 //!          ─ capture (YCbCr・色差間引き・DCT 圧縮) ─▶ RgbaFrame
 //! ```
 //! 音声は `audio` (テープ音声トラック → 再生機 → キャプチャ ADC) で別に処理する。
 //! GUI や入出力には依存しない純粋なライブラリ。
 
+pub mod adjust;
 pub mod audio;
 pub mod camera;
 pub mod capture;

@@ -1,5 +1,6 @@
 //! 全体のパイプライン: RGB → コンポジット → テープ → 受像機 → RGBA。
 
+use crate::adjust::InputAdjust;
 use crate::camera::{CameraInput, CameraSim};
 use crate::capture::{CaptureSim, CodecStats};
 use crate::decoder::Decoder;
@@ -20,6 +21,8 @@ const RF_BROADCAST_SEED: u64 = 0x5246_4252_4f41_4443;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StageTimings {
+    /// 入力映像の画質調整
+    pub input: Duration,
     pub camera: Duration,
     pub encode: Duration,
     pub tape: Duration,
@@ -30,12 +33,14 @@ pub struct StageTimings {
 
 impl StageTimings {
     pub fn total(&self) -> Duration {
-        self.camera + self.encode + self.tape + self.rf + self.decode + self.capture
+        self.input + self.camera + self.encode + self.tape + self.rf + self.decode + self.capture
     }
 }
 
 pub struct Pipeline {
     params: Params,
+    /// 入力映像の画質調整 (カメラの有無に関わらず先頭で掛ける)
+    adjust: InputAdjust,
     camera: CameraSim,
     field: Field,
     tape: TapeSim,
@@ -66,6 +71,7 @@ impl Pipeline {
         camera.set_field_rate(std.field_rate);
         Self {
             params,
+            adjust: InputAdjust::default(),
             camera,
             field: Field::new(std),
             tape: TapeSim::new(std),
@@ -147,7 +153,19 @@ impl Pipeline {
             resized = input.resized(w, h);
             &resized
         };
-        self.run(CameraInput::Rgb(input))
+        if InputAdjust::is_identity(&self.params.input) {
+            self.run(CameraInput::Rgb(input));
+            return self.output();
+        }
+        // run が &mut self を取るので、調整器を一時的に取り出す
+        let t = Instant::now();
+        let mut adjust = std::mem::take(&mut self.adjust);
+        let adjusted = adjust.process_rgb(input, &self.params.input);
+        let d = t.elapsed();
+        self.run(CameraInput::Rgb(adjusted));
+        self.adjust = adjust;
+        self.timings.input = d;
+        self.output()
     }
 
     /// シーンリニアな HDR 映像 (3DCG のレンダリング結果など) を 1 フィールドぶん処理する。
@@ -162,7 +180,18 @@ impl Pipeline {
             resized = input.resized(w, h);
             &resized
         };
-        self.run(CameraInput::Linear(input))
+        if InputAdjust::is_identity(&self.params.input) {
+            self.run(CameraInput::Linear(input));
+            return self.output();
+        }
+        let t = Instant::now();
+        let mut adjust = std::mem::take(&mut self.adjust);
+        let adjusted = adjust.process_linear(input, &self.params.input);
+        let d = t.elapsed();
+        self.run(CameraInput::Linear(adjusted));
+        self.adjust = adjust;
+        self.timings.input = d;
+        self.output()
     }
 
     fn run(&mut self, src: CameraInput) -> &RgbaFrame {
@@ -257,7 +286,7 @@ impl Pipeline {
         let t5 = Instant::now();
 
         self.timings =
-            StageTimings { camera: t0 - tc, encode: t1 - t_dv, tape: (t_dv - t0) + (t2 - t1r), rf: (t1r - t1) + (t3 - t2), decode: t4 - t3, capture: t5 - t4 };
+            StageTimings { input: Duration::ZERO, camera: t0 - tc, encode: t1 - t_dv, tape: (t_dv - t0) + (t2 - t1r), rf: (t1r - t1) + (t3 - t2), decode: t4 - t3, capture: t5 - t4 };
         self.field_index += 1;
         self.output()
     }

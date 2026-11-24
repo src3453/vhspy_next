@@ -1,6 +1,7 @@
 //! 処理スレッド。入力の取得 → パイプライン → プレビュー/録画への出力を回す。
 
 use crate::crt::{Crt, CrtInfo};
+use crate::still::{Still, StillFrame};
 use crate::ffmpeg::{AUDIO_RATE, AudioTrack, FrameStream, Recorder, StreamSpec, probe_duration, process_audio};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -86,14 +87,9 @@ pub struct Engine {
 
 enum Source {
     Still(RgbFrame),
+    /// 画像ファイル (配置・パンはフィールドごとに `params.image` で決める)
+    Image(Box<Still>),
     Stream(FrameStream),
-}
-
-fn load_image(path: &Path, tv: &Standard) -> Result<RgbFrame, String> {
-    let (w, h) = tv.image_size();
-    let img = image::open(path).map_err(|e| format!("画像を開けません: {e}"))?.to_rgb8();
-    let img = image::imageops::resize(&img, w as u32, h as u32, image::imageops::FilterType::CatmullRom);
-    Ok(RgbFrame::from_raw(w, h, img.into_raw()).unwrap())
 }
 
 fn source_name(spec: &SourceSpec) -> String {
@@ -111,7 +107,7 @@ fn source_name(spec: &SourceSpec) -> String {
 fn open_source(spec: &SourceSpec, tv: &Standard) -> Result<Source, String> {
     Ok(match spec {
         SourceSpec::Pattern => Source::Still(vhs_core::pattern::color_bars(tv)),
-        SourceSpec::Image(p) => Source::Still(load_image(p, tv)?),
+        SourceSpec::Image(p) => Source::Image(Box::new(Still::load(p)?)),
         SourceSpec::Stream(s) => Source::Stream(FrameStream::open(s, true, tv)?),
     })
 }
@@ -329,14 +325,17 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     st.error = Some("テレビ方式が変わったため録画を停止しました".into());
                 }
                 drop(st);
-                source = Source::Still(vhs_core::pattern::color_bars(tv));
-                match open_source(&spec, tv) {
-                    Ok(s) => source = s,
-                    Err(e) => {
-                        let mut st = shared.stats.lock().unwrap();
-                        st.error = Some(e);
-                        st.source = source_name(&SourceSpec::Pattern);
-                        spec = SourceSpec::Pattern;
+                // 画像は方式に合わせて毎フィールド配置し直すので開き直さなくてよい
+                if !matches!(source, Source::Image(_)) {
+                    source = Source::Still(vhs_core::pattern::color_bars(tv));
+                    match open_source(&spec, tv) {
+                        Ok(s) => source = s,
+                        Err(e) => {
+                            let mut st = shared.stats.lock().unwrap();
+                            st.error = Some(e);
+                            st.source = source_name(&SourceSpec::Pattern);
+                            spec = SourceSpec::Pattern;
+                        }
                     }
                 }
             }
@@ -344,21 +343,30 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
 
         // ---- 入力 ----
         let streamed;
-        let input: &RgbFrame = match &source {
+        let mut pace = || {
+            // 静止画はフィールド周波数 (NTSC なら 59.94 Hz) で流す
+            let now = Instant::now();
+            if next_deadline > now {
+                std::thread::sleep(next_deadline - now);
+            }
+            let period = field_period(tv);
+            next_deadline = (next_deadline + period).max(Instant::now() - period);
+            period
+        };
+        let image_params = pipeline.params().image.clone();
+        let input = match &mut source {
             Source::Still(f) => {
-                // 静止画はフィールド周波数 (NTSC なら 59.94 Hz) で同じ画像を流す
-                let now = Instant::now();
-                if next_deadline > now {
-                    std::thread::sleep(next_deadline - now);
-                }
-                let period = field_period(tv);
-                next_deadline = (next_deadline + period).max(Instant::now() - period);
-                f
+                pace();
+                StillFrame::Rgb(f)
+            }
+            Source::Image(s) => {
+                let period = pace();
+                s.render(&image_params, tv, period.as_secs_f32())
             }
             Source::Stream(s) => match s.rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(f) => {
                     streamed = f;
-                    &streamed
+                    StillFrame::Rgb(&streamed)
                 }
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => {
@@ -374,7 +382,10 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
         };
 
         // ---- 処理 ----
-        let out = pipeline.process_field(input);
+        let out = match input {
+            StillFrame::Rgb(f) => pipeline.process_field(f),
+            StillFrame::Linear(f) => pipeline.process_field_linear(f),
+        };
 
         // ---- ブラウン管 ----
         if shared.crt_reload.swap(false, Ordering::AcqRel) {
@@ -438,7 +449,8 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
             let t = pipeline.timings;
             let mut st = shared.stats.lock().unwrap();
             st.fields_per_sec = window_count as f32 / el.as_secs_f32();
-            st.camera_ms = t.camera.as_secs_f32() * 1e3;
+            // 入力の画質調整もカメラと同じ前段として数える
+            st.camera_ms = (t.input + t.camera).as_secs_f32() * 1e3;
             st.encode_ms = t.encode.as_secs_f32() * 1e3;
             st.tape_ms = t.tape.as_secs_f32() * 1e3;
             st.rf_ms = t.rf.as_secs_f32() * 1e3;

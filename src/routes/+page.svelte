@@ -41,7 +41,7 @@
   const CRT_HEIGHTS = [720, 960, 1080, 1440, 2160];
 
   const VIDEO_EXTS = ["mp4", "mkv", "mov", "avi", "webm", "m4v", "mpg", "ts"];
-  const IMAGE_EXTS = ["png", "jpg", "jpeg", "bmp", "webp"];
+  const IMAGE_EXTS = ["png", "jpg", "jpeg", "bmp", "webp", "exr"];
 
   async function run(f: () => Promise<unknown>) {
     try {
@@ -162,9 +162,11 @@
     const fm = params?.tape.luma_model === "fm";
     const base = retarget(defaults, params?.standard ?? "ntsc", params?.tape.format ?? "vhs", fm);
     const crt = params ? $state.snapshot(params.crt) : null;
+    const image = params ? $state.snapshot(params.image) : null;
     params = applyDiff(base, presets[i].diff);
-    // ブラウン管の設定は表示環境なので VHS のプリセットでは変えない
+    // ブラウン管の設定は表示環境、画像の配置は入力の設定なので VHS のプリセットでは変えない
     if (crt && params) params.crt = crt;
+    if (image && params) params.image = image;
   }
 
   async function pickFont(path: string) {

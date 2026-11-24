@@ -10,7 +10,9 @@ pub use crate::timing::TvStandard;
 pub struct Params {
     /// テレビ方式 (信号のタイミング・色の符号化)
     pub standard: TvStandard,
-    /// 撮像管カメラ (入力映像の直後)
+    /// 入力映像の画質調整 (パイプラインの先頭。カメラの有無に関わらずすべての映像に掛かる)
+    pub input: InputParams,
+    /// 撮像管カメラ (入力映像の画質調整の後)
     pub camera: CameraParams,
     pub encoder: EncoderParams,
     pub tape: TapeParams,
@@ -30,8 +32,65 @@ pub struct Params {
     pub osd: OsdParams,
     /// ブラウン管の表示 (RetroArch slang シェーダー)。vhs-core 自体は使わず、GUI 側の GPU 処理で適用する
     pub crt: CrtParams,
+    /// 静止画入力の配置・パン。vhs-core 自体は使わず、GUI 側で入力画像を作るときに使う
+    pub image: ImageParams,
     /// 乱数シード (同じシードなら同じ劣化パターン)
     pub seed: u64,
+}
+
+/// 入力映像の画質調整。昔のビデオカメラの甘いレンズ・強い輪郭強調・色の癖などを作る。
+/// 値はガンマ補正済み (表示用) の映像に対するもの。モデルの詳細は `adjust` モジュールを参照。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct InputParams {
+    pub enabled: bool,
+    /// ぼけ (レンズ・光学ローパス) のガウス σ [画素]
+    pub blur_px: f32,
+    /// 輪郭強調の量 (0 = なし、負で細部を削る)。輝度だけに掛かる
+    pub sharpness: f32,
+    /// 輪郭強調の半径 (ガウス σ) [画素]。大きいほどハローが太い
+    pub sharpness_radius_px: f32,
+    /// 縦方向の輪郭強調の割合 (0 = 横だけ, 1 = 縦横同じ)
+    pub sharpness_vertical: f32,
+    /// コアリング: これより小さい細部 (雑音) は強調しない (0..1 の振幅)
+    pub sharpness_coring: f32,
+    /// 強調で足す量の上限 (0 = 無制限)
+    pub sharpness_limit: f32,
+    /// 明るさ (加算, 白 = 1)
+    pub brightness: f32,
+    /// コントラスト (中間 0.5 を中心にした倍率)
+    pub contrast: f32,
+    /// ガンマ (1 より大きいと中間調が明るくなる)
+    pub gamma: f32,
+    /// 彩度 (倍率)
+    pub saturation: f32,
+    /// 色相の回転 [度]
+    pub hue_deg: f32,
+    /// 色温度 (-1 = 青っぽい, 1 = 赤っぽい)。明るさは保つ
+    pub color_temp: f32,
+    /// 色かぶり (-1 = 緑, 1 = マゼンタ)
+    pub tint: f32,
+}
+
+impl Default for InputParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            blur_px: 0.0,
+            sharpness: 0.0,
+            sharpness_radius_px: 1.0,
+            sharpness_vertical: 1.0,
+            sharpness_coring: 0.0,
+            sharpness_limit: 0.0,
+            brightness: 0.0,
+            contrast: 1.0,
+            gamma: 1.0,
+            saturation: 1.0,
+            hue_deg: 0.0,
+            color_temp: 0.0,
+            tint: 0.0,
+        }
+    }
 }
 
 /// 撮像管 (ビジコン・プランビコン・サチコンなど) を使ったカラーカメラ。
@@ -597,6 +656,42 @@ pub struct CrtParams {
 impl Default for CrtParams {
     fn default() -> Self {
         Self { enabled: false, preset: String::new(), height: 1080, params: Default::default() }
+    }
+}
+
+/// 静止画を画面にどう合わせるか
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageFit {
+    /// 縦横比を無視して画面いっぱいに引き伸ばす
+    #[default]
+    Stretch,
+    /// 縦横比を保って画面を覆う (はみ出した部分はパンで見る)
+    Cover,
+    /// 縦横比を保って画面に収める (余白は黒)
+    Contain,
+}
+
+/// 静止画入力の配置とパン (カメラを振る動き)
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ImageParams {
+    pub fit: ImageFit,
+    /// 拡大率 (1 = `fit` の大きさ)
+    pub zoom: f32,
+    /// 表示位置 (-1 = 左端/上端, 0 = 中央, 1 = 右端/下端)
+    pub pan_x: f32,
+    pub pan_y: f32,
+    /// パンの速さ [画面幅/秒], [画面高さ/秒]。0 なら `pan_x`/`pan_y` の位置で止まる。端で折り返す
+    pub speed_x: f32,
+    pub speed_y: f32,
+    /// HDR 画像 (OpenEXR) の露出 [EV]
+    pub exposure_ev: f32,
+}
+
+impl Default for ImageParams {
+    fn default() -> Self {
+        Self { fit: ImageFit::Stretch, zoom: 1.0, pan_x: 0.0, pan_y: 0.0, speed_x: 0.0, speed_y: 0.0, exposure_ev: 0.0 }
     }
 }
 

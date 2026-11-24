@@ -10,6 +10,23 @@ export const isDigitalFormat = (f: TapeFormat): f is DigitalFormat => f === "dv"
 export type Params = {
   /** テレビ方式 */
   standard: Standard;
+  /** 入力映像の画質調整 (カメラの有無に関わらずすべての映像に掛かる) */
+  input: {
+    enabled: boolean;
+    blur_px: number;
+    sharpness: number;
+    sharpness_radius_px: number;
+    sharpness_vertical: number;
+    sharpness_coring: number;
+    sharpness_limit: number;
+    brightness: number;
+    contrast: number;
+    gamma: number;
+    saturation: number;
+    hue_deg: number;
+    color_temp: number;
+    tint: number;
+  };
   camera: {
     enabled: boolean;
     exposure_ev: number;
@@ -194,6 +211,16 @@ export type Params = {
     /** シェーダーパラメータの上書き */
     params: Record<string, number>;
   };
+  /** 静止画入力の配置・パン */
+  image: {
+    fit: "stretch" | "cover" | "contain";
+    zoom: number;
+    pan_x: number;
+    pan_y: number;
+    speed_x: number;
+    speed_y: number;
+    exposure_ev: number;
+  };
   seed: number;
 };
 
@@ -224,6 +251,46 @@ export const groups: Group[] = [
           { value: "pal", label: "PAL-B/G (625 / 50 Hz)" },
         ],
       },
+    ],
+  },
+  {
+    title: "画像入力 (静止画)",
+    note: "画像ファイルを開いているときだけ効く。速さを 0 以外にすると端で折り返しながらパンし続ける。",
+    controls: [
+      {
+        kind: "select", path: "image.fit", label: "配置",
+        options: [
+          { value: "stretch", label: "引き伸ばし (縦横比を無視)" },
+          { value: "cover", label: "画面を覆う (はみ出しはパンで見る)" },
+          { value: "contain", label: "画面に収める (余白は黒)" },
+        ],
+      },
+      r("image.zoom", "拡大", 1, 4, 0.01, "×"),
+      r("image.pan_x", "横位置", -1, 1, 0.01),
+      r("image.pan_y", "縦位置", -1, 1, 0.01),
+      r("image.speed_x", "横パン速度", -1, 1, 0.005, "画面/s"),
+      r("image.speed_y", "縦パン速度", -1, 1, 0.005, "画面/s"),
+      r("image.exposure_ev", "HDR 露出", -8, 8, 0.1, "EV"),
+    ],
+  },
+  {
+    title: "入力の画質調整",
+    note: "入力映像すべてに最初に掛かる (撮像管カメラ・テープより前)。昔のビデオカメラの甘いレンズ、強い輪郭強調のハロー、色の癖などを作る。",
+    controls: [
+      b("input.enabled", "画質調整を有効にする"),
+      r("input.blur_px", "ぼけ (レンズ)", 0, 4, 0.05, "px"),
+      r("input.sharpness", "シャープネス", -1, 4, 0.01),
+      r("input.sharpness_radius_px", "輪郭強調の太さ", 0.3, 4, 0.05, "px"),
+      r("input.sharpness_vertical", "縦の輪郭強調", 0, 1, 0.01),
+      r("input.sharpness_coring", "コアリング", 0, 0.1, 0.001),
+      r("input.sharpness_limit", "強調の上限", 0, 0.5, 0.005),
+      r("input.brightness", "明るさ", -0.5, 0.5, 0.005),
+      r("input.contrast", "コントラスト", 0, 2, 0.01),
+      r("input.gamma", "ガンマ", 0.3, 3, 0.01),
+      r("input.saturation", "彩度", 0, 2, 0.01),
+      r("input.hue_deg", "色相", -180, 180, 1, "°"),
+      r("input.color_temp", "色温度 (青 ↔ 赤)", -1, 1, 0.01),
+      r("input.tint", "色かぶり (緑 ↔ マゼンタ)", -1, 1, 0.01),
     ],
   },
   {
@@ -574,6 +641,29 @@ export const groups: Group[] = [
 
 // ツールチップ用の説明 (path → 説明文)。
 export const help: Record<string, string> = {
+  // 画像入力
+  "image.fit": "画像を画面 (4:3) に合わせる方法。「覆う」や拡大で画面からはみ出した部分を、位置・パンで見る。",
+  "image.zoom": "配置した大きさからの拡大率。",
+  "image.pan_x": "表示位置。-1 で左端、1 で右端が見える (画像が画面より小さいときは画像が左右に寄る)。",
+  "image.pan_y": "表示位置。-1 で上端、1 で下端が見える。",
+  "image.speed_x": "横方向にカメラを振る速さ (1 秒に動く画面幅)。端で折り返す。動きでくし形 Y/C 分離・残像・圧縮の劣化が見える。",
+  "image.speed_y": "縦方向にカメラを振る速さ (1 秒に動く画面高さ)。端で折り返す。",
+  "image.exposure_ev": "OpenEXR などの HDR 画像 (シーンリニア) に掛ける露出。8 bit の画像には効かない。白を超える光は撮像管カメラでコメットテールなどになる。",
+  // 入力の画質調整
+  "input.enabled": "入力映像の画質調整を有効にする。撮像管カメラの有無に関わらず、パイプラインの先頭ですべての映像に掛かる。",
+  "input.blur_px": "レンズや光学ローパスフィルタによるぼけ (ガウスの σ)。家庭用ビデオカメラの甘い解像感。",
+  "input.sharpness": "輝度の輪郭強調 (アンシャープマスク)。上げると輪郭の両側に白・黒の縁 (ハロー) が出る。負の値で細部を削る。",
+  "input.sharpness_radius_px": "輪郭強調で見る範囲。大きいほどハローが太く、昔のカメラらしいにじんだ縁になる。",
+  "input.sharpness_vertical": "縦方向の輪郭強調の割合。0 で横方向だけ (1H 遅延線の補正が弱い機種)、1 で縦横同じ。",
+  "input.sharpness_coring": "これより小さい細部は強調しない。雑音が強調でざらつくのを抑える。",
+  "input.sharpness_limit": "輪郭強調で足す明るさの上限。0 で無制限。",
+  "input.brightness": "明るさ (全体に足す量)。",
+  "input.contrast": "中間の明るさを中心にした階調の傾き。",
+  "input.gamma": "中間調の明るさ。1 より大きいと明るく、小さいと暗く沈む。",
+  "input.saturation": "色の濃さ。",
+  "input.hue_deg": "色相の回転。",
+  "input.color_temp": "ホワイトバランスのずれ。負で青っぽく (蛍光灯・日陰)、正で赤っぽく (白熱灯) なる。明るさは保つ。",
+  "input.tint": "色かぶり。負で緑、正でマゼンタに寄る。",
   // 撮像管カメラ
   "camera.enabled": "入力映像を撮像管カメラで撮影した映像にする。テープ・OSD の焼き込みより前に入る。",
   "camera.exposure_ev": "アイリスによる露出。上げると白を超えるハイライトが増え、コメットテールや焼き付きが起きやすい。",
@@ -844,6 +934,13 @@ const comb3d = (p: Params) => ycSeparated(p) && p.decoder.yc_separation === "com
 /** path → 効く条件。ここにない path は常に有効。
  *  `"camera."` のように末尾が "." のキーはそのグループ全体 (個別のキーがあればそちらも満たす必要がある) */
 const activeWhen: Record<string, (p: Params) => boolean> = {
+  // 入力の画質調整
+  "input.": (p) => p.input.enabled,
+  "input.sharpness_radius_px": (p) => p.input.sharpness !== 0,
+  "input.sharpness_vertical": (p) => p.input.sharpness !== 0,
+  "input.sharpness_coring": (p) => p.input.sharpness !== 0,
+  "input.sharpness_limit": (p) => p.input.sharpness !== 0,
+
   // 撮像管カメラ
   "camera.": (p) => p.camera.enabled,
   "camera.act_level": (p) => p.camera.act,
@@ -929,6 +1026,7 @@ const activeWhen: Record<string, (p: Params) => boolean> = {
 
 /** グループ全体の条件 ("camera." など) を掛けない path (グループのオン・オフ自体のスイッチなど) */
 const ignoreGroup = new Set([
+  "input.enabled",
   "camera.enabled",
   "osd.enabled",
   "tape.enabled",
@@ -1051,6 +1149,15 @@ export const standardDiffs: Record<Standard, DeepPartial<Params>> = {
 // 組み込みプリセット (既定値からの差分。テレビ方式は今の方式を引き継ぐ)
 export const presets: { name: string; diff: DeepPartial<Params> }[] = [
   { name: "VHS 標準 (SP)", diff: {} },
+  {
+    name: "90 年代の家庭用ビデオカメラ",
+    diff: {
+      input: {
+        enabled: true, blur_px: 0.8, sharpness: 1.6, sharpness_radius_px: 1.6, sharpness_vertical: 0.4,
+        sharpness_coring: 0.01, sharpness_limit: 0.18, contrast: 1.08, saturation: 1.15, color_temp: 0.12,
+      },
+    },
+  },
   {
     name: "放送用プランビコン 3 管カメラ",
     diff: { camera: { enabled: true, act: true } },

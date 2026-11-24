@@ -24,4 +24,4 @@ tauri-plugin-dialog = "2"
 librashader = { version = "0.12.1", default-features = false, features = ["runtime-wgpu", "presets", "preprocess"] }
 wgpu = "30"
 pollster = "0.4"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp", "exr"] }

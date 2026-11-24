@@ -1,6 +1,7 @@
 mod crt;
 mod engine;
 mod ffmpeg;
+mod still;
 
 use engine::{Engine, SourceSpec, Stats};
 use ffmpeg::StreamSpec;
@@ -19,7 +20,7 @@ enum OpenRequest {
     File { path: PathBuf },
 }
 
-const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "bmp", "webp"];
+const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "bmp", "webp", "exr"];
 
 #[tauri::command]
 fn get_params(engine: State<'_, Engine>) -> Params {
