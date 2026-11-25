@@ -1,0 +1,17 @@
+{
+  "name": "VhsNext.HDRP",
+  "rootNamespace": "VhsNext.HDRP",
+  "references": [
+    "VhsNext.Runtime",
+    "Unity.RenderPipelines.HighDefinition.Runtime"
+  ],
+  "includePlatforms": [],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": [],
+  "versionDefines": [],
+  "noEngineReferences": false
+}

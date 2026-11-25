@@ -1,0 +1,22 @@
+{
+  "name": "com.vhsnext.unity",
+  "version": "0.1.0",
+  "displayName": "VHS Next",
+  "description": "Unity render-pipeline bridge for the VHS Next signal simulator.",
+  "unity": "6000.0",
+  "dependencies": {
+    "com.unity.collections": "2.1.4"
+  },
+  "samples": [
+    {
+      "displayName": "Universal Render Pipeline",
+      "description": "Unity 6 URP Render Graph renderer feature with a 4:3 output aperture.",
+      "path": "Samples~/URP"
+    },
+    {
+      "displayName": "High Definition Render Pipeline",
+      "description": "HDRP custom pass.",
+      "path": "Samples~/HDRP"
+    }
+  ]
+}

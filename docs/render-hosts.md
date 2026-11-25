@@ -58,3 +58,21 @@ for the sequence and resets it if frame order is interrupted. The generated
 image can be viewed in Blender or loaded into a compositor as an image input.
 This first adapter runs after Blender produces a Render Result; it does not
 evaluate as a live compositor node during that same render.
+
+## Unity URP / HDRP
+
+The Unity package is in `integrations/unity`. It provides a shared C ABI wrapper
+and adapters for URP Renderer Features and HDRP Custom Pass Volumes. The
+realtime path uses `CommandBuffer.RequestAsyncReadback` and processes frames on
+a worker thread, so processed frames appear after GPU readback and CPU
+processing latency. See [the Unity integration guide](../integrations/unity/README.md)
+for installation and current limitations.
+
+The URP sample uses `RecordRenderGraph` and defaults to before post-processing
+to match the scene-linear input contract. The output is centered and cropped to
+4:3 with black side bars on a 16:9 camera target. The HDRP sample uses
+`CustomPass.Execute`; place it before post-processing in a Custom Pass Volume
+for the same color-space reason. Unity documents the [URP render-pass extension
+point](https://docs.unity3d.com/ja/6000.0/Manual/urp/renderer-features/write-a-scriptable-render-pass.html),
+[HDRP C# Custom Passes](https://docs.unity3d.com/Packages/com.unity.render-pipelines.high-definition@17.0/manual/Custom-Pass-Scripting.html),
+and [asynchronous GPU readback](https://docs.unity3d.com/cn/6000.0/ScriptReference/Rendering.AsyncGPUReadback.html).

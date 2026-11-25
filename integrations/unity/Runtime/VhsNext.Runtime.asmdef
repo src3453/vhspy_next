@@ -1,0 +1,16 @@
+{
+  "name": "VhsNext.Runtime",
+  "rootNamespace": "VhsNext",
+  "references": [
+    "Unity.Collections"
+  ],
+  "includePlatforms": [],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": [],
+  "versionDefines": [],
+  "noEngineReferences": false
+}

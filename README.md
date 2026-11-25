@@ -115,8 +115,9 @@ ffmpeg -i in.mp4 -vn -ac 2 -ar 48000 -f f32le - | cargo run -p vhs-core --releas
 ### レンダーパス連携
 
 Blenderなどのホストから使うためのC ABI (`vhs-ffi`) と、Render Resultを処理する
-Blenderアドオンを追加。シーンリニアな `float32 RGBA` を受け取り、フレーム間の
-テープ状態を保持したまま処理する。導入手順は [docs/render-hosts.md](docs/render-hosts.md) を参照。
+Blenderアドオン、Unity URP/HDRP向けパッケージを追加。シーンリニアな `float32 RGBA` を受け取り、フレーム間の
+テープ状態を保持したまま処理する。Unity版は非同期GPU読み戻しを使い、数フレーム遅れて出力する。
+導入手順は [docs/render-hosts.md](docs/render-hosts.md) と [integrations/unity/README.md](integrations/unity/README.md) を参照。
 
 ## 今後
 
