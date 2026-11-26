@@ -16,6 +16,8 @@
 
   type Actions = {
     openPattern: () => void;
+    openSmpte: () => void;
+    openEbu: () => void;
     openCamera: () => void;
     openFile: () => void;
     refreshCameras: () => Promise<void>;
@@ -167,7 +169,9 @@
       return {
         title: "ﾆｭｳﾘｮｸ",
         items: [
-          { label: "ﾃｽﾄﾊﾟﾀｰﾝ", enter: actions.openPattern },
+          { label: "ｼﾝﾀﾞﾝ ﾊﾟﾀｰﾝ", enter: actions.openPattern },
+          { label: "SMPTE ｶﾗｰﾊﾞｰ", enter: actions.openSmpte },
+          { label: "EBU ｶﾗｰﾊﾞｰ", enter: actions.openEbu },
           {
             label: "ｶﾒﾗ",
             value: () => (camera ? toOsd(camera) : "---"),

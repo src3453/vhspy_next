@@ -76,6 +76,27 @@ public struct Biquad
         return int(ceil(log(eps) / log(r)));
     }
 
+    /// 周波数 f での群遅延 [サンプル] (Rust の Biquad::group_delay と同じ式)
+    public float groupDelay(float f, float fs)
+    {
+        float w = 2.0 * PI * f / fs;
+        return polyDelay(float3(b0, b1, b2), w) - polyDelay(float3(1.0, a1, a2), w);
+    }
+
+    /// 多項式 Σ p_n z^-n の群遅延 = Re(Σ n p_n e^{-jωn} / Σ p_n e^{-jωn})
+    static float polyDelay(float3 p, float w)
+    {
+        float c1 = cos(w);
+        float s1 = sin(w);
+        float c2 = cos(2.0 * w);
+        float s2 = sin(2.0 * w);
+        float dr = p.x + p.y * c1 + p.z * c2;
+        float di = -(p.y * s1 + p.z * s2);
+        float nr = p.y * c1 + 2.0 * p.z * c2;
+        float ni = -(p.y * s1 + 2.0 * p.z * s2);
+        return (nr * dr + ni * di) / max(dr * dr + di * di, 1e-20);
+    }
+
     [mutating]
     public float process(float x)
     {
@@ -119,6 +140,16 @@ public struct Cascade<let N : int>
         [ForceUnroll]
         for (int k = 0; k < N; k++)
             total += s[k].decaySamples(eps);
+        return total;
+    }
+
+    /// 周波数 f での群遅延 [サンプル] (各段の和)
+    public float groupDelay(float f, float fs)
+    {
+        float total = 0.0;
+        [ForceUnroll]
+        for (int k = 0; k < N; k++)
+            total += s[k].groupDelay(f, fs);
         return total;
     }
 

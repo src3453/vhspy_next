@@ -28,9 +28,11 @@ How the serial parts are parallelised:
 - **Horizontal AFC** (`pos ← pos + k·(edge − pos)`) is a chain of affine maps.
   It runs as a Hillis–Steele scan in groupshared memory.
 - **PAL ident** is a sum of per-line votes, computed as a tree reduction.
-- **The subcarrier PLL** is per-line (parallel) at the default `burst_pll = 1`.
-  For `burst_pll < 1` it wraps angles in a nonlinear recurrence, so one thread
-  runs it serially over groupshared values.
+- **The subcarrier PLL** is per-line (parallel) when `burst_pll = 1`.
+  For `burst_pll < 1` (the default, 0.2, like a real receiver's APC loop) it
+  wraps angles in a nonlinear recurrence, so one thread runs it serially over
+  groupshared values. The receiver's crystal offset (`vcxo_offset_hz`) adds a
+  constant per-line phase step to the prediction.
 - **The AFC-aligned signal** is not stored. Kernels interpolate it from the
   composite signal when they read it.
 - **Input resampling** runs once per host frame for both fields, not once per

@@ -3,12 +3,12 @@
   // 格納中は計算しない。
 
   type Standard = "ntsc" | "pal";
-  let { standard = "ntsc" as Standard } = $props();
+  let { standard = "ntsc" as Standard, open = false } = $props();
 
   const STORE_KEY = "vhs-scopes";
-  type Saved = { open: boolean; mode: "luma" | "parade"; gain: number };
+  type Saved = { mode: "luma" | "parade"; gain: number };
   function load(): Saved {
-    const d: Saved = { open: false, mode: "luma", gain: 1 };
+    const d: Saved = { mode: "luma", gain: 1 };
     try {
       return { ...d, ...JSON.parse(localStorage.getItem(STORE_KEY) ?? "{}") };
     } catch {
@@ -16,11 +16,10 @@
     }
   }
   const saved = load();
-  let open = $state(saved.open);
   let mode = $state<Saved["mode"]>(saved.mode);
   let gain = $state(saved.gain);
   $effect(() => {
-    const s = JSON.stringify({ open, mode, gain });
+    const s = JSON.stringify({ mode, gain });
     try {
       localStorage.setItem(STORE_KEY, s);
     } catch {}
@@ -376,11 +375,8 @@
   });
 </script>
 
-<section class="scopes" class:open>
+<section class="scopes" class:open hidden={!open}>
   <header>
-    <button class="toggle" onclick={() => (open = !open)} aria-expanded={open}>
-      <span class="chev">{open ? "▾" : "▸"}</span> スコープ
-    </button>
     {#if open}
       <select bind:value={mode} title="波形の表示">
         <option value="luma">輝度 (Y)</option>
@@ -425,18 +421,6 @@
     gap: 10px;
     padding: 4px 8px;
     color: var(--muted);
-  }
-  .toggle {
-    background: none;
-    border: none;
-    padding: 2px 4px;
-    color: var(--text);
-    font-weight: 600;
-    cursor: pointer;
-  }
-  .chev {
-    display: inline-block;
-    width: 1em;
   }
   .gain {
     display: flex;

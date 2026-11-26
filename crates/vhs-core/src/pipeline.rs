@@ -6,8 +6,8 @@ use crate::capture::{CaptureSim, CodecStats};
 use crate::decoder::Decoder;
 use crate::deinterlace::Deinterlacer;
 use crate::dv::{DvSim, DvStats};
-use crate::encoder::{encode_field_full, encode_field_yc_with_signal};
-use crate::frame::{Field, LinearFrame, RgbFrame, RgbaFrame, VideoFrame};
+use crate::encoder::{encode_field_full, encode_field_full_yiq, encode_field_yc_with_signal};
+use crate::frame::{Field, LinearFrame, RgbFrame, RgbaFrame, VideoFrame, YiqFrame};
 use crate::osd::Osd;
 use crate::params::{Connection, OsdMode, OsdParams, Params};
 use crate::rf::RfSim;
@@ -169,7 +169,7 @@ impl Pipeline {
             &resized
         };
         if InputAdjust::is_identity(&self.params.input) {
-            self.run(CameraInput::Rgb(input));
+            self.run(CameraInput::Rgb(input), None);
             return self.output();
         }
         // run が &mut self を取るので、調整器を一時的に取り出す
@@ -177,7 +177,7 @@ impl Pipeline {
         let mut adjust = std::mem::take(&mut self.adjust);
         let adjusted = adjust.process_rgb(input, &self.params.input);
         let d = t.elapsed();
-        self.run(CameraInput::Rgb(adjusted));
+        self.run(CameraInput::Rgb(adjusted), None);
         self.adjust = adjust;
         self.timings.input = d;
         self.output()
@@ -196,20 +196,28 @@ impl Pipeline {
             &resized
         };
         if InputAdjust::is_identity(&self.params.input) {
-            self.run(CameraInput::Linear(input));
+            self.run(CameraInput::Linear(input), None);
             return self.output();
         }
         let t = Instant::now();
         let mut adjust = std::mem::take(&mut self.adjust);
         let adjusted = adjust.process_linear(input, &self.params.input);
         let d = t.elapsed();
-        self.run(CameraInput::Linear(adjusted));
+        self.run(CameraInput::Linear(adjusted), None);
         self.adjust = adjust;
         self.timings.input = d;
         self.output()
     }
 
-    fn run(&mut self, src: CameraInput) -> &RgbaFrame {
+    /// YIQ テスト信号を入力し、RGB ガマットへの変換を通さずエンコーダへ渡す。
+    pub fn process_field_yiq(&mut self, input: &YiqFrame) -> &RgbaFrame {
+        assert_eq!((input.width, input.height), self.input_size());
+        let placeholder = RgbFrame::new(1, 1);
+        self.run(CameraInput::Rgb(&placeholder), Some(input));
+        self.output()
+    }
+
+    fn run(&mut self, src: CameraInput, yiq: Option<&YiqFrame>) -> &RgbaFrame {
         self.field.set_index(self.field_index);
         let p = &self.params;
         let osd = (p.osd.enabled && self.osd.update(&p.osd, self.field_index)).then_some(p.osd.mode);
@@ -219,12 +227,12 @@ impl Pipeline {
         let tc = Instant::now();
         // 撮像管カメラ (OSD の日付などはカメラの後段で焼き込まれる)
         let burn = osd == Some(OsdMode::Tape);
-        if p.camera.enabled {
+        if p.camera.enabled && yiq.is_none() {
             let cam = self.camera.process(src, &p.camera, p.seed, self.field_index);
             if burn {
                 self.video.data.copy_from_slice(&cam.data);
             }
-        } else {
+        } else if yiq.is_none() {
             match src {
                 CameraInput::Rgb(f) => self.video.copy_from_rgb(f),
                 CameraInput::Linear(f) => self.video.copy_from_linear(f),
@@ -261,7 +269,11 @@ impl Pipeline {
             } else {
                 // 帰線区間の VBI データ・試験信号も送出側で載せる
                 self.field.set_separate(false);
-                encode_field_full(input, &mut self.field, &p.encoder, &p.signal, &p.vbi, p.seed);
+                if let Some(yiq) = yiq {
+                    encode_field_full_yiq(yiq, &mut self.field, &p.encoder, &p.signal, &p.vbi, p.seed);
+                } else {
+                    encode_field_full(input, &mut self.field, &p.encoder, &p.signal, &p.vbi, p.seed);
+                }
             }
             t1 = Instant::now();
             // 放送受信: 受信時の劣化ごとテープに記録される (デッキ→テレビの RF とは独立した雑音)。

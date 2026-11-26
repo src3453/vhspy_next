@@ -54,6 +54,7 @@ public struct CompositeParams
     public uint colorKiller;
     public uint palDelayLine;
     public uint outputLinear; // 1: 出力をシーンリニア (2.2 乗) にする
+    public float vcxoOffsetHz; // 受像機の色副搬送波発振器の周波数ずれ [Hz]
 }
 
 /// ラインごとの中間結果
@@ -245,6 +246,10 @@ void vhsEncode(uint3 tid : SV_DispatchThreadID)
     var iLp = Cascade<1>.butterLowpassAt(aBw * 1e6, s.fs);
     var qLp = Cascade<1>.butterLowpassAt(bBw * 1e6, s.fs);
     int warmup = max(yLp.decaySamples(WARMUP_EPS), max(iLp.decaySamples(WARMUP_EPS), qLp.decaySamples(WARMUP_EPS)));
+    // I/Q (U/V) のフィルタの遅れに合わせ、色差は群遅延のぶん先の画素から読む (実機の Y/C 遅延の整合)
+    float yDelay = yLp.groupDelay(1e3, s.fs);
+    int iLead = int(max(round(iLp.groupDelay(1e3, s.fs) - yDelay), 0.0));
+    int qLead = int(max(round(qLp.groupDelay(1e3, s.fs) - yDelay), 0.0));
     int n0 = chunk * ENCODE_CHUNK;
     int n1 = min(n0 + ENCODE_CHUNK, s.lineSamples);
     int start = max(0, n0 - warmup);
@@ -277,12 +282,16 @@ void vhsEncode(uint3 tid : SV_DispatchThreadID)
         {
             y = lv.sync;
         }
-        else if (n >= s.activeStart && n < activeEnd)
+        else
         {
-            float3 v = video[videoRow + n].xyz;
-            y = v.x;
-            i = sv * v.y; // PAL スイッチ (NTSC は sv = 1)
-            q = v.z;
+            if (n >= s.activeStart && n < activeEnd)
+                y = video[videoRow + n].x;
+            int ni = n + iLead;
+            if (ni >= s.activeStart && ni < activeEnd)
+                i = sv * video[videoRow + ni].y; // PAL スイッチ (NTSC は sv = 1)
+            int nq = n + qLead;
+            if (nq >= s.activeStart && nq < activeEnd)
+                q = video[videoRow + nq].z;
         }
         y = yLp.process(y);
         i = iLp.process(i);
@@ -520,6 +529,8 @@ void vhsBurstLock(uint3 gtid : SV_GroupThreadID)
 
     // --- 副搬送波 PLL ---
     float k = clamp(params().burstPll, 0.0, 1.0);
+    // VCXO が 1 ラインのあいだに余分に進む位相 (1 次ループなので定常位相誤差として残る)
+    float drift = TAU * params().vcxoOffsetHz * float(s.lineSamples) / s.fs;
     if (k < 1.0)
     {
         gC[t] = measured;
@@ -529,7 +540,7 @@ void vhsBurstLock(uint3 gtid : SV_GroupThreadID)
             float phase = gC[0];
             for (int l = 1; l < count; l++)
             {
-                float pred = wrapAngle(phase + step);
+                float pred = wrapAngle(phase + step + drift);
                 phase = gB[l] >= 3.0 ? pred + k * wrapAngle(gC[l] - pred) : pred;
                 gC[l] = phase;
             }
@@ -571,6 +582,9 @@ void vhsSeparateDemod(uint3 tid : SV_DispatchThreadID)
     var bLp = aLp;
     // 輝度はノッチ (またはくし形の色の引き算)、色はバンドパス → 検波ローパスの縦続
     int warmup = max(nf.decaySamples(WARMUP_EPS), bp.decaySamples(WARMUP_EPS) + aLp.decaySamples(WARMUP_EPS));
+    // 輝度遅延線: 色の経路 (バンドパス + 検波ローパス) の遅れから輝度の経路の遅れを引いたぶん、色を前へ出す
+    float lumaDelay = useComb ? 0.0 : nf.groupDelay(1e3, s.fs);
+    int lead = int(max(round(bp.groupDelay(s.fsc, s.fs) + aLp.groupDelay(1e3, s.fs) - lumaDelay), 0.0));
     int activeEnd = s.activeEnd();
     int n0 = s.activeStart + chunk * DEMOD_CHUNK;
     int n1 = min(n0 + DEMOD_CHUNK, activeEnd);
@@ -592,9 +606,11 @@ void vhsSeparateDemod(uint3 tid : SV_DispatchThreadID)
     }
 
     int d = l * s.activeWidth - s.activeStart;
-    for (int n = start; n < n1; n++)
+    float a = 0.0;
+    float b = 0.0;
+    for (int n = start; n < n1 + lead; n++)
     {
-        float x = cur.at(n);
+        float x = cur.at(min(n, s.lineSamples - 1));
         float y;
         float c;
         if (useComb)
@@ -607,13 +623,16 @@ void vhsSeparateDemod(uint3 tid : SV_DispatchThreadID)
             y = nf.process(x);
             c = bp.process(x);
         }
-        float a = aLp.process(2.0 * c * cosT[n & 3]);
-        float b = bLp.process(2.0 * c * sinT[n & 3]);
-        if (n >= n0)
+        // ラインの終わりを越えたぶんは最後の値を保つ
+        if (n < s.lineSamples)
         {
-            luma[d + n] = y;
-            detected[d + n] = float2(a, b);
+            a = aLp.process(2.0 * c * cosT[n & 3]);
+            b = bLp.process(2.0 * c * sinT[n & 3]);
         }
+        if (n >= n0 && n < n1)
+            luma[d + n] = y;
+        if (n - lead >= n0)
+            detected[d + n - lead] = float2(a, b);
     }
 }
 

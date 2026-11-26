@@ -17,13 +17,19 @@ fn field_rate_arg(tv: &Standard) -> String {
 }
 
 pub fn ffmpeg_path() -> PathBuf {
-    std::env::var_os("VHS_FFMPEG").map(PathBuf::from).unwrap_or_else(|| "ffmpeg".into())
+    std::env::var_os("VHS_FFMPEG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| "ffmpeg".into())
 }
 
 fn ffprobe_path() -> PathBuf {
     let ff = ffmpeg_path();
     match ff.parent().filter(|p| !p.as_os_str().is_empty()) {
-        Some(dir) => dir.join(if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" }),
+        Some(dir) => dir.join(if cfg!(windows) {
+            "ffprobe.exe"
+        } else {
+            "ffprobe"
+        }),
         None => "ffprobe".into(),
     }
 }
@@ -42,7 +48,15 @@ fn command(program: &Path) -> Command {
 /// DirectShow のビデオデバイス名一覧
 pub fn list_cameras() -> Result<Vec<String>, String> {
     let out = command(&ffmpeg_path())
-        .args(["-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"])
+        .args([
+            "-hide_banner",
+            "-list_devices",
+            "true",
+            "-f",
+            "dshow",
+            "-i",
+            "dummy",
+        ])
         .output()
         .map_err(|e| format!("ffmpeg を起動できません: {e}"))?;
     let text = String::from_utf8_lossy(&out.stderr);
@@ -60,7 +74,14 @@ pub fn list_cameras() -> Result<Vec<String>, String> {
 /// 動画の長さ [秒]
 pub fn probe_duration(path: &Path) -> Option<f64> {
     let out = command(&ffprobe_path())
-        .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1"])
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=nw=1:nk=1",
+        ])
         .arg(path)
         .output()
         .ok()?;
@@ -70,8 +91,53 @@ pub fn probe_duration(path: &Path) -> Option<f64> {
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum StreamSpec {
-    Camera { device: String, width: Option<u32>, height: Option<u32>, fps: Option<u32> },
-    File { path: PathBuf, #[serde(default)] looped: bool, #[serde(default = "yes")] realtime: bool },
+    Camera {
+        device: String,
+        width: Option<u32>,
+        height: Option<u32>,
+        fps: Option<u32>,
+        #[serde(default)]
+        scaling: ScalingMethod,
+    },
+    Window {
+        title: String,
+        crop_x: u32,
+        crop_y: u32,
+        crop_width: u32,
+        crop_height: u32,
+        #[serde(default)]
+        scaling: ScalingMethod,
+    },
+    File {
+        path: PathBuf,
+        #[serde(default)]
+        looped: bool,
+        #[serde(default = "yes")]
+        realtime: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScalingMethod {
+    Nearest,
+    Bilinear,
+    Bicubic,
+    #[default]
+    Area,
+    Lanczos,
+}
+
+impl ScalingMethod {
+    fn ffmpeg_flags(self) -> &'static str {
+        match self {
+            Self::Nearest => "neighbor",
+            Self::Bilinear => "bilinear",
+            Self::Bicubic => "bicubic",
+            Self::Area => "area",
+            Self::Lanczos => "lanczos",
+        }
+    }
 }
 
 fn yes() -> bool {
@@ -93,8 +159,23 @@ impl FrameStream {
         let mut cmd = command(&ffmpeg_path());
         cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
         match spec {
-            StreamSpec::Camera { device, width, height, fps } => {
-                cmd.args(["-f", "dshow", "-rtbufsize", "64M", "-fflags", "nobuffer", "-flags", "low_delay"]);
+            StreamSpec::Camera {
+                device,
+                width,
+                height,
+                fps,
+                ..
+            } => {
+                cmd.args([
+                    "-f",
+                    "dshow",
+                    "-rtbufsize",
+                    "64M",
+                    "-fflags",
+                    "nobuffer",
+                    "-flags",
+                    "low_delay",
+                ]);
                 if let (Some(w), Some(h)) = (width, height) {
                     cmd.args(["-video_size", &format!("{w}x{h}")]);
                 }
@@ -103,7 +184,27 @@ impl FrameStream {
                 }
                 cmd.arg("-i").arg(format!("video={device}"));
             }
-            StreamSpec::File { path, looped, realtime } => {
+            StreamSpec::Window { title, .. } => {
+                #[cfg(not(windows))]
+                return Err("ウィンドウキャプチャは Windows でのみ利用できます".into());
+                #[cfg(windows)]
+                {
+                    cmd.args([
+                        "-f",
+                        "gdigrab",
+                        "-framerate",
+                        &field_rate_arg(tv),
+                        "-draw_mouse",
+                        "1",
+                    ]);
+                    cmd.arg("-i").arg(format!("title={title}"));
+                }
+            }
+            StreamSpec::File {
+                path,
+                looped,
+                realtime,
+            } => {
                 if *realtime {
                     cmd.arg("-re");
                 }
@@ -113,11 +214,41 @@ impl FrameStream {
                 cmd.arg("-i").arg(path);
             }
         }
-        let vf = format!("fps={},scale={iw}:{ih}:flags=area", field_rate_arg(tv));
-        cmd.args(["-an", "-vf", &vf, "-pix_fmt", "rgb24", "-f", "rawvideo", "-"]);
-        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let scaling = match spec {
+            StreamSpec::Camera { scaling, .. } | StreamSpec::Window { scaling, .. } => *scaling,
+            StreamSpec::File { .. } => ScalingMethod::Area,
+        };
+        let crop = match spec {
+            StreamSpec::Window {
+                crop_x,
+                crop_y,
+                crop_width,
+                crop_height,
+                ..
+            } => {
+                if *crop_width == 0 || *crop_height == 0 {
+                    return Err("クロップ幅と高さは 1 以上にしてください".into());
+                }
+                format!("crop={crop_width}:{crop_height}:{crop_x}:{crop_y},")
+            }
+            _ => String::new(),
+        };
+        let vf = format!(
+            "{}fps={},scale={iw}:{ih}:flags={}",
+            crop,
+            field_rate_arg(tv),
+            scaling.ffmpeg_flags()
+        );
+        cmd.args([
+            "-an", "-vf", &vf, "-pix_fmt", "rgb24", "-f", "rawvideo", "-",
+        ]);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
-        let mut child = cmd.spawn().map_err(|e| format!("ffmpeg を起動できません: {e}"))?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("ffmpeg を起動できません: {e}"))?;
         let mut stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
         // stderr を読み捨てないとパイプが詰まる。最後のエラーだけログに出す。
@@ -151,7 +282,11 @@ impl FrameStream {
                 }
             }
         });
-        Ok(Self { child, rx, _reader: reader })
+        Ok(Self {
+            child,
+            rx,
+            _reader: reader,
+        })
     }
 }
 
@@ -179,7 +314,16 @@ pub fn process_audio(
     let mut child = command(&ffmpeg_path())
         .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
         .arg(input)
-        .args(["-vn", "-ac", "2", "-ar", &AUDIO_RATE.to_string(), "-f", "f32le", "-"])
+        .args([
+            "-vn",
+            "-ac",
+            "2",
+            "-ar",
+            &AUDIO_RATE.to_string(),
+            "-f",
+            "f32le",
+            "-",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -195,7 +339,10 @@ pub fn process_audio(
     let mut samples = vec![0f32; CHUNK * 2];
     let mut skip = latency * 2;
     let mut written = 0u64;
-    let mut write = |out: &mut std::io::BufWriter<std::fs::File>, s: &[f32], skip: &mut usize| -> std::io::Result<()> {
+    let mut write = |out: &mut std::io::BufWriter<std::fs::File>,
+                     s: &[f32],
+                     skip: &mut usize|
+     -> std::io::Result<()> {
         let n = (*skip).min(s.len());
         *skip -= n;
         let s = &s[n..];
@@ -248,7 +395,8 @@ pub fn process_audio(
 
     let mut file = out.into_inner().map_err(|e| e.to_string())?;
     use std::io::Seek;
-    file.seek(std::io::SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(|e| e.to_string())?;
     write_wav_header(&mut file, written * 4).map_err(|e| e.to_string())?;
     Ok(true)
 }
@@ -310,12 +458,29 @@ impl Recorder {
         );
         let mut cmd = command(&ffmpeg_path());
         cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
-        cmd.args(["-f", "rawvideo", "-pix_fmt", "rgba", "-s", &format!("{ow}x{oh}")]);
+        cmd.args([
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgba",
+            "-s",
+            &format!("{ow}x{oh}"),
+        ]);
         cmd.args(["-framerate", &field_rate_arg(tv), "-i", "-"]);
         if let Some(a) = audio {
             cmd.arg("-i").arg(a.path);
             let kbps = format!("{}k", a.kbps.clamp(8, 512));
-            cmd.args(["-map", "0:v", "-map", "1:a?", "-c:a", "aac", "-b:a", &kbps, "-shortest"]);
+            cmd.args([
+                "-map",
+                "0:v",
+                "-map",
+                "1:a?",
+                "-c:a",
+                "aac",
+                "-b:a",
+                &kbps,
+                "-shortest",
+            ]);
             if a.mono {
                 cmd.args(["-ac", "1"]);
             }
@@ -325,11 +490,17 @@ impl Recorder {
             let dw = (oh * 4 / 3 + 1) & !1;
             cmd.args(["-vf", &format!("scale={dw}:{oh}:flags=bicubic,setsar=1")]);
         }
-        cmd.args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p"]);
+        cmd.args([
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
+        ]);
         cmd.arg(path);
-        cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
 
-        let mut child = cmd.spawn().map_err(|e| format!("ffmpeg を起動できません: {e}"))?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("ffmpeg を起動できません: {e}"))?;
         let mut stdin = child.stdin.take().unwrap();
         let stderr = child.stderr.take().unwrap();
         std::thread::spawn(move || {
@@ -347,11 +518,19 @@ impl Recorder {
                 }
             }
         });
-        Ok(Self { child, tx: Some(tx), writer: Some(writer), path: path.to_path_buf(), size: (ow, oh) })
+        Ok(Self {
+            child,
+            tx: Some(tx),
+            writer: Some(writer),
+            path: path.to_path_buf(),
+            size: (ow, oh),
+        })
     }
 
     pub fn push(&self, rgba: &[u8]) -> bool {
-        self.tx.as_ref().is_some_and(|tx| tx.send(rgba.to_vec()).is_ok())
+        self.tx
+            .as_ref()
+            .is_some_and(|tx| tx.send(rgba.to_vec()).is_ok())
     }
 
     pub fn finish(mut self) -> Result<(), String> {
@@ -360,7 +539,11 @@ impl Recorder {
             let _ = w.join();
         }
         let status = self.child.wait().map_err(|e| e.to_string())?;
-        if status.success() { Ok(()) } else { Err(format!("ffmpeg が異常終了しました ({status})")) }
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("ffmpeg が異常終了しました ({status})"))
+        }
     }
 }
 
@@ -392,10 +575,23 @@ mod tests {
         let params = vhs_core::Params::default();
         let mut proc = vhs_core::audio::AudioProcessor::new(&params, AUDIO_RATE);
         let latency = proc.latency();
-        let has = process_audio(&input, &wav, latency, &AtomicBool::new(false), |b| proc.process(b)).unwrap();
+        let has = process_audio(&input, &wav, latency, &AtomicBool::new(false), |b| {
+            proc.process(b)
+        })
+        .unwrap();
         assert!(has);
         let tv = params.tv();
-        let rec = Recorder::start(&out, Some(AudioTrack { path: &wav, kbps: 64, mono: true }), tv, None).unwrap();
+        let rec = Recorder::start(
+            &out,
+            Some(AudioTrack {
+                path: &wav,
+                kbps: 64,
+                mono: true,
+            }),
+            tv,
+            None,
+        )
+        .unwrap();
         let (ow, oh) = tv.image_size();
         let frame = vec![128u8; ow * oh * 4];
         for _ in 0..120 {
@@ -403,13 +599,23 @@ mod tests {
         }
         rec.finish().unwrap();
         let probe = command(&ffprobe_path())
-            .args(["-v", "error", "-show_entries", "stream=codec_type,channels,bit_rate", "-of", "compact"])
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type,channels,bit_rate",
+                "-of",
+                "compact",
+            ])
             .arg(&out)
             .output()
             .unwrap();
         let text = String::from_utf8_lossy(&probe.stdout);
         println!("{text}");
-        assert!(text.contains("codec_type=audio") && text.contains("channels=1"), "{text}");
+        assert!(
+            text.contains("codec_type=audio") && text.contains("channels=1"),
+            "{text}"
+        );
         let _ = std::fs::remove_file(&wav);
     }
 }

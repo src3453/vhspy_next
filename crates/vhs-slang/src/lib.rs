@@ -42,7 +42,7 @@ pub fn dispatch_size(kernel: &str, s: &Standard) -> (u32, u32, u32) {
     }
 }
 
-/// `CompositeParams` (shaders/composite.slang) と同じ並び。4 バイトのスカラーだけ、96 バイト
+/// `CompositeParams` (shaders/composite.slang) と同じ並び。4 バイトのスカラーだけ、100 バイト
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct CompositeParams {
@@ -70,9 +70,10 @@ pub struct CompositeParams {
     pub color_killer: u32,
     pub pal_delay_line: u32,
     pub output_linear: u32,
+    pub vcxo_offset_hz: f32,
 }
 
-const _: () = assert!(std::mem::size_of::<CompositeParams>() == 96);
+const _: () = assert!(std::mem::size_of::<CompositeParams>() == 100);
 
 impl CompositeParams {
     /// GPU 版が扱う範囲のパラメータを写す。3 次元 Y/C 分離は未対応なのでラインくし形にする
@@ -102,6 +103,7 @@ impl CompositeParams {
             color_killer: u32::from(dec.color_killer),
             pal_delay_line: u32::from(dec.pal_delay_line),
             output_linear: 0,
+            vcxo_offset_hz: dec.vcxo_offset_hz,
         }
     }
 }

@@ -172,6 +172,20 @@ pub struct VideoFrame {
     pub data: Vec<f32>,
 }
 
+/// コンポジットエンコーダへ直接渡す YIQ テスト信号。Y/I/Q は白レベルを 1 とする。
+#[derive(Clone, Debug)]
+pub struct YiqFrame {
+    pub width: usize,
+    pub height: usize,
+    pub data: Vec<[f32; 3]>,
+}
+
+impl YiqFrame {
+    pub fn new(width: usize, height: usize, color: [f32; 3]) -> Self {
+        Self { width, height, data: vec![color; width * height] }
+    }
+}
+
 impl VideoFrame {
     pub fn new(width: usize, height: usize) -> Self {
         Self { width, height, data: vec![0.0; width * height * 3] }

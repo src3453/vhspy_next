@@ -25,6 +25,7 @@ struct CompositeParams_std430_0
     @align(4) colorKiller_0 : u32,
     @align(4) palDelayLine_0 : u32,
     @align(4) outputLinear_0 : u32,
+    @align(4) vcxoOffsetHz_0 : f32,
 };
 
 @binding(0) @group(0) var<storage, read> paramBuffer_0 : array<CompositeParams_std430_0>;
@@ -209,12 +210,13 @@ struct CompositeParams_0
      colorKiller_0 : u32,
      palDelayLine_0 : u32,
      outputLinear_0 : u32,
+     vcxoOffsetHz_0 : f32,
 };
 
 fn params_0() -> CompositeParams_0
 {
     var _S8 : CompositeParams_std430_0 = paramBuffer_0[i32(0)];
-    var _S9 : CompositeParams_0 = CompositeParams_0( _S8.standard_0, _S8.parity_0, _S8.frameNo_0, _S8.fieldIndex_0, _S8.srcWidth_0, _S8.srcHeight_0, _S8.inputLinear_0, _S8.ycMode_0, _S8.lumaBwMhz_0, _S8.iBwMhz_0, _S8.qBwMhz_0, _S8.uvBwMhz_0, _S8.chromaGain_0, _S8.chromaBwMhz_0, _S8.hPll_0, _S8.burstPll_0, _S8.contrast_0, _S8.brightness_0, _S8.saturation_0, _S8.hueDeg_0, _S8.acc_0, _S8.colorKiller_0, _S8.palDelayLine_0, _S8.outputLinear_0 );
+    var _S9 : CompositeParams_0 = CompositeParams_0( _S8.standard_0, _S8.parity_0, _S8.frameNo_0, _S8.fieldIndex_0, _S8.srcWidth_0, _S8.srcHeight_0, _S8.inputLinear_0, _S8.ycMode_0, _S8.lumaBwMhz_0, _S8.iBwMhz_0, _S8.qBwMhz_0, _S8.uvBwMhz_0, _S8.chromaGain_0, _S8.chromaBwMhz_0, _S8.hPll_0, _S8.burstPll_0, _S8.contrast_0, _S8.brightness_0, _S8.saturation_0, _S8.hueDeg_0, _S8.acc_0, _S8.colorKiller_0, _S8.palDelayLine_0, _S8.outputLinear_0, _S8.vcxoOffsetHz_0 );
     return _S9;
 }
 
@@ -1287,6 +1289,7 @@ fn vhsBurstLock(@builtin(local_invocation_id) gtid_2 : vec3<u32>)
         measured_0 = mu_0;
     }
     var k_6 : f32 = clamp(params_0().burstPll_0, 0.0f, 1.0f);
+    var drift_0 : f32 = 6.28318548202514648f * params_0().vcxoOffsetHz_0 * f32(s_10.lineSamples_0) / s_10.fs_4;
     if((k_6 < 1.0f))
     {
         gC_0[t_1] = measured_0;
@@ -1304,7 +1307,7 @@ fn vhsBurstLock(@builtin(local_invocation_id) gtid_2 : vec3<u32>)
                 {
                     break;
                 }
-                var pred_0 : f32 = wrapAngle_0(gain_1 + step_0);
+                var pred_0 : f32 = wrapAngle_0(gain_1 + step_0 + drift_0);
                 if(((gB_0[l_3]) >= 3.0f))
                 {
                     gain_1 = pred_0 + k_6 * wrapAngle_0(gC_0[l_3] - pred_0);

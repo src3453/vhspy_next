@@ -9,7 +9,7 @@
 //!   バーストも V 成分ごと反転するので、-U 軸から ±45° (135° / 225°) に振れる (スウィンギングバースト)
 
 use crate::filter::Cascade;
-use crate::frame::{Field, VideoFrame};
+use crate::frame::{Field, VideoFrame, YiqFrame};
 use crate::params::{EncoderParams, SignalParams, VbiParams};
 use crate::raster;
 use crate::rng::Rng;
@@ -49,7 +49,21 @@ pub fn encode_field_with_signal(
     signal: &SignalParams,
     seed: u64,
 ) {
-    encode(frame, field, p, signal, &NO_VBI, seed, false);
+    encode(frame, None, field, p, signal, &NO_VBI, seed, false);
+}
+
+/// YIQ の電気信号を RGB 変換・クリップせずコンポジットへ符号化する。
+pub fn encode_field_full_yiq(
+    frame: &YiqFrame,
+    field: &mut Field,
+    p: &EncoderParams,
+    signal: &SignalParams,
+    vbi: &VbiParams,
+    seed: u64,
+) {
+    let rgb_placeholder = VideoFrame { width: 0, height: 0, data: Vec::new() };
+    let split = field.separate;
+    encode(&rgb_placeholder, Some(frame), field, p, signal, vbi, seed, split);
 }
 
 /// 信号要素ごとの劣化と VBI のデータ・試験信号を加えて書く。
@@ -63,7 +77,7 @@ pub fn encode_field_full(
     seed: u64,
 ) {
     let split = field.separate;
-    encode(frame, field, p, signal, vbi, seed, split);
+    encode(frame, None, field, p, signal, vbi, seed, split);
 }
 
 /// `field.separate` なら Y/C を分けたまま (S 映像) 書く: `data` = Y (同期付き)、`chroma` = C (バースト付き)。
@@ -81,11 +95,12 @@ pub fn encode_field_yc_with_signal(
     seed: u64,
 ) {
     let split = field.separate;
-    encode(frame, field, p, signal, &NO_VBI, seed, split);
+    encode(frame, None, field, p, signal, &NO_VBI, seed, split);
 }
 
 fn encode(
     frame: &VideoFrame,
+    yiq_frame: Option<&YiqFrame>,
     field: &mut Field,
     p: &EncoderParams,
     signal: &SignalParams,
@@ -95,7 +110,7 @@ fn encode(
 ) {
     let s = field.std;
     let (aw, fl) = s.image_size();
-    assert_eq!((frame.width, frame.height), (aw, fl));
+    assert_eq!((yiq_frame.map_or(frame.width, |f| f.width), yiq_frame.map_or(frame.height, |f| f.height)), (aw, fl));
     let pal = s.is_pal();
 
     let y_lp = Cascade::butter_lowpass_at(4, p.luma_bw_mhz * 1e6, s.fs);
@@ -103,6 +118,13 @@ fn encode(
     let (a_bw, b_bw) = if pal { (p.uv_bw_mhz, p.uv_bw_mhz) } else { (p.i_bw_mhz, p.q_bw_mhz) };
     let i_lp = Cascade::butter_lowpass_at(2, a_bw * 1e6, s.fs);
     let q_lp = Cascade::butter_lowpass_at(2, b_bw * 1e6, s.fs);
+    // 実機のエンコーダは帯域の狭い I/Q (U/V) のフィルタの遅れに合わせて Y (と I) を遅らせ、3 つを揃える。
+    // ここでは同じことを、色差を群遅延のぶん先の画素から読むことで行う
+    let iq_lead = |lp: &Cascade| {
+        let d = lp.group_delay(1e3, s.fs) - y_lp.group_delay(1e3, s.fs);
+        d.round().max(0.0) as usize
+    };
+    let (i_lead, q_lead) = (iq_lead(&i_lp), iq_lead(&q_lp));
     let (parity, frame_no, field_index) = (field.parity, field.frame, field.index);
     let lv = s.ire;
     let span = lv.span();
@@ -125,7 +147,8 @@ fn encode(
         sin_iq[k] = a.sin();
     }
     let cg = p.chroma_gain;
-    let burst_half = lv.burst * std::f32::consts::FRAC_1_SQRT_2;
+    let burst_amp = lv.burst * (p.burst_level_pct / 100.0).max(0.0);
+    let burst_half = burst_amp * std::f32::consts::FRAC_1_SQRT_2;
     let hs = &signal.horizontal_sync;
     let hs_attenuation = (hs.attenuation_pct / 100.0).clamp(0.0, 1.0);
     let burst_signal = &signal.color_burst;
@@ -156,8 +179,8 @@ fn encode(
         let source = image_line.map_or(0.0, |a| a as f32 - vertical_offset);
         let source_lo = source.floor() as isize;
         let source_frac = source - source_lo as f32;
-        let source_a = field_row(frame, source_lo, parity);
-        let source_b = field_row(frame, source_lo + 1, parity);
+        let source_a = yiq_frame.is_none().then(|| field_row(frame, source_lo, parity)).flatten();
+        let source_b = yiq_frame.is_none().then(|| field_row(frame, source_lo + 1, parity)).flatten();
         let (mut y_lp, mut i_lp, mut q_lp) = (y_lp, i_lp, q_lp);
 
         let mut hs_rng = Rng::derive(seed, field_index, l as u64, STREAM_HSYNC);
@@ -178,6 +201,37 @@ fn encode(
         let has_vbi = info.video != raster::Video::Full
             && vbi::render_line(s, &info, vbi_p, base, &mut vbi_y[..ls], &mut vbi_c[..ls]);
 
+        // 有効映像の画素 n の [Y, I, Q] (映像のない位置なら None)
+        let video_yiq = |n: usize| -> Option<[f32; 3]> {
+            if !video.is_some_and(|(a, b)| (a..b).contains(&n)) {
+                return None;
+            }
+            let a = image_line?;
+            let px = n - s.active_start;
+            if let Some(yiq) = yiq_frame {
+                let yiq = yiq.data[(2 * a + parity as usize) * aw + px];
+                return Some([lv.black + span * yiq[0], span * yiq[1], span * yiq[2]]);
+            }
+            let px = px * 3;
+            let (r, g, b) = if shifted {
+                let sample = |c: usize| {
+                    let a = source_a.map_or(0.0, |line| line[px + c]);
+                    let b = source_b.map_or(0.0, |line| line[px + c]);
+                    a + (b - a) * source_frac
+                };
+                (sample(0), sample(1), sample(2))
+            } else {
+                let row = &frame.data[(2 * a + parity as usize) * aw * 3..];
+                (row[px], row[px + 1], row[px + 2])
+            };
+            let y = lv.black + span * (0.299 * r + 0.587 * g + 0.114 * b);
+            Some(if pal {
+                [y, sv * span * (0.615 * r - 0.515 * g - 0.100 * b), span * (-0.147 * r - 0.289 * g + 0.436 * b)]
+            } else {
+                [y, span * (0.5959 * r - 0.2746 * g - 0.3213 * b), span * (0.2115 * r - 0.5227 * g + 0.3112 * b)]
+            })
+        };
+
         for (n, o) in out.iter_mut().enumerate() {
             // NTSC: (i, q) = (I, Q)、PAL: (i, q) = (±V, U)。どちらも i は cos 側、q は sin 側に載る
             let (mut y, mut i, mut q) = (lv.blank, 0.0, 0.0);
@@ -194,29 +248,11 @@ fn encode(
             if h_cov > 0.0 || v_cov > 0.0 {
                 y += (lv.sync - lv.blank) * (h_cov * (1.0 - hs_attenuation) + v_cov * (1.0 - vertical_attenuation));
             } else if in_video {
-                y = lv.black;
-                if let Some(a) = image_line {
-                    let px = (n - s.active_start) * 3;
-                    let (r, g, b) = if shifted {
-                        let sample = |c: usize| {
-                            let a = source_a.map_or(0.0, |line| line[px + c]);
-                            let b = source_b.map_or(0.0, |line| line[px + c]);
-                            a + (b - a) * source_frac
-                        };
-                        (sample(0), sample(1), sample(2))
-                    } else {
-                        let row = &frame.data[(2 * a + parity as usize) * aw * 3..];
-                        (row[px], row[px + 1], row[px + 2])
-                    };
-                    y = lv.black + span * (0.299 * r + 0.587 * g + 0.114 * b);
-                    if pal {
-                        i = sv * span * (0.615 * r - 0.515 * g - 0.100 * b);
-                        q = span * (-0.147 * r - 0.289 * g + 0.436 * b);
-                    } else {
-                        i = span * (0.5959 * r - 0.2746 * g - 0.3213 * b);
-                        q = span * (0.2115 * r - 0.5227 * g + 0.3112 * b);
-                    }
-                }
+                y = video_yiq(n).map_or(lv.black, |v| v[0]);
+            }
+            if h_cov == 0.0 && v_cov == 0.0 {
+                i = video_yiq(n + i_lead).map_or(0.0, |v| v[1]);
+                q = video_yiq(n + q_lead).map_or(0.0, |v| v[2]);
             }
             if has_vbi && !in_video {
                 y += vbi_y[n];
@@ -246,14 +282,14 @@ fn encode(
                         // -U 軸から V 側へ ±45°
                         c += burst_half * (sv * COS4[k] - SIN4[k]);
                     } else {
-                        c -= lv.burst * SIN4[k];
+                        c -= burst_amp * SIN4[k];
                     }
                 } else {
                     let (burst_i, burst_q) = if pal {
                         // -U 軸から V 側へ ±45°
                         (sv * burst_half, -burst_half)
                     } else {
-                        (0.0, -lv.burst)
+                        (0.0, -burst_amp)
                     };
                     let burst_i_rot = burst_i * burst_cos + burst_q * burst_sin;
                     let burst_q_rot = burst_q * burst_cos - burst_i * burst_sin;

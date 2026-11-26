@@ -9,7 +9,7 @@
   import { scopeView } from "#lib/scopeView.svelte.ts";
 
   type Standard = "ntsc" | "pal";
-  let { standard = "ntsc" as Standard } = $props();
+  let { standard = "ntsc" as Standard, open = false } = $props();
 
   // ---- 表示設定 (localStorage に保存) ----
   type Span = "1" | "2" | "3" | "9" | "22" | "v";
@@ -17,7 +17,6 @@
   /** analog = CRT ビーム (残光・輝度・フォーカス)、dso = デジタルオシロ風 (最新フィールドの細い線だけ) */
   type Mode = "analog" | "dso";
   type Saved = {
-    open: boolean;
     mode: Mode;
     /** デコード画面に、見ているラインを重ねて表示する */
     overlay: boolean;
@@ -35,7 +34,6 @@
   const STORE_KEY = "vhs-oscilloscope";
   function load(): Saved {
     const d: Saved = {
-      open: false,
       mode: "analog",
       overlay: true,
       line: { ntsc: 21, pal: 23 },
@@ -54,7 +52,6 @@
     }
   }
   const saved = load();
-  let open = $state(saved.open);
   let mode = $state<Mode>(saved.mode === "dso" ? "dso" : "analog");
   let overlay = $state(saved.overlay !== false);
   let lines = $state(saved.line);
@@ -66,7 +63,7 @@
   let focus = $state(saved.focus);
   let dsoWidth = $state(saved.dsoWidth);
   $effect(() => {
-    const s = JSON.stringify({ open, mode, overlay, line: lines, span, filter, persistence, fps, intensity, focus, dsoWidth });
+    const s = JSON.stringify({ mode, overlay, line: lines, span, filter, persistence, fps, intensity, focus, dsoWidth });
     try {
       localStorage.setItem(STORE_KEY, s);
     } catch {}
@@ -369,7 +366,7 @@
   $effect(() => {
     const active = open;
     untrack(() => {
-      invoke("set_scope_active", { active }).catch(() => {});
+      invoke("set_scope_active", { active, who: 1 }).catch(() => {});
       if (timer) {
         clearTimeout(timer);
         timer = null;
@@ -402,7 +399,7 @@
 
   onDestroy(() => {
     if (timer) clearTimeout(timer);
-    invoke("set_scope_active", { active: false }).catch(() => {});
+    invoke("set_scope_active", { active: false, who: 1 }).catch(() => {});
   });
 
   // 方式・ライン・範囲・フィルタを変えたら蛍光面を消す
@@ -624,11 +621,8 @@
   }
 </script>
 
-<section class="osc" class:open>
+<section class="osc" class:open hidden={!open}>
   <header>
-    <button class="toggle" onclick={() => (open = !open)} aria-expanded={open}>
-      <span class="chev">{open ? "▾" : "▸"}</span> オシロスコープ (コンポジット)
-    </button>
     {#if open}
       <label title="表示を始めるライン番号 (ホイールでも変えられる。Shift で 10 ライン)">
         ライン
@@ -764,18 +758,6 @@
     gap: 10px;
     padding: 4px 8px;
     color: var(--muted);
-  }
-  .toggle {
-    background: none;
-    border: none;
-    padding: 2px 4px;
-    color: var(--text);
-    font-weight: 600;
-    cursor: pointer;
-  }
-  .chev {
-    display: inline-block;
-    width: 1em;
   }
   label {
     display: flex;

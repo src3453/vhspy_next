@@ -91,6 +91,24 @@ impl Biquad {
         )
     }
 
+    /// 周波数 f での群遅延 [サンプル]。伝達関数の零点の真上 (バンドパスの直流など) では意味を持たない
+    pub fn group_delay(&self, f: f32, fs: f32) -> f32 {
+        // 多項式 Σ p_n z^-n の群遅延 = Re(Σ n p_n e^{-jωn} / Σ p_n e^{-jωn})
+        let poly = |p: [f32; 3]| {
+            let w = 2.0 * PI * f / fs;
+            let (mut nr, mut ni, mut dr, mut di) = (0f32, 0f32, 0f32, 0f32);
+            for (n, &c) in p.iter().enumerate() {
+                let (s, co) = (w * n as f32).sin_cos();
+                dr += c * co;
+                di -= c * s;
+                nr += n as f32 * c * co;
+                ni -= n as f32 * c * s;
+            }
+            (nr * dr + ni * di) / (dr * dr + di * di).max(1e-20)
+        };
+        poly([self.b0, self.b1, self.b2]) - poly([1.0, self.a1, self.a2])
+    }
+
     #[inline(always)]
     pub fn process(&mut self, x: f32) -> f32 {
         let y = self.b0 * x + self.z1;
@@ -164,6 +182,11 @@ impl Cascade {
         &self.s[..self.n]
     }
 
+    /// 周波数 f での群遅延 [サンプル] (各段の和)
+    pub fn group_delay(&self, f: f32, fs: f32) -> f32 {
+        self.sections().iter().map(|b| b.group_delay(f, fs)).sum()
+    }
+
     pub fn process_slice(&mut self, buf: &mut [f32]) {
         for v in buf {
             *v = self.process(*v);
@@ -177,17 +200,56 @@ impl Cascade {
     }
 }
 
-/// 線形補間による小数サンプル遅延。範囲外は `fill`。
+/// 小数サンプル遅延の補間の片側タップ数 (Lanczos 窓の半径)
+const SHIFT_TAPS: isize = 4;
+
+/// 小数サンプル遅延 (`dst[n] = src(n - shift)`)。範囲外は `fill`。
+/// Lanczos (a = 4) 窓付き sinc で補間する。線形補間だと半サンプルずらしたとき 4fsc の副搬送波 (fs/4) が
+/// cos 45° ≒ 0.707 倍に落ち、バーストも色も薄くなる (ACC なしで彩度が下がる)。整数ずらしならそのままコピーになる
 pub fn fractional_shift(src: &[f32], dst: &mut [f32], shift: f32, fill: f32) {
     let len = src.len() as isize;
     let i0 = shift.floor();
     let frac = shift - i0;
     let i0 = i0 as isize;
+    let get = |k: isize| if (0..len).contains(&k) { src[k as usize] } else { fill };
+    if frac == 0.0 {
+        for (n, d) in dst.iter_mut().enumerate() {
+            *d = get(n as isize - i0);
+        }
+        return;
+    }
+    // 出力 n の位置は src の (n - i0) - frac。src[n - i0 - j] (j = 1 - a ..= a) の重み w[j] = L(frac - j)
+    let lanczos = |t: f32| {
+        let a = SHIFT_TAPS as f32;
+        if t.abs() < 1e-6 {
+            1.0
+        } else if t.abs() >= a {
+            0.0
+        } else {
+            let pt = std::f32::consts::PI * t;
+            a * pt.sin() * (pt / a).sin() / (pt * pt)
+        }
+    };
+    let mut w = [0f32; 2 * SHIFT_TAPS as usize];
+    for (i, wi) in w.iter_mut().enumerate() {
+        *wi = lanczos(frac - (i as isize + 1 - SHIFT_TAPS) as f32);
+    }
+    let sum: f32 = w.iter().sum();
+    w.iter_mut().for_each(|wi| *wi /= sum);
+    let inner = (i0 + SHIFT_TAPS)..(len + i0 - SHIFT_TAPS);
     for (n, d) in dst.iter_mut().enumerate() {
         let k = n as isize - i0;
-        let a = if (0..len).contains(&k) { src[k as usize] } else { fill };
-        let b = if (0..len).contains(&(k - 1)) { src[(k - 1) as usize] } else { fill };
-        *d = a + (b - a) * frac;
+        let mut acc = 0.0;
+        if inner.contains(&(n as isize)) {
+            for (i, wi) in w.iter().enumerate() {
+                acc += wi * src[(k - (i as isize + 1 - SHIFT_TAPS)) as usize];
+            }
+        } else {
+            for (i, wi) in w.iter().enumerate() {
+                acc += wi * get(k - (i as isize + 1 - SHIFT_TAPS));
+            }
+        }
+        *d = acc;
     }
 }
 
@@ -196,6 +258,26 @@ mod tests {
     use super::*;
     use crate::timing::NTSC;
     const FS: f32 = NTSC.fs;
+
+    /// 半サンプルずらしても 4fsc の副搬送波 (fs/4) の振幅がほぼ保たれ、整数ずらしはそのままコピーになる
+    #[test]
+    fn fractional_shift_keeps_subcarrier() {
+        let src: Vec<f32> = (0..400).map(|n| (PI / 2.0 * n as f32 + 0.3).sin()).collect();
+        let mut dst = vec![0f32; 400];
+        for shift in [0.5f32, 0.25, -0.5, 1.75] {
+            fractional_shift(&src, &mut dst, shift, 0.0);
+            // fs/4 なので隣り合う 2 サンプルが直交成分になる: 振幅 = sqrt(x[n]² + x[n+1]²)
+            for k in 100..300 {
+                let amp = (dst[k] * dst[k] + dst[k + 1] * dst[k + 1]).sqrt();
+                assert!((amp - 1.0).abs() < 0.03, "shift {shift}: {amp} at {k}");
+            }
+            let want = (PI / 2.0 * (200.0 - shift) + 0.3).sin();
+            assert!((dst[200] - want).abs() < 0.03, "shift {shift}: {} vs {want}", dst[200]);
+        }
+        fractional_shift(&src, &mut dst, 3.0, -1.0);
+        assert_eq!(&dst[3..], &src[..397]);
+        assert!(dst[..3].iter().all(|&v| v == -1.0));
+    }
 
     fn gain_at(mut f: Cascade, freq: f32) -> f32 {
         let n = 20000;

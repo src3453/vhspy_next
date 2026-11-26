@@ -5,6 +5,7 @@
 //! リニア (ノーマル) トラック:
 //!   モノラル化 → 録音レベル (磁気飽和。映像と同じ磁性体モデル `tape.magnetic_model`) → 帯域制限 (低域カット・高域カット・ヘッドバンプ)
 //!   → ワウフラッタ (変調遅延線によるピッチの揺れ) → テープヒス → ドロップアウト (こもり・レベル低下)
+//!   → 再生ヘッドの損失 (テープ速度・スペーシング・ギャップ。SP 用の再生 EQ で補いきれないぶん、[`crate::tape::head`])
 //! Hi-Fi トラック:
 //!   ステレオ・広帯域 → ワウフラッタ (弱め) → コンパンダによるノイズの浮き沈み
 //!   → ヘッド切替バズ (59.94 Hz の周期的な欠落とスパイク。トラッキングずれで悪化) → FM 欠落
@@ -14,10 +15,42 @@
 use crate::filter::{Biquad, Cascade};
 use crate::params::{AudioMode, AudioParams, Params};
 use crate::rng::Rng;
+use crate::tape::head::{Fir, design_fir, playback_loss};
 use crate::tape::magnetic::MagneticTransfer;
+use crate::timing::TvStandard;
 use std::f32::consts::TAU;
 
 const DELAY_LEN: usize = 1 << 15;
+/// 再生ヘッドの損失の FIR の長さ
+const HEAD_TAPS: usize = 255;
+/// 再生 EQ が想定している音声ヘッドとテープの間隔 [m]
+const NOMINAL_SPACING: f32 = 0.2e-6;
+
+/// リニアトラックの SP のテープ速度 [m/s]
+fn sp_speed(standard: TvStandard) -> f32 {
+    match standard {
+        TvStandard::Ntsc => 33.35e-3,
+        TvStandard::Pal => 23.39e-3,
+    }
+}
+
+/// 再生ヘッドの損失のうち、SP 用の再生 EQ で補われないぶん (FIR)。補うべきものがなければ None。
+/// 厚み損失は速度ごとに EQ の時定数で補われるので含めない (式 (13) の δ = 0)
+fn head_loss_fir(p: &AudioParams, standard: TvStandard, fs: f32) -> Option<Fir> {
+    let extra = p.head_spacing_um.max(0.0) * 1e-6;
+    let ratio = p.tape_speed.clamp(0.05, 4.0);
+    if extra <= 0.0 && (ratio - 1.0).abs() < 1e-4 {
+        return None;
+    }
+    let v_ref = sp_speed(standard);
+    let v = v_ref * ratio;
+    let gap = p.head_gap_um.max(0.0) * 1e-6;
+    let gain = |f: f32| {
+        let eq = playback_loss(f, v_ref, NOMINAL_SPACING, gap, 0.0);
+        playback_loss(f, v, NOMINAL_SPACING + extra, gap, 0.0) / eq.max(0.05)
+    };
+    Some(Fir::new(design_fir(HEAD_TAPS, fs, gain)))
+}
 
 fn db(v: f32) -> f32 {
     if v <= -89.9 { 0.0 } else { 10f32.powf(v / 20.0) }
@@ -34,6 +67,8 @@ struct Channel {
     adc_pre: Cascade,
     adc_post: Cascade,
     held: f32,
+    /// 再生ヘッドの損失 (リニアトラックで速度・スペーシングが SP 標準と違うとき)
+    head: Option<Fir>,
 }
 
 pub struct AudioProcessor {
@@ -48,6 +83,8 @@ pub struct AudioProcessor {
     t: u64,
     write: usize,
     base_delay: f32,
+    /// 再生ヘッドの損失の FIR の遅れ [サンプル]
+    head_delay: f32,
     wow_amp: f32,
     flutter_amp: [f32; 3],
     flutter_phase: [f32; 3],
@@ -97,7 +134,9 @@ impl AudioProcessor {
             adc_pre,
             adc_post,
             held: 0.0,
+            head: if linear { head_loss_fir(&p, params.standard, fs) } else { None },
         };
+        let head_delay = chan.head.as_ref().map_or(0, Fir::delay) as f32;
 
         // ワウ (≒0.6 Hz) とフラッタ (キャプスタン・ピンチローラ由来の数 Hz〜十数 Hz) の遅延振幅
         // 速度偏差 pct [%] の正弦波 → 遅延振幅 A = pct / 100 / (2π f)
@@ -120,6 +159,7 @@ impl AudioProcessor {
             t: 0,
             write: 0,
             base_delay,
+            head_delay,
             wow_amp,
             flutter_amp: fl_amp,
             flutter_phase,
@@ -133,14 +173,14 @@ impl AudioProcessor {
             agc_gain: 1.0,
             comp_env: 0.0,
             hold_phase: 1.0,
-            mag: MagneticTransfer::new(params.tape.magnetic_model, 1.0),
+            mag: MagneticTransfer::audio(params.tape.magnetic_model, params.tape.magnetic_media, p.bias_level),
             p,
         }
     }
 
     /// ワウフラッタの遅延線による遅れ [サンプル]。書き出し時に頭を詰めるのに使う
     pub fn latency(&self) -> usize {
-        self.base_delay.round() as usize
+        (self.base_delay + self.head_delay).round() as usize
     }
 
     /// インターリーブのステレオ f32 (−1..1) をその場で処理する
@@ -149,7 +189,7 @@ impl AudioProcessor {
         let fs = self.fs;
         let linear = p.mode == AudioMode::Linear;
         let drive = 0.5 * db(p.drive_db).max(1e-3);
-        let mag = self.mag;
+        let mag = self.mag.clone();
         let drive_norm = 1.0 / mag.transfer(drive).max(1e-3);
         let hiss = if linear { db(p.hiss_db) } else { db(p.hiss_db - 25.0) };
         // 帯域制限した白色雑音の rms を戻す係数
@@ -256,6 +296,10 @@ impl AudioProcessor {
                 if hiss > 0.0 {
                     y += ch.hiss_lp.process(self.rng.normal()) * hiss_norm * noise_mod;
                 }
+                // 再生ヘッド: テープから出る信号 (ヒスを含む) が速度・スペーシング・ギャップで削られる
+                if let Some(head) = ch.head.as_mut() {
+                    y = head.process(y);
+                }
                 y += hum_v;
                 *o = y;
             }
@@ -355,6 +399,33 @@ mod tests {
         let (a, b) = (rms(&lo[20000..]), rms(&hi[20000..]));
         assert!(a > 0.15, "1 kHz should pass: {a}");
         assert!(b < 0.03, "16 kHz should be cut: {b}");
+    }
+
+    /// SP 用の EQ のまま 3 倍モードにすると、スペーシングとギャップの損失で高域が落ちる (低域はほぼそのまま)。
+    /// SP の標準状態では損失の FIR を掛けない
+    #[test]
+    fn slower_tape_loses_treble() {
+        let mut p = Params::default();
+        p.audio.dropout_rate = 0.0;
+        p.audio.hiss_db = -90.0;
+        p.audio.wow_pct = 0.0;
+        p.audio.flutter_pct = 0.0;
+        assert!(AudioProcessor::new(&p, 48000).ch[0].head.is_none());
+        let level = |p: &Params, f: f32| {
+            let mut v = sine(48000.0, f, 48000, 0.2);
+            AudioProcessor::new(p, 48000).process(&mut v);
+            rms(&v[20000..])
+        };
+        let (sp_lo, sp_hi) = (level(&p, 300.0), level(&p, 6000.0));
+        p.audio.tape_speed = 1.0 / 3.0;
+        let (ep_lo, ep_hi) = (level(&p, 300.0), level(&p, 6000.0));
+        assert!((ep_lo / sp_lo - 1.0).abs() < 0.05, "300 Hz: {sp_lo} -> {ep_lo}");
+        let drop_db = 20.0 * (sp_hi / ep_hi).log10();
+        assert!(drop_db > 6.0 && drop_db < 20.0, "6 kHz drop {drop_db} dB");
+        // 余分なスペーシングでも高域が落ちる
+        p.audio.tape_speed = 1.0;
+        p.audio.head_spacing_um = 0.5;
+        assert!(level(&p, 6000.0) < 0.7 * sp_hi);
     }
 
     #[test]

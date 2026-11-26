@@ -37,6 +37,7 @@ struct CompositeParams_0
     uint colorKiller_0;
     uint palDelayLine_0;
     uint outputLinear_0;
+    float vcxoOffsetHz_0;
 };
 
 StructuredBuffer<CompositeParams_0 > paramBuffer : register(t0);
@@ -620,6 +621,7 @@ void vhsBurstLock(uint3 gtid_0 : SV_GroupThreadID)
         measured_0 = mu_0;
     }
     float k_3 = clamp(params_0().burstPll_0, 0.0f, 1.0f);
+    float drift_0 = 6.28318548202514648f * params_0().vcxoOffsetHz_0 * float(s_6.lineSamples_0) / s_6.fs_0;
     if(k_3 < 1.0f)
     {
         gC[t_0] = measured_0;
@@ -637,7 +639,7 @@ void vhsBurstLock(uint3 gtid_0 : SV_GroupThreadID)
                 {
                     break;
                 }
-                float pred_0 = wrapAngle_0(gain_1 + step_0);
+                float pred_0 = wrapAngle_0(gain_1 + step_0 + drift_0);
                 if((gB[l_1]) >= 3.0f)
                 {
                     gain_1 = pred_0 + k_3 * wrapAngle_0(gC[l_1] - pred_0);

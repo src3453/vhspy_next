@@ -31,8 +31,15 @@ impl Pixels {
         match self {
             Pixels::Rgb(f) if (f.width, f.height) == (w, h) => self.clone(),
             Pixels::Rgb(f) => {
-                let img = image::RgbImage::from_raw(f.width as u32, f.height as u32, f.data.clone()).unwrap();
-                let img = image::imageops::resize(&img, w as u32, h as u32, image::imageops::FilterType::CatmullRom);
+                let img =
+                    image::RgbImage::from_raw(f.width as u32, f.height as u32, f.data.clone())
+                        .unwrap();
+                let img = image::imageops::resize(
+                    &img,
+                    w as u32,
+                    h as u32,
+                    image::imageops::FilterType::CatmullRom,
+                );
                 Pixels::Rgb(RgbFrame::from_raw(w, h, img.into_raw()).unwrap())
             }
             // 光量を保つリサイズ (小さな光源が縮小で消えない)
@@ -60,10 +67,12 @@ impl Pixels {
         let (w, h) = self.size();
         match self {
             _ if (kx, ky) == (1, 1) => self.clone(),
-            Pixels::Rgb(f) => Pixels::Rgb(RgbFrame::from_raw(w * kx, h * ky, rep(&f.data, (w, h), kx, ky)).unwrap()),
-            Pixels::Linear(f) => {
-                Pixels::Linear(LinearFrame::from_raw(w * kx, h * ky, rep(&f.data, (w, h), kx, ky)).unwrap())
-            }
+            Pixels::Rgb(f) => Pixels::Rgb(
+                RgbFrame::from_raw(w * kx, h * ky, rep(&f.data, (w, h), kx, ky)).unwrap(),
+            ),
+            Pixels::Linear(f) => Pixels::Linear(
+                LinearFrame::from_raw(w * kx, h * ky, rep(&f.data, (w, h), kx, ky)).unwrap(),
+            ),
         }
     }
 }
@@ -149,7 +158,11 @@ impl Still {
     /// 1 フィールドぶんの入力を作る。`dt` はフィールドの時間 [s] (パンを進める)
     pub fn render(&mut self, p: &ImageParams, tv: &Standard, dt: f32) -> StillFrame<'_> {
         let frame = tv.image_size();
-        let key = ScaleKey { fit: p.fit, zoom: p.zoom.clamp(1.0, MAX_ZOOM), frame };
+        let key = ScaleKey {
+            fit: p.fit,
+            zoom: p.zoom.clamp(1.0, MAX_ZOOM),
+            frame,
+        };
         if self.scaled.as_ref().is_none_or(|(k, _)| *k != key) {
             let scaled = if p.fit == ImageFit::Pixel {
                 let (kx, ky) = pixel_factors(self.original.size(), frame);
@@ -205,7 +218,14 @@ impl Still {
                 if (self.out_rgb.width, self.out_rgb.height) != frame {
                     self.out_rgb = RgbFrame::new(frame.0, frame.1);
                 }
-                place(&src.data, (sw, sh), &mut self.out_rgb.data, frame, origin, 1.0);
+                place(
+                    &src.data,
+                    (sw, sh),
+                    &mut self.out_rgb.data,
+                    frame,
+                    origin,
+                    1.0,
+                );
                 StillFrame::Rgb(&self.out_rgb)
             }
             Pixels::Linear(src) => {
@@ -213,7 +233,14 @@ impl Still {
                     self.out_linear = LinearFrame::new(frame.0, frame.1);
                 }
                 let gain = 2f32.powf(p.exposure_ev);
-                place(&src.data, (sw, sh), &mut self.out_linear.data, frame, origin, gain);
+                place(
+                    &src.data,
+                    (sw, sh),
+                    &mut self.out_linear.data,
+                    frame,
+                    origin,
+                    gain,
+                );
                 StillFrame::Linear(&self.out_linear)
             }
         }
@@ -247,7 +274,14 @@ impl Sample for f32 {
 }
 
 /// `src` (RGB) を左上が `origin` に来るように `dst` へ置く (はみ出しは黒、端数はバイリニア補間)。`gain` を掛ける
-fn place<T: Sample>(src: &[T], (sw, sh): (usize, usize), dst: &mut [T], (dw, dh): (usize, usize), origin: [f32; 2], gain: f32) {
+fn place<T: Sample>(
+    src: &[T],
+    (sw, sh): (usize, usize),
+    dst: &mut [T],
+    (dw, dh): (usize, usize),
+    origin: [f32; 2],
+    gain: f32,
+) {
     let (ox, oy) = (origin[0], origin[1]);
     // 整数位置で倍率 1 なら行ごとにコピーする (止めている引き伸ばし表示は元と同じ画素になる)
     if ox.fract() == 0.0 && oy.fract() == 0.0 && gain == 1.0 {
@@ -306,7 +340,13 @@ mod tests {
     #[test]
     fn pixel_fit_is_integer_and_phase_aligned() {
         let (w, h) = (640u32, 200u32);
-        let img = image::RgbImage::from_fn(w, h, |x, _| if x % 4 < 2 { image::Rgb([255; 3]) } else { image::Rgb([0; 3]) });
+        let img = image::RgbImage::from_fn(w, h, |x, _| {
+            if x % 4 < 2 {
+                image::Rgb([255; 3])
+            } else {
+                image::Rgb([0; 3])
+            }
+        });
         let path = std::env::temp_dir().join(format!("vhs_still_pixel_{}.png", std::process::id()));
         DynamicImage::ImageRgb8(img).save(&path).unwrap();
         let mut still = Still::load(&path).unwrap();
@@ -314,15 +354,26 @@ mod tests {
         let tv = &vhs_core::timing::NTSC_228;
         let (fw, _) = tv.image_size();
         for phase in 0..4u8 {
-            let p = ImageParams { fit: ImageFit::Pixel, pixel_phase: phase, ..Default::default() };
-            let StillFrame::Rgb(f) = still.render(&p, tv, 1.0 / 60.0) else { panic!() };
+            let p = ImageParams {
+                fit: ImageFit::Pixel,
+                pixel_phase: phase,
+                ..Default::default()
+            };
+            let StillFrame::Rgb(f) = still.render(&p, tv, 1.0 / 60.0) else {
+                panic!()
+            };
             let row = |y: usize| &f.data[y * fw * 3..(y + 1) * fw * 3];
             // 縦は 2 ライン単位で同じ行
-            let top = (0..f.height).find(|&y| row(y).iter().any(|&v| v > 0)).unwrap();
+            let top = (0..f.height)
+                .find(|&y| row(y).iter().any(|&v| v > 0))
+                .unwrap();
             assert_eq!(top % 2, 0);
             assert_eq!(row(top), row(top + 1));
             // 最初の白画素の位置 (有効区間の先頭からの副搬送波位相) が phase になる
-            let x = row(top).chunks_exact(3).position(|px| px[0] == 255).unwrap();
+            let x = row(top)
+                .chunks_exact(3)
+                .position(|px| px[0] == 255)
+                .unwrap();
             assert_eq!((x + tv.active_start) % 4, phase as usize, "phase {phase}");
             // 補間なし: 0 / 255 だけ
             assert!(row(top).iter().all(|&v| v == 0 || v == 255));
@@ -356,18 +407,28 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let tv = vhs_core::TvStandard::Ntsc.spec();
         let (fw, fh) = tv.image_size();
-        let mut p = ImageParams { fit: ImageFit::Cover, pan_x: -1.0, ..Default::default() };
+        let mut p = ImageParams {
+            fit: ImageFit::Cover,
+            pan_x: -1.0,
+            ..Default::default()
+        };
         let mid = |f: &LinearFrame| f.data[(fh / 2 * fw + fw / 2) * 3];
         // 左端に寄せると暗い側だけ、右端に寄せると明るい側 (1.0 超えのまま) が見える
-        let StillFrame::Linear(f) = still.render(&p, tv, 1.0 / 60.0) else { panic!("HDR のはず") };
+        let StillFrame::Linear(f) = still.render(&p, tv, 1.0 / 60.0) else {
+            panic!("HDR のはず")
+        };
         assert_eq!((f.width, f.height), (fw, fh));
         assert!((mid(f) - 0.25).abs() < 1e-3);
         p.pan_x = 1.0;
-        let StillFrame::Linear(f) = still.render(&p, tv, 1.0 / 60.0) else { unreachable!() };
+        let StillFrame::Linear(f) = still.render(&p, tv, 1.0 / 60.0) else {
+            unreachable!()
+        };
         assert!((mid(f) - 4.0).abs() < 1e-3);
         // 露出
         p.exposure_ev = -2.0;
-        let StillFrame::Linear(f) = still.render(&p, tv, 1.0 / 60.0) else { unreachable!() };
+        let StillFrame::Linear(f) = still.render(&p, tv, 1.0 / 60.0) else {
+            unreachable!()
+        };
         assert!((mid(f) - 1.0).abs() < 1e-3);
         // パン: 右端から左向きに動き始め、端で折り返す
         p.speed_x = 1.0;

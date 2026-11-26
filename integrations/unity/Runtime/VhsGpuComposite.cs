@@ -32,7 +32,7 @@ namespace VhsNext
 
         private const int MaxFieldsPerFrame = 8;
 
-        /// <summary>Same layout as CompositeParams in composite.slang (24 scalars, 96 bytes).</summary>
+        /// <summary>Same layout as CompositeParams in composite.slang (25 scalars, 100 bytes).</summary>
         [StructLayout(LayoutKind.Sequential)]
         private struct CompositeParams
         {
@@ -42,6 +42,7 @@ namespace VhsNext
             public float chromaGain, chromaBwMhz, hPll, burstPll;
             public float contrast, brightness, saturation, hueDeg;
             public uint acc, colorKiller, palDelayLine, outputLinear;
+            public float vcxoOffsetHz;
         }
 
         // Subset of the core Params JSON (snake_case like the Rust serde names).
@@ -53,7 +54,7 @@ namespace VhsNext
         [Serializable] private sealed class JsonDecoder
         {
             public string yc_separation = "notch";
-            public float chroma_bw_mhz = 1.3f, h_pll = 0.25f, burst_pll = 1f;
+            public float chroma_bw_mhz = 1.3f, h_pll = 0.25f, burst_pll = 0.2f, vcxo_offset_hz = 50f;
             public bool acc = true, color_killer = true, pal_delay_line = true;
             public float contrast = 1f, brightness = 0f, saturation = 1f, hue_deg = 0f;
         }
@@ -150,7 +151,8 @@ namespace VhsNext
                 acc = json.decoder.acc ? 1u : 0u,
                 colorKiller = json.decoder.color_killer ? 1u : 0u,
                 palDelayLine = json.decoder.pal_delay_line ? 1u : 0u,
-                outputLinear = 1
+                outputLinear = 1,
+                vcxoOffsetHz = json.decoder.vcxo_offset_hz
             };
 
             for (int i = 0; i < KernelNames.Length; ++i)

@@ -1,9 +1,11 @@
 //! 処理スレッド。入力の取得 → パイプライン → プレビュー/録画への出力を回す。
 
 use crate::crt::{Crt, CrtInfo};
+use crate::ffmpeg::{
+    AUDIO_RATE, AudioTrack, FrameStream, Recorder, StreamSpec, probe_duration, process_audio,
+};
 use crate::scope::{ScopeField, ScopeRing};
 use crate::still::{Still, StillFrame};
-use crate::ffmpeg::{AUDIO_RATE, AudioTrack, FrameStream, Recorder, StreamSpec, probe_duration, process_audio};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -69,8 +71,8 @@ pub struct Shared {
     /// デッキのメニュー表示 (イマーシブモードの OSD)。再生出力の信号に重畳する
     menu: Mutex<Option<String>>,
     menu_version: AtomicU64,
-    /// オシロスコープが開いている (このときだけコンポジット信号を写す)
-    pub scope_active: AtomicBool,
+    /// コンポジット信号を見ている表示 (オシロスコープ・生信号ビュー) のビット。0 でないときだけ信号を写す
+    pub scope_active: std::sync::atomic::AtomicU32,
     /// 最近のフィールドのコンポジット信号 (オシロスコープ用)
     pub scope: Mutex<ScopeRing>,
 }
@@ -78,6 +80,8 @@ pub struct Shared {
 #[derive(Clone, Debug)]
 pub enum SourceSpec {
     Pattern,
+    SmpteBars,
+    EbuBars,
     Image(PathBuf),
     Stream(StreamSpec),
 }
@@ -95,18 +99,34 @@ pub struct Engine {
 
 enum Source {
     Still(RgbFrame),
+    YiqPattern(vhs_core::frame::YiqFrame),
     /// 画像ファイル (配置・パンはフィールドごとに `params.image` で決める)
     Image(Box<Still>),
     Stream(FrameStream),
 }
 
+enum EngineInput<'a> {
+    Rgb(&'a RgbFrame),
+    Linear(&'a vhs_core::LinearFrame),
+    Yiq(&'a vhs_core::frame::YiqFrame),
+}
+
 fn source_name(spec: &SourceSpec) -> String {
     match spec {
         SourceSpec::Pattern => "テストパターン".into(),
-        SourceSpec::Image(p) => format!("画像: {}", p.file_name().unwrap_or_default().to_string_lossy()),
+        SourceSpec::SmpteBars => "SMPTE カラーバー".into(),
+        SourceSpec::EbuBars => "EBU カラーバー".into(),
+        SourceSpec::Image(p) => format!(
+            "画像: {}",
+            p.file_name().unwrap_or_default().to_string_lossy()
+        ),
         SourceSpec::Stream(StreamSpec::Camera { device, .. }) => format!("カメラ: {device}"),
+        SourceSpec::Stream(StreamSpec::Window { title, .. }) => format!("ウィンドウ: {title}"),
         SourceSpec::Stream(StreamSpec::File { path, .. }) => {
-            format!("動画: {}", path.file_name().unwrap_or_default().to_string_lossy())
+            format!(
+                "動画: {}",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            )
         }
     }
 }
@@ -115,6 +135,14 @@ fn source_name(spec: &SourceSpec) -> String {
 fn open_source(spec: &SourceSpec, tv: &Standard) -> Result<Source, String> {
     Ok(match spec {
         SourceSpec::Pattern => Source::Still(vhs_core::pattern::color_bars(tv)),
+        SourceSpec::SmpteBars => Source::YiqPattern(vhs_core::pattern::color_bar_signal(
+            tv,
+            vhs_core::pattern::ColorBarStandard::Smpte,
+        )),
+        SourceSpec::EbuBars => Source::YiqPattern(vhs_core::pattern::color_bar_signal(
+            tv,
+            vhs_core::pattern::ColorBarStandard::Ebu,
+        )),
         SourceSpec::Image(p) => Source::Image(Box::new(Still::load(p)?)),
         SourceSpec::Stream(s) => Source::Stream(FrameStream::open(s, true, tv)?),
     })
@@ -125,7 +153,10 @@ impl Engine {
         let shared = Arc::new(Shared {
             params: Mutex::new(Params::default()),
             params_version: AtomicU64::new(1),
-            frame: Mutex::new(FrameSlot { id: 0, bytes: Vec::new() }),
+            frame: Mutex::new(FrameSlot {
+                id: 0,
+                bytes: Vec::new(),
+            }),
             stats: Mutex::new(Stats::default()),
             export_cancel: Mutex::new(None),
             crt_info: Mutex::new(CrtInfo::default()),
@@ -133,19 +164,25 @@ impl Engine {
             crt_reload: AtomicBool::new(false),
             menu: Mutex::new(None),
             menu_version: AtomicU64::new(0),
-            scope_active: AtomicBool::new(false),
+            scope_active: std::sync::atomic::AtomicU32::new(0),
             scope: Mutex::new(ScopeRing::default()),
         });
         let (tx, rx) = channel();
         let sh = shared.clone();
-        std::thread::Builder::new().name("vhs-engine".into()).spawn(move || run(sh, rx)).unwrap();
+        std::thread::Builder::new()
+            .name("vhs-engine".into())
+            .spawn(move || run(sh, rx))
+            .unwrap();
         Self { tx, shared }
     }
 
     fn call(&self, make: impl FnOnce(Sender<Result<(), String>>) -> Cmd) -> Result<(), String> {
         let (rtx, rrx) = channel();
-        self.tx.send(make(rtx)).map_err(|_| "エンジンが停止しています".to_string())?;
-        rrx.recv().map_err(|_| "エンジンが停止しています".to_string())?
+        self.tx
+            .send(make(rtx))
+            .map_err(|_| "エンジンが停止しています".to_string())?;
+        rrx.recv()
+            .map_err(|_| "エンジンが停止しています".to_string())?
     }
 
     pub fn open(&self, spec: SourceSpec) -> Result<(), String> {
@@ -172,7 +209,12 @@ impl Engine {
     }
 
     /// 動画ファイルを最初から最後まで (実時間より速く) 処理して書き出す
-    pub fn start_export(&self, app: AppHandle, input: PathBuf, output: PathBuf) -> Result<(), String> {
+    pub fn start_export(
+        &self,
+        app: AppHandle,
+        input: PathBuf,
+        output: PathBuf,
+    ) -> Result<(), String> {
         let mut guard = self.shared.export_cancel.lock().unwrap();
         if guard.is_some() {
             return Err("書き出し中です".into());
@@ -187,7 +229,12 @@ impl Engine {
                 let r = export(&app, &input, &output, params, &cancel);
                 let _ = app.emit(
                     "export-progress",
-                    ExportProgress { done: 0, total: None, finished: true, error: r.err() },
+                    ExportProgress {
+                        done: 0,
+                        total: None,
+                        finished: true,
+                        error: r.err(),
+                    },
                 );
                 *shared.export_cancel.lock().unwrap() = None;
             })
@@ -211,15 +258,27 @@ impl Drop for TempFile {
     }
 }
 
-fn export(app: &AppHandle, input: &Path, output: &Path, params: Params, cancel: &AtomicBool) -> Result<(), String> {
+fn export(
+    app: &AppHandle,
+    input: &Path,
+    output: &Path,
+    params: Params,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
     let tv = params.tv();
-    let total = probe_duration(input).map(|d| (d * tv.field_rate_ratio.0 as f64 / tv.field_rate_ratio.1 as f64) as u64);
+    let total = probe_duration(input)
+        .map(|d| (d * tv.field_rate_ratio.0 as f64 / tv.field_rate_ratio.1 as f64) as u64);
 
     // 音声は先に全部処理して一時 WAV にする (映像より桁違いに軽い)
     let mut audio_tmp = None;
     if params.audio.enabled {
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
-        let tmp = TempFile(std::env::temp_dir().join(format!("vhs_audio_{}_{nanos}.wav", std::process::id())));
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tmp = TempFile(
+            std::env::temp_dir().join(format!("vhs_audio_{}_{nanos}.wav", std::process::id())),
+        );
         let mut proc = AudioProcessor::new(&params, AUDIO_RATE);
         let latency = proc.latency();
         if process_audio(input, &tmp.0, latency, cancel, |buf| proc.process(buf))? {
@@ -227,16 +286,35 @@ fn export(app: &AppHandle, input: &Path, output: &Path, params: Params, cancel: 
         }
     }
     let audio = match &audio_tmp {
-        Some(t) => Some(AudioTrack { path: &t.0, kbps: params.audio.codec_kbps, mono: params.audio.mono }),
+        Some(t) => Some(AudioTrack {
+            path: &t.0,
+            kbps: params.audio.codec_kbps,
+            mono: params.audio.mono,
+        }),
         None if params.audio.enabled => None,
         // 音声処理を切っているときは元の音声をそのまま使う
-        None => Some(AudioTrack { path: input, kbps: params.audio.codec_kbps, mono: false }),
+        None => Some(AudioTrack {
+            path: input,
+            kbps: params.audio.codec_kbps,
+            mono: false,
+        }),
     };
 
-    let stream =
-        FrameStream::open(&StreamSpec::File { path: input.to_path_buf(), looped: false, realtime: false }, false, tv)?;
+    let stream = FrameStream::open(
+        &StreamSpec::File {
+            path: input.to_path_buf(),
+            looped: false,
+            realtime: false,
+        },
+        false,
+        tv,
+    )?;
     let mut crt = Crt::new(false);
-    let square = if crt.prepare(&params.crt)? { Some(Crt::output_size(params.crt.height)) } else { None };
+    let square = if crt.prepare(&params.crt)? {
+        Some(Crt::output_size(params.crt.height))
+    } else {
+        None
+    };
     let rec = Recorder::start(output, audio, tv, square)?;
     let crt_params = params.crt.clone();
     let mut pipeline = Pipeline::new(params);
@@ -251,7 +329,11 @@ fn export(app: &AppHandle, input: &Path, output: &Path, params: Params, cancel: 
         let data = match crt.process(&crt_params, out, crt_params.height) {
             Some((_, _, px)) => px,
             None if square.is_some() => {
-                return Err(crt.info().error.clone().unwrap_or_else(|| "CRT シェーダーが使えません".into()));
+                return Err(crt
+                    .info()
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "CRT シェーダーが使えません".into()));
             }
             None => &out.data,
         };
@@ -260,7 +342,15 @@ fn export(app: &AppHandle, input: &Path, output: &Path, params: Params, cancel: 
         }
         done += 1;
         if done % 30 == 0 {
-            let _ = app.emit("export-progress", ExportProgress { done, total, finished: false, error: None });
+            let _ = app.emit(
+                "export-progress",
+                ExportProgress {
+                    done,
+                    total,
+                    finished: false,
+                    error: None,
+                },
+            );
         }
     }
     drop(stream);
@@ -311,7 +401,9 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                         let _ = r.finish();
                     }
                     // CRT シェーダーが効いていればその出力 (正方画素) を録画する
-                    let square = crt.active(&crt_params).then(|| Crt::output_size(crt_params.height));
+                    let square = crt
+                        .active(&crt_params)
+                        .then(|| Crt::output_size(crt_params.height));
                     let r = Recorder::start(&path, None, tv, square).map(|r| {
                         shared.stats.lock().unwrap().recording = Some(r.path.display().to_string());
                         recorder = Some(r);
@@ -383,16 +475,23 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
         let input = match &mut source {
             Source::Still(f) => {
                 pace();
-                StillFrame::Rgb(f)
+                EngineInput::Rgb(f)
+            }
+            Source::YiqPattern(f) => {
+                pace();
+                EngineInput::Yiq(f)
             }
             Source::Image(s) => {
                 let period = pace();
-                s.render(&image_params, tv, period.as_secs_f32())
+                match s.render(&image_params, tv, period.as_secs_f32()) {
+                    StillFrame::Rgb(f) => EngineInput::Rgb(f),
+                    StillFrame::Linear(f) => EngineInput::Linear(f),
+                }
             }
             Source::Stream(s) => match s.rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(f) => {
                     streamed = f;
-                    StillFrame::Rgb(&streamed)
+                    EngineInput::Rgb(&streamed)
                 }
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => {
@@ -409,8 +508,9 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
 
         // ---- 処理 ----
         let out = match input {
-            StillFrame::Rgb(f) => pipeline.process_field(f),
-            StillFrame::Linear(f) => pipeline.process_field_linear(f),
+            EngineInput::Rgb(f) => pipeline.process_field(f),
+            EngineInput::Linear(f) => pipeline.process_field_linear(f),
+            EngineInput::Yiq(f) => pipeline.process_field_yiq(f),
         };
 
         // ---- ブラウン管 ----
@@ -439,8 +539,10 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
             slot.bytes.extend_from_slice(&dh.to_le_bytes());
             slot.bytes.extend_from_slice(dpx);
             if shown.is_some() {
-                slot.bytes.extend_from_slice(&(out.width as u32).to_le_bytes());
-                slot.bytes.extend_from_slice(&(out.height as u32).to_le_bytes());
+                slot.bytes
+                    .extend_from_slice(&(out.width as u32).to_le_bytes());
+                slot.bytes
+                    .extend_from_slice(&(out.height as u32).to_le_bytes());
                 slot.bytes.extend_from_slice(&out.data);
             }
         }
@@ -462,8 +564,8 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
             }
         }
 
-        // オシロスコープ: 開いているときだけ最新フィールドの信号を写す
-        if shared.scope_active.load(Ordering::Relaxed) {
+        // オシロスコープ・生信号ビュー: 開いているときだけ最新フィールドの信号を写す
+        if shared.scope_active.load(Ordering::Relaxed) != 0 {
             let f = ScopeField::from_field(frame_id, pipeline.composite());
             shared.scope.lock().unwrap().push(f);
         }
@@ -563,7 +665,11 @@ mod tests {
             let slot = engine.shared.frame.lock().unwrap();
             assert_eq!(slot.bytes.len(), 16 + 1200 * 900 * 4 + 8 + 754 * 480 * 4);
             // 真っ黒ではない
-            let mean = slot.bytes[16..16 + 1200 * 900 * 4].iter().map(|&b| b as u64).sum::<u64>() / (1200 * 900 * 4);
+            let mean = slot.bytes[16..16 + 1200 * 900 * 4]
+                .iter()
+                .map(|&b| b as u64)
+                .sum::<u64>()
+                / (1200 * 900 * 4);
             assert!(mean > 40, "mean {mean}");
         }
 

@@ -63,7 +63,7 @@ export type Params = {
     white_clip: number;
     camera_gamma: number;
   };
-  encoder: { enabled: boolean; luma_bw_mhz: number; i_bw_mhz: number; q_bw_mhz: number; uv_bw_mhz: number; chroma_gain: number };
+  encoder: { enabled: boolean; luma_bw_mhz: number; i_bw_mhz: number; q_bw_mhz: number; uv_bw_mhz: number; chroma_gain: number; burst_level_pct: number };
   signal: {
     vertical_sync: { jitter: number; attenuation_pct: number; noise_ire: number };
     horizontal_sync: { jitter: number; attenuation_pct: number; noise_ire: number };
@@ -90,6 +90,8 @@ export type Params = {
     fm_white_mhz: number;
     fm_channel_mhz: number;
     fm_noise: number;
+    writing_speed_mps: number;
+    head_spacing_um: number;
     color_under_khz: number;
     color_under_level: number;
     luma_bw_mhz: number;
@@ -105,10 +107,14 @@ export type Params = {
     chroma_phase_noise_deg: number;
     chroma_delay_samples: number;
     magnetic_model: "linear" | "tanh" | "jiles_atherton";
+    magnetic_media: MagneticMedia;
+    rf_drive_hc: number;
     saturation_ire: number;
     rf_saturation: number;
     dropout_rate: number;
     dropout_length: number;
+    dropout_depth_um: number;
+    doc_threshold_db: number;
     dropout_compensation: boolean;
     crease_rate: number;
     crease_fields: number;
@@ -172,6 +178,7 @@ export type Params = {
     color_killer: boolean;
     h_pll: number;
     burst_pll: number;
+    vcxo_offset_hz: number;
     pal_delay_line: boolean;
     ynr_strength: number;
     dnr_strength: number;
@@ -205,6 +212,10 @@ export type Params = {
     mode: "linear" | "hifi";
     low_cut_hz: number;
     high_cut_hz: number;
+    tape_speed: number;
+    head_gap_um: number;
+    head_spacing_um: number;
+    bias_level: number;
     hiss_db: number;
     drive_db: number;
     wow_pct: number;
@@ -457,6 +468,8 @@ export const groups: Group[] = [
       r("tape.fm_white_mhz", "ホワイトピーク周波数", 2.5, 10, 0.05, "MHz"),
       r("tape.fm_channel_mhz", "再生伝送路の帯域", 2.5, 12, 0.1, "MHz"),
       r("tape.fm_noise", "RF ノイズ", 0, 0.5, 0.005),
+      r("tape.writing_speed_mps", "ヘッドの書き込み速度", 2, 10, 0.01, "m/s"),
+      r("tape.head_spacing_um", "ヘッドの汚れ (スペーシング)", 0, 1, 0.01, "µm"),
       r("tape.color_under_khz", "低域変換周波数", 400, 1200, 1, "kHz"),
       r("tape.color_under_level", "低域変換の記録レベル", 0, 0.6, 0.01),
       {
@@ -514,18 +527,30 @@ export const groups: Group[] = [
   },
   {
     title: "テープ: 磁性体",
-    note: "Jiles–Atherton は FM 輝度 RF のみで使う PoC。ラインごとに状態を初期化し、4 倍オーバーサンプリングする。係数は論文のフェライト系テープ値を正規化した初期値で、VHS 用の同定値ではない。クロマ包絡線・簡易輝度・音声は tanh 近似のまま。",
+    note: "Jiles–Atherton はテープの種類ごとに保磁力と角形比へ当てはめた係数で、記録磁界を保磁力 Hc の倍数で指定する。" +
+      "FM 輝度 RF はラインごとに状態を持って解き (8 倍オーバーサンプリング)、色と音声はバイアス (色は FM 搬送波、音声は交流バイアス) を掛けた J-A から作った曲線を使う。" +
+      "係数は公称の保磁力・角形比からの見積もりで、実際のテープを測った値ではない。",
     controls: [
       {
         kind: "select", path: "tape.magnetic_model", label: "磁性体モデル",
         options: [
           { value: "tanh", label: "tanh 飽和" },
-          { value: "jiles_atherton", label: "Jiles–Atherton (FM RF PoC)" },
+          { value: "jiles_atherton", label: "Jiles–Atherton (ヒステリシス)" },
           { value: "linear", label: "線形" },
         ],
       },
       r("tape.saturation_ire", "色の飽和レベル", 5, 150, 1, "IRE"),
       r("tape.rf_saturation", "RF の飽和レベル", 0.2, 5, 0.05),
+      {
+        kind: "select", path: "tape.magnetic_media", label: "テープの種類",
+        options: [
+          { value: "cobalt", label: "コバルト酸化鉄 (VHS・ベータ)" },
+          { value: "high_cobalt", label: "高保磁力コバルト (S-VHS)" },
+          { value: "metal_particle", label: "メタル (8mm・Hi8)" },
+          { value: "ferric_audio", label: "音声用酸化鉄 (論文の係数)" },
+        ],
+      },
+      r("tape.rf_drive_hc", "FM の記録磁界", 0.3, 6, 0.05, "×Hc"),
     ],
   },
   {
@@ -533,7 +558,9 @@ export const groups: Group[] = [
     controls: [
       r("tape.dropout_rate", "発生率 (/ライン)", 0, 0.1, 0.0005),
       r("tape.dropout_length", "平均長", 1, 400, 1, "smp"),
+      r("tape.dropout_depth_um", "テープの浮き", 0, 3, 0.05, "µm"),
       b("tape.dropout_compensation", "ドロップアウト補償 (DOC)"),
+      r("tape.doc_threshold_db", "DOC の検出レベル", 3, 40, 1, "dB"),
     ],
   },
   {
@@ -606,6 +633,7 @@ export const groups: Group[] = [
       r("encoder.q_bw_mhz", "Q 帯域", 0.1, 3, 0.05, "MHz"),
       r("encoder.uv_bw_mhz", "U/V 帯域 (PAL)", 0.2, 3, 0.05, "MHz"),
       r("encoder.chroma_gain", "色ゲイン", 0, 3, 0.01),
+      r("encoder.burst_level_pct", "バースト振幅", 0, 300, 1, "%"),
     ],
   },
   {
@@ -678,6 +706,7 @@ export const groups: Group[] = [
       b("decoder.color_killer", "カラーキラー"),
       r("decoder.h_pll", "水平 AFC 追従", 0, 1, 0.01),
       r("decoder.burst_pll", "色副搬送波 PLL 追従", 0.02, 1, 0.01),
+      r("decoder.vcxo_offset_hz", "色発振器の周波数ずれ", -300, 300, 1, "Hz"),
       b("decoder.pal_delay_line", "PAL 遅延線"),
       r("decoder.contrast", "コントラスト", 0, 2, 0.01),
       r("decoder.brightness", "明るさ", -0.5, 0.5, 0.01),
@@ -765,7 +794,11 @@ export const groups: Group[] = [
       },
       r("audio.low_cut_hz", "低域カット", 20, 400, 1, "Hz"),
       r("audio.high_cut_hz", "高域カット", 2000, 20000, 100, "Hz"),
+      r("audio.tape_speed", "テープ速度 (SP 比)", 0.2, 1.5, 0.01),
+      r("audio.head_gap_um", "音声ヘッドのギャップ", 0.2, 5, 0.05, "µm"),
+      r("audio.head_spacing_um", "音声ヘッドの汚れ (スペーシング)", 0, 3, 0.01, "µm"),
       r("audio.drive_db", "録音レベル", -12, 18, 0.5, "dB"),
+      r("audio.bias_level", "交流バイアス", 0, 6, 0.05, "×Hc"),
       r("audio.hiss_db", "ヒス", -90, -20, 0.5, "dBFS"),
       r("audio.wow_pct", "ワウ", 0, 2, 0.01, "%"),
       r("audio.flutter_pct", "フラッタ", 0, 1, 0.01, "%"),
@@ -881,26 +914,37 @@ export const help: Record<string, string> = {
   "tape.chroma_bw_khz": "低域変換された色信号の帯域。小さいほど色がにじむ。VHS は約 500 kHz。",
   "tape.chroma_noise_ire": "色信号の振幅ノイズ (rms)。色ムラ・色の粒状ノイズになる。",
   "tape.chroma_phase_noise_deg": "再生時の色位相の揺らぎ (rms)。ラインごとに色相がぶれる。",
-  "tape.chroma_delay_samples": "輝度に対する色の位置ずれ。正で色が右にずれる。",
+  "tape.chroma_delay_samples": "VCR の Y/C 遅延の整合のあとに残る、輝度に対する色の位置ずれ (1 サンプル ≒ 70 ns)。正で色が右にずれる。",
   "tape.magnetic_model":
     "磁性体の伝達特性。tanh は記録レベルが大きいと磁化が飽和する: " +
     "強い色が頭打ちになり、FM の搬送波と色の相互変調で鮮やかな色の部分に輝度のモアレが出て、" +
-    "リニア音声は大きい音が潰れる (テープコンプレッション)。Jiles–Atherton は FM 輝度 RF の履歴を持つ PoC。" +
-    "線形は飽和なし。",
-  "tape.saturation_ire": "低域変換クロマの磁気飽和が始まる色の振幅。小さいほど鮮やかな色が早く潰れる (tanh のみ)。",
+    "リニア音声は大きい音が潰れる (テープコンプレッション)。Jiles–Atherton は磁化の履歴 (ヒステリシス) を持つ物理モデルで、" +
+    "テープの種類・FM の記録磁界・音声の交流バイアスで飽和の仕方が決まる。線形は飽和なし。",
+  "tape.saturation_ire": "低域変換クロマの磁気飽和が始まる色の振幅。小さいほど鮮やかな色が早く潰れる (tanh のみ。J-A では色の記録レベルと FM の記録磁界で決まる)。",
   "tape.rf_saturation":
     "FM 輝度の RF (搬送波の振幅 = 1) の飽和レベル。小さいほど搬送波と色の相互変調が強くなり、" +
-    "鮮やかな色の部分に細かいモアレが出る。J-A 選択時は磁界スケールの調整にも使う。",
+    "鮮やかな色の部分に細かいモアレが出る (tanh のみ)。",
+  "tape.magnetic_media":
+    "テープの磁性体 (J-A の係数)。コバルト酸化鉄は VHS・ベータの標準テープ (角形比 0.85)、高保磁力コバルトは S-VHS (0.9)、" +
+    "メタルは 8mm・Hi8 (0.92)。角張ったループほど記録磁界が保磁力を超えたところで急に飽和する。音声用酸化鉄は論文の係数 (角形比 0.26 の丸いループ)。",
+  "tape.rf_drive_hc":
+    "FM 搬送波を記録する磁界の振幅 (保磁力 Hc の倍数)。2 で再生 RF が基準の大きさ。小さいと磁化しきれず RF が弱くノイズが増え、" +
+    "大きいと飽和して搬送波と色の相互変調 (鮮やかな色の部分の輝度のモアレ) が増える。搬送波は色のバイアスでもあるので、" +
+    "大きいほど色は直線的に記録される。",
 
   // テープ: ドロップアウト
   "tape.dropout_rate": "1 ラインあたりのドロップアウト (磁性体の欠落による白や黒の横筋) の発生確率。",
   "tape.dropout_length": "ドロップアウト 1 回の平均の長さ。",
-  "tape.dropout_compensation": "ドロップアウト部分を 1 ライン前の映像で埋める (DOC)。オフだと白い筋がそのまま出る。",
+  "tape.dropout_depth_um":
+    "ドロップアウトでテープがヘッドから浮く量の目安 (傷・ゴミ・磁性体の欠け)。損失は搬送波の高い白ほど大きいので、" +
+    "浅いものは白い部分だけがざらつき・黒い筋になり、深いものは RF が消えて DOC か砂嵐になる。色も浮きのぶん薄くなる。",
+  "tape.dropout_compensation": "RF の落ち込みが検出レベルを超えたところを 1 ライン前の映像で埋める (DOC)。オフだと白い筋・砂嵐がそのまま出る。",
+  "tape.doc_threshold_db": "DOC がドロップアウトとみなす RF レベルの低下 (中心搬送波で)。大きくすると浅いドロップアウトは補償されずにそのまま見える。",
 
   // テープ: 傷み
-  "tape.crease_rate": "テープのしわ・折れ目が現れる頻度。画面を帯状のノイズが流れる。",
+  "tape.crease_rate": "テープのしわ・折れ目が現れる頻度。画面を帯状のノイズが流れる。しわの山でテープがヘッドから浮く (スペーシング) ので、搬送波の高い白い部分から崩れる。",
   "tape.crease_fields": "しわ 1 回が画面に現れ続ける長さ (フィールド数、60 で約 1 秒)。",
-  "tape.head_clog_rate": "ヘッドの目詰まりが起きる頻度。画面全体が一瞬砂嵐に埋もれる。",
+  "tape.head_clog_rate": "ヘッドの目詰まりが起きる頻度。画面全体が一瞬砂嵐に埋もれる。ギャップに付いた汚れの厚みがスペーシングになり、搬送波の高いフォーマット・書き込み速度の遅いフォーマットほどひどい。",
 
   // 走行系
   "transport.jitter_samples": "ラインごとの時間軸の揺れ (rms)。縦線がギザギザに揺れる。",
@@ -951,6 +995,10 @@ export const help: Record<string, string> = {
   "encoder.i_bw_mhz": "I 信号 (橙〜青緑方向の色差) の帯域。NTSC 規格は 1.3 MHz。",
   "encoder.q_bw_mhz": "Q 信号 (紫〜黄緑方向の色差) の帯域。NTSC 規格は 0.6 MHz。",
   "encoder.chroma_gain": "送出時の色信号の振幅倍率。大きいとテープでの色飽和が起きやすい。",
+  "encoder.burst_level_pct":
+    "カラーバーストの振幅 (100% = 規格の 40 IRE p-p / 300 mV p-p)。受像機の ACC はバーストを基準に色の濃さを合わせるので、" +
+    "大きくすると色が薄く、小さくすると濃くなる (ACC を切ると色の濃さは変わらない)。0 にするとカラーキラーが働けば白黒になる。" +
+    "CGA などのコンピュータはバーストを色信号と同じ回路で作るので規格より大きいことがあり、アーティファクトカラーの濃さの調整に使う。",
   "signal.vertical_sync.jitter": "同期に対する映像のフィールドごとの上下の揺れ (rms)。1 ラインは表示画像の 2 行分。",
   "signal.vertical_sync.attenuation_pct": "垂直同期 (幅広パルス) の振幅を下げる。受像機の積分回路がしきい値に届かなくなると垂直発振器が自走して画面が流れる。",
   "signal.vertical_sync.noise_ire": "垂直同期 (幅広パルス) に乗る雑音。積分回路が取り損ねる・早くトリガすると画面が跳ねたり流れたりする。",
@@ -1004,7 +1052,11 @@ export const help: Record<string, string> = {
   "decoder.chroma_bw_mhz": "受像機で復調した後の色差の帯域。小さいほど色がにじむ。",
   "decoder.burst_pll":
     "色副搬送波の PLL がバーストに追従する速さ (ライン単位)。1 = ラインごとに即時同期。" +
-    "小さくするとテープのライン単位の位相ゆらぎを取り切れず、NTSC では色相の横縞、PAL では彩度のむらになる。",
+    "小さくするとテープのライン単位の位相ゆらぎを取り切れず、NTSC では色相の横縞、PAL では彩度のむらになる。" +
+    "実機の APC は 0.1〜0.3 程度で、発振器の周波数ずれが定常的な色相ずれとして残る。",
+  "decoder.vcxo_offset_hz":
+    "受像機の色副搬送波発振器 (水晶 VCXO) の自走周波数のずれ。PLL の追従が 1 未満だと定常位相誤差が残り、" +
+    "NTSC では画面全体の色相ずれ (色合いツマミで直す類のもの)、PAL では彩度低下になる。0 で理想的な発振器。",
   "decoder.pal_delay_line":
     "PAL の 1H 遅延線 (PAL-D)。切るとシンプル PAL になり、位相の誤差がライン交互の色相ずれ (ハノーバーバー) として見える。",
   "decoder.acc": "カラーバーストの振幅で色の濃さを自動調整する (ACC)。",
@@ -1022,6 +1074,13 @@ export const help: Record<string, string> = {
   "tape.fm_channel_mhz":
     "再生伝送路 (ヘッド・テープ・再生アンプ) の帯域。狭いと白のエッジで搬送波が弱まり、" +
     "ゼロ交差を見落として白の右に黒い筋 (ベアディング) が出る。ヘッドの摩耗の目安。",
+  "tape.writing_speed_mps":
+    "ビデオヘッドとテープの相対速度。フォーマットとテレビ方式で決まる (VHS NTSC ≒ 5.8 m/s、PAL ≒ 4.85、ベータ ≒ 6.9 / 5.8、8mm ≒ 3.75 / 3.1)。" +
+    "記録波長は 速度 / 周波数 なので、遅いほど同じ汚れでも損失が大きい。",
+  "tape.head_spacing_um":
+    "再生 EQ が想定していない余分なヘッド・テープ間隔 (ヘッドの汚れ、テープの浮き・摩耗)。損失は 54.6 × 間隔 / 波長 [dB] で、" +
+    "搬送波の高い白ほど大きく落ちる (VHS で 0.5 µm だとホワイトで約 21 dB)。ノイズは減らないので S/N が下がり、" +
+    "白い部分から先にノイズや砂嵐が出る。色 (低域変換) のノイズも少し増える。",
   "tape.fm_noise": "再生 RF のノイズ (搬送波に対する比)。大きいと白黒の粒状ノイズが増え、トラッキングずれで一気に悪化する。",
   "tape.color_under_khz": "低域変換クロマの周波数。VHS 629 kHz、ベータ 688 kHz、8mm 743 kHz (NTSC)。",
   "tape.color_under_level": "低域変換クロマの記録レベル (FM 搬送波に対する比)。大きいと鮮やかな色の部分の輝度にモアレが乗る。",
@@ -1109,12 +1168,20 @@ export const help: Record<string, string> = {
     "リニア: 固定ヘッドのノーマル音声。モノラル・狭帯域でヒスやワウフラッタがある。\n" +
     "Hi-Fi: 回転ヘッドの FM 音声。ステレオ・広帯域だがヘッド切替バズが出る。",
   "audio.low_cut_hz": "リニアトラックの低域カットオフ。大きいほど低音が痩せる。",
-  "audio.high_cut_hz": "リニアトラックの高域カットオフ。SP ≒ 10 kHz、3倍モード ≒ 5 kHz。",
+  "audio.high_cut_hz": "リニアトラックの録音・再生アンプの高域カットオフ。テープ速度とヘッドによる損失はこれとは別に掛かる。",
+  "audio.tape_speed":
+    "リニアトラックのテープ速度 (SP に対する比。標準 1、3倍モード (EP) 0.333、LP 0.5)。SP は NTSC 33.35 mm/s、PAL 23.39 mm/s。" +
+    "再生 EQ は SP 用のままなので、遅くすると波長が短くなってスペーシング損失とギャップ損失で高域がこもる。",
+  "audio.head_gap_um": "音声ヘッドのギャップ長。波長がギャップと等しくなる周波数 (速度 / ギャップ、3倍モードで 1 µm なら約 11 kHz) で出力が消える。SP 標準の状態では影響しない。",
+  "audio.head_spacing_um": "音声ヘッドとテープの余分な間隔 (ヘッドの汚れ、テープの摩耗)。高域ほど指数的に落ちる。",
   "audio.drive_db": "録音レベル。上げるとテープ飽和で歪む。",
   "audio.hiss_db": "テープヒス (サーッというノイズ) の量。",
   "audio.wow_pct": "ゆっくりした速度変動による音程の揺れ。",
   "audio.flutter_pct": "速い速度変動による音のざらつき・震え。",
   "audio.dropout_rate": "音が一瞬こもって痩せるドロップアウトの頻度 (回/秒)。",
+  "audio.bias_level":
+    "リニアトラックの交流バイアスの磁界 (保磁力 Hc の倍数、磁性体モデルが J-A のとき)。2 前後でほぼ直線に録音できる。" +
+    "足りないと小さい音がデッドゾーンで歪み (クロスオーバー歪み)、大きい音も早く潰れる。多すぎると感度が落ちる (録音レベルで補われる)。",
   "audio.hifi_buzz": "Hi-Fi 音声のヘッド切替バズ (ブーンという雑音) の量。トラッキングずれでも増える。",
   "audio.hum_db": "電源ハム (グラウンドループによるブーン音) の量。",
   "audio.hum_hz": "電源周波数。東日本 50 Hz、西日本・北米 60 Hz。",
@@ -1178,8 +1245,11 @@ const activeWhen: Record<string, (p: Params) => boolean> = {
   "tape.luma_noise_ire": (p) => !fmModel(p),
   "tape.bearding_threshold_ire": (p) => !fmModel(p),
   "tape.bearding_strength": (p) => !fmModel(p),
-  "tape.saturation_ire": nonlinearMag,
-  "tape.rf_saturation": nonlinearMag,
+  "tape.saturation_ire": (p) => p.tape.magnetic_model === "tanh",
+  "tape.rf_saturation": (p) => p.tape.magnetic_model === "tanh",
+  "tape.magnetic_media": (p) => p.tape.magnetic_model === "jiles_atherton",
+  "tape.rf_drive_hc": (p) => p.tape.magnetic_model === "jiles_atherton",
+  "audio.bias_level": (p) => p.audio.mode === "linear" && p.tape.magnetic_model === "jiles_atherton",
   "output.connection": (p) => composite(p) && p.tape.enabled && !(p.rf.enabled && p.rf.placement !== "before_tape"),
 
   // DV
@@ -1213,6 +1283,7 @@ const activeWhen: Record<string, (p: Params) => boolean> = {
   "signal.": composite,
   "encoder.luma_bw_mhz": composite,
   "encoder.chroma_gain": composite,
+  "encoder.burst_level_pct": composite,
   "encoder.i_bw_mhz": (p) => composite(p) && p.standard === "ntsc",
   "encoder.q_bw_mhz": (p) => composite(p) && p.standard === "ntsc",
   "encoder.uv_bw_mhz": (p) => composite(p) && p.standard === "pal",
@@ -1254,6 +1325,9 @@ const activeWhen: Record<string, (p: Params) => boolean> = {
   "audio.": (p) => p.audio.enabled,
   "audio.low_cut_hz": (p) => p.audio.mode === "linear",
   "audio.high_cut_hz": (p) => p.audio.mode === "linear",
+  "audio.tape_speed": (p) => p.audio.mode === "linear",
+  "audio.head_gap_um": (p) => p.audio.mode === "linear",
+  "audio.head_spacing_um": (p) => p.audio.mode === "linear",
   "audio.hifi_buzz": (p) => p.audio.mode === "hifi",
 };
 
@@ -1291,6 +1365,7 @@ export function setPath(obj: any, path: string, value: any) {
   target[last] = value;
 }
 
+export type MagneticMedia = "cobalt" | "high_cobalt" | "metal_particle" | "ferric_audio";
 type DeepPartial<T> = { [K in keyof T]?: T[K] extends object ? DeepPartial<T[K]> : T[K] };
 
 // テープのフォーマットごとの値。NTSC / PAL で搬送波・低域変換周波数が違うものは方式で分ける。
@@ -1300,6 +1375,10 @@ type FormatSpec = {
   colorUnder: { ntsc: number; pal: number };
   lumaBw: number;
   channel: number;
+  /// ビデオヘッドの書き込み速度 [m/s] (ドラム径と回転数で決まる)
+  speed: { ntsc: number; pal: number };
+  /// 標準のテープの磁性体
+  media: MagneticMedia;
   noise: number;
   connection: "composite" | "s_video";
   extra?: DeepPartial<Params>;
@@ -1315,29 +1394,29 @@ const digitalSpecs: Record<DigitalFormat, DeepPartial<Params>> = {
 const formatSpecs: Record<Exclude<TapeFormat, "custom" | DigitalFormat>, FormatSpec> = {
   vhs: {
     fm: { ntsc: [3.4, 4.4], pal: [3.8, 4.8] }, colorUnder: { ntsc: 629, pal: 627 },
-    lumaBw: 3.0, channel: 5.5, noise: 0.05, connection: "composite",
+    lumaBw: 3.0, channel: 5.5, noise: 0.05, connection: "composite", speed: { ntsc: 5.8, pal: 4.85 }, media: "cobalt",
   },
   svhs: {
     fm: { ntsc: [5.4, 7.0], pal: [5.4, 7.0] }, colorUnder: { ntsc: 629, pal: 627 },
-    lumaBw: 5.0, channel: 8.5, noise: 0.04, connection: "s_video",
+    lumaBw: 5.0, channel: 8.5, noise: 0.04, connection: "s_video", speed: { ntsc: 5.8, pal: 4.85 }, media: "high_cobalt",
   },
   beta: {
     fm: { ntsc: [3.6, 4.8], pal: [3.8, 5.2] }, colorUnder: { ntsc: 688, pal: 685 },
-    lumaBw: 3.2, channel: 6.0, noise: 0.05, connection: "composite",
+    lumaBw: 3.2, channel: 6.0, noise: 0.05, connection: "composite", speed: { ntsc: 6.9, pal: 5.83 }, media: "cobalt",
   },
   super_beta: {
     fm: { ntsc: [4.4, 5.6], pal: [4.4, 5.6] }, colorUnder: { ntsc: 688, pal: 685 },
-    lumaBw: 3.8, channel: 7.0, noise: 0.045, connection: "composite",
+    lumaBw: 3.8, channel: 7.0, noise: 0.045, connection: "composite", speed: { ntsc: 6.9, pal: 5.83 }, media: "cobalt",
   },
   video8: {
     fm: { ntsc: [4.2, 5.4], pal: [4.2, 5.4] }, colorUnder: { ntsc: 743, pal: 732 },
-    lumaBw: 3.0, channel: 6.5, noise: 0.05, connection: "composite",
+    lumaBw: 3.0, channel: 6.5, noise: 0.05, connection: "composite", speed: { ntsc: 3.75, pal: 3.12 }, media: "metal_particle",
     // 薄いメタル (蒸着) テープはドロップアウトが多い
     extra: { tape: { dropout_rate: 0.004 } },
   },
   hi8: {
     fm: { ntsc: [5.7, 7.7], pal: [5.7, 7.7] }, colorUnder: { ntsc: 743, pal: 732 },
-    lumaBw: 4.8, channel: 9.5, noise: 0.04, connection: "s_video",
+    lumaBw: 4.8, channel: 9.5, noise: 0.04, connection: "s_video", speed: { ntsc: 3.75, pal: 3.12 }, media: "metal_particle",
     extra: { tape: { dropout_rate: 0.004 } },
   },
 };
@@ -1353,12 +1432,13 @@ export function formatDiff(format: TapeFormat, standard: Standard, full = true):
   }
   const f = formatSpecs[format];
   const [sync, white] = f.fm[standard];
-  if (!full) return { tape: { fm_sync_mhz: sync, fm_white_mhz: white, color_under_khz: f.colorUnder[standard] } };
+  if (!full) return { tape: { fm_sync_mhz: sync, fm_white_mhz: white, color_under_khz: f.colorUnder[standard], writing_speed_mps: f.speed[standard] } };
   return applyDiff(
     {
       tape: {
         format, luma_model: "fm", fm_sync_mhz: sync, fm_white_mhz: white, fm_channel_mhz: f.channel,
         fm_noise: f.noise, color_under_khz: f.colorUnder[standard], luma_bw_mhz: f.lumaBw,
+        writing_speed_mps: f.speed[standard], magnetic_media: f.media,
         dropout_rate: 0.002,
       },
       output: { connection: f.connection },
@@ -1423,7 +1503,7 @@ export const presets: { name: string; diff: DeepPartial<Params> }[] = [
     diff: {
       tape: { luma_bw_mhz: 2.2, luma_noise_ire: 4, chroma_bw_khz: 350, chroma_noise_ire: 2.5, chroma_phase_noise_deg: 6, dropout_rate: 0.004 },
       transport: { jitter_samples: 0.8, head_switch_offset: 16 },
-      audio: { high_cut_hz: 6000, hiss_db: -46, wow_pct: 0.2, flutter_pct: 0.12 },
+      audio: { tape_speed: 0.333, hiss_db: -46, wow_pct: 0.2, flutter_pct: 0.12 },
     },
   },
   {

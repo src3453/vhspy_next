@@ -3,9 +3,10 @@ mod engine;
 mod ffmpeg;
 mod scope;
 mod still;
+mod syncview;
 
 use engine::{Engine, SourceSpec, Stats};
-use ffmpeg::StreamSpec;
+use ffmpeg::{ScalingMethod, StreamSpec};
 use serde::Deserialize;
 use std::path::PathBuf;
 use tauri::State;
@@ -16,9 +17,29 @@ use vhs_core::Params;
 #[serde(rename_all = "snake_case", tag = "kind")]
 enum OpenRequest {
     Pattern,
-    Camera { device: String, width: Option<u32>, height: Option<u32>, fps: Option<u32> },
+    Smpte,
+    Ebu,
+    Camera {
+        device: String,
+        width: Option<u32>,
+        height: Option<u32>,
+        fps: Option<u32>,
+        #[serde(default)]
+        scaling: ScalingMethod,
+    },
+    Window {
+        title: String,
+        crop_x: u32,
+        crop_y: u32,
+        crop_width: u32,
+        crop_height: u32,
+        #[serde(default)]
+        scaling: ScalingMethod,
+    },
     /// 拡張子で画像/動画を判別する
-    File { path: PathBuf },
+    File {
+        path: PathBuf,
+    },
 }
 
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "bmp", "webp", "exr"];
@@ -53,15 +74,49 @@ async fn list_cameras() -> Result<Vec<String>, String> {
 async fn open_source(engine: State<'_, Engine>, req: OpenRequest) -> Result<(), String> {
     let spec = match req {
         OpenRequest::Pattern => SourceSpec::Pattern,
-        OpenRequest::Camera { device, width, height, fps } => {
-            SourceSpec::Stream(StreamSpec::Camera { device, width, height, fps })
-        }
+        OpenRequest::Smpte => SourceSpec::SmpteBars,
+        OpenRequest::Ebu => SourceSpec::EbuBars,
+        OpenRequest::Camera {
+            device,
+            width,
+            height,
+            fps,
+            scaling,
+        } => SourceSpec::Stream(StreamSpec::Camera {
+            device,
+            width,
+            height,
+            fps,
+            scaling,
+        }),
+        OpenRequest::Window {
+            title,
+            crop_x,
+            crop_y,
+            crop_width,
+            crop_height,
+            scaling,
+        } => SourceSpec::Stream(StreamSpec::Window {
+            title,
+            crop_x,
+            crop_y,
+            crop_width,
+            crop_height,
+            scaling,
+        }),
         OpenRequest::File { path } => {
-            let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+            let ext = path
+                .extension()
+                .map(|e| e.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
             if IMAGE_EXTS.contains(&ext.as_str()) {
                 SourceSpec::Image(path)
             } else {
-                SourceSpec::Stream(StreamSpec::File { path, looped: true, realtime: true })
+                SourceSpec::Stream(StreamSpec::File {
+                    path,
+                    looped: true,
+                    realtime: true,
+                })
             }
         }
     };
@@ -72,16 +127,56 @@ async fn open_source(engine: State<'_, Engine>, req: OpenRequest) -> Result<(), 
 #[tauri::command]
 async fn get_frame(engine: State<'_, Engine>, after: u64) -> Result<Response, String> {
     let slot = engine.shared.frame.lock().unwrap();
-    if slot.id > after { Ok(Response::new(slot.bytes.clone())) } else { Ok(Response::new(Vec::new())) }
+    if slot.id > after {
+        Ok(Response::new(slot.bytes.clone()))
+    } else {
+        Ok(Response::new(Vec::new()))
+    }
 }
 
-/// オシロスコープを開いた・閉じた (開いている間だけエンジンがコンポジット信号を写す)
+/// コンポジット信号を見る表示を開いた・閉じた (どれかが開いている間だけエンジンがコンポジット信号を写す)。
+/// `who` は表示ごとのビット (1 = オシロスコープ、2 = 生信号ビュー)
 #[tauri::command]
-fn set_scope_active(engine: State<'_, Engine>, active: bool) {
-    engine.shared.scope_active.store(active, std::sync::atomic::Ordering::Relaxed);
-    if !active {
+fn set_scope_active(engine: State<'_, Engine>, active: bool, who: Option<u32>) {
+    use std::sync::atomic::Ordering;
+    let bit = who.unwrap_or(1);
+    let flags = &engine.shared.scope_active;
+    let now = if active {
+        flags.fetch_or(bit, Ordering::Relaxed) | bit
+    } else {
+        flags.fetch_and(!bit, Ordering::Relaxed) & !bit
+    };
+    if now == 0 {
         engine.shared.scope.lock().unwrap().clear();
     }
+}
+
+/// 生信号ビュー: 最近のフィールドのコンポジット信号をデコードせずに白黒の画像にする。
+/// `after` より新しいフィールドがなければ空。形式は `syncview::SyncImage::to_bytes`
+#[tauri::command]
+async fn get_sync_view(
+    engine: State<'_, Engine>,
+    after: u64,
+    width: f64,
+    phase: f64,
+    frame: bool,
+    sync: bool,
+    pre_lines: f64,
+) -> Result<Response, String> {
+    let fields = {
+        let ring = engine.shared.scope.lock().unwrap();
+        let f = ring.newer(0, scope::RING_FIELDS);
+        if f.last().is_none_or(|l| l.id <= after) && after != 0 {
+            return Ok(Response::new(Vec::new()));
+        }
+        // 1 フレーム + 前後の余白を、垂直同期がどこにあっても取れるだけ
+        let n = f.len().min(if frame { 6 } else { 4 });
+        f[f.len() - n..].to_vec()
+    };
+    let req = syncview::SyncViewReq { width, phase, frame, sync, pre_lines };
+    Ok(Response::new(
+        syncview::render(&fields, &req).map_or_else(Vec::new, |i| i.to_bytes()),
+    ))
 }
 
 /// `after` より新しいフィールド (新しい方から最大 `max_fields`) の、ライン番号 `line` から `count` ラインの
@@ -94,7 +189,12 @@ async fn get_composite(
     count: usize,
     max_fields: usize,
 ) -> Result<Response, String> {
-    let fields = engine.shared.scope.lock().unwrap().newer(after, max_fields.min(scope::RING_FIELDS));
+    let fields = engine
+        .shared
+        .scope
+        .lock()
+        .unwrap()
+        .newer(after, max_fields.min(scope::RING_FIELDS));
     Ok(Response::new(scope::extract(&fields, line, count)))
 }
 
@@ -112,13 +212,19 @@ fn get_crt_info(engine: State<'_, Engine>) -> crt::CrtInfo {
 /// CRT シェーダーを読み直す
 #[tauri::command]
 fn reload_crt(engine: State<'_, Engine>) {
-    engine.shared.crt_reload.store(true, std::sync::atomic::Ordering::Release);
+    engine
+        .shared
+        .crt_reload
+        .store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// プレビュー画面の高さ [物理 px]。CRT シェーダーはこの大きさで描く
 #[tauri::command]
 fn set_viewport(engine: State<'_, Engine>, height: u32) {
-    engine.shared.viewport_height.store(height, std::sync::atomic::Ordering::Relaxed);
+    engine
+        .shared
+        .viewport_height
+        .store(height, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[tauri::command]
@@ -132,7 +238,12 @@ async fn stop_recording(engine: State<'_, Engine>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn start_export(app: tauri::AppHandle, engine: State<'_, Engine>, input: PathBuf, output: PathBuf) -> Result<(), String> {
+fn start_export(
+    app: tauri::AppHandle,
+    engine: State<'_, Engine>,
+    input: PathBuf,
+    output: PathBuf,
+) -> Result<(), String> {
     engine.start_export(app, input, output)
 }
 
@@ -175,6 +286,7 @@ pub fn run() {
             get_frame,
             get_composite,
             set_scope_active,
+            get_sync_view,
             get_stats,
             start_recording,
             stop_recording,

@@ -46,7 +46,11 @@ fn gpu() -> Result<&'static Gpu, String> {
             ..Default::default()
         }))
         .map_err(|e| format!("GPU を初期化できません: {e}"))?;
-        Ok(Gpu { device, queue, name: format!("{} ({:?})", info.name, info.backend) })
+        Ok(Gpu {
+            device,
+            queue,
+            name: format!("{} ({:?})", info.name, info.backend),
+        })
     })
     .as_ref()
     .map_err(|e| e.clone())
@@ -84,7 +88,8 @@ struct Loaded {
 
 fn load(path: &str) -> Result<Loaded, String> {
     let g = gpu()?;
-    let preset = ShaderPreset::try_parse(path, ShaderFeatures::NONE).map_err(|e| format!("プリセットを読めません: {e}"))?;
+    let preset = ShaderPreset::try_parse(path, ShaderFeatures::NONE)
+        .map_err(|e| format!("プリセットを読めません: {e}"))?;
     let pack = ShaderPresetPack::load_from_preset::<FilterChainError>(preset)
         .map_err(|e| format!("シェーダーを読めません: {e}"))?;
 
@@ -100,29 +105,48 @@ fn load(path: &str) -> Result<Loaded, String> {
                 }
             }
         }
-        let mut rest: Vec<_> = src.parameters.keys().map(|k| k.as_str()).filter(|k| !ids.contains(k)).collect();
+        let mut rest: Vec<_> = src
+            .parameters
+            .keys()
+            .map(|k| k.as_str())
+            .filter(|k| !ids.contains(k))
+            .collect();
         rest.sort();
         ids.extend(rest);
         for id in ids {
-            let Some(p) = src.parameters.get(id) else { continue };
+            let Some(p) = src.parameters.get(id) else {
+                continue;
+            };
             if params.iter().any(|q| q.id == id) {
                 continue;
             }
-            let initial = pack.parameters.iter().find(|m| m.name.as_str() == id).map_or(p.initial, |m| m.value);
+            let initial = pack
+                .parameters
+                .iter()
+                .find(|m| m.name.as_str() == id)
+                .map_or(p.initial, |m| m.value);
             params.push(ShaderParam {
                 id: id.to_string(),
                 description: p.description.clone(),
                 initial,
                 min: p.minimum,
                 max: p.maximum,
-                step: if p.step > 0.0 { p.step } else { (p.maximum - p.minimum) / 100.0 },
+                step: if p.step > 0.0 {
+                    p.step
+                } else {
+                    (p.maximum - p.minimum) / 100.0
+                },
             });
         }
     }
 
     let chain = FilterChain::load_from_pack(pack, &g.device, &g.queue, None)
         .map_err(|e| format!("シェーダーをコンパイルできません: {e}"))?;
-    Ok(Loaded { chain, params, applied: None })
+    Ok(Loaded {
+        chain,
+        params,
+        applied: None,
+    })
 }
 
 struct Target {
@@ -190,7 +214,13 @@ impl Crt {
         if self.sync(p) {
             Ok(true)
         } else {
-            Err(format!("CRT シェーダー: {}", self.info.error.clone().unwrap_or_else(|| "読み込めません".into())))
+            Err(format!(
+                "CRT シェーダー: {}",
+                self.info
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "読み込めません".into())
+            ))
         }
     }
 
@@ -212,7 +242,13 @@ impl Crt {
             self.loaded = None;
             self.pending = None;
             let path = p.preset.clone();
-            self.set_info(|i| *i = CrtInfo { preset: path, loading: true, ..Default::default() });
+            self.set_info(|i| {
+                *i = CrtInfo {
+                    preset: path,
+                    loading: true,
+                    ..Default::default()
+                }
+            });
             if self.background {
                 let (tx, rx) = channel();
                 let path = p.preset.clone();
@@ -268,7 +304,12 @@ impl Crt {
 
     /// `frame` にシェーダーを掛け、高さ `height` (幅は 4:3) の RGBA を返す。
     /// CRT が無効・読み込み中・エラーのときは None (呼び出し側は元の画像を使う)
-    pub fn process(&mut self, p: &CrtParams, frame: &RgbaFrame, height: u32) -> Option<(u32, u32, &[u8])> {
+    pub fn process(
+        &mut self,
+        p: &CrtParams,
+        frame: &RgbaFrame,
+        height: u32,
+    ) -> Option<(u32, u32, &[u8])> {
         if !self.sync(p) {
             return None;
         }
@@ -300,10 +341,18 @@ impl Crt {
 
         // 入力テクスチャ
         let (iw, ih) = (frame.width as u32, frame.height as u32);
-        if self.input.as_ref().is_none_or(|t| t.width() != iw || t.height() != ih) {
+        if self
+            .input
+            .as_ref()
+            .is_none_or(|t| t.width() != iw || t.height() != ih)
+        {
             self.input = Some(g.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("crt-input"),
-                size: wgpu::Extent3d { width: iw, height: ih, depth_or_array_layers: 1 },
+                size: wgpu::Extent3d {
+                    width: iw,
+                    height: ih,
+                    depth_or_array_layers: 1,
+                },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
@@ -318,7 +367,11 @@ impl Crt {
         g.queue.write_texture(
             input.as_image_copy(),
             &frame.data,
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(iw * 4), rows_per_image: None },
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(iw * 4),
+                rows_per_image: None,
+            },
             input.size(),
         );
 
@@ -326,7 +379,11 @@ impl Crt {
         if self.target.as_ref().is_none_or(|t| t.w != ow || t.h != oh) {
             let texture = g.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("crt-output"),
-                size: wgpu::Extent3d { width: ow, height: oh, depth_or_array_layers: 1 },
+                size: wgpu::Extent3d {
+                    width: ow,
+                    height: oh,
+                    depth_or_array_layers: 1,
+                },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
@@ -335,14 +392,22 @@ impl Crt {
                 view_formats: &[],
             });
             let view = texture.create_view(&Default::default());
-            let bpr = (ow * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+            let bpr = (ow * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+                * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
             let buffer = g.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("crt-readback"),
                 size: (bpr * oh) as u64,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             });
-            self.target = Some(Target { w: ow, h: oh, bpr, texture, view, buffer });
+            self.target = Some(Target {
+                w: ow,
+                h: oh,
+                bpr,
+                texture,
+                view,
+                buffer,
+            });
         }
         let t = self.target.as_ref().unwrap();
 
@@ -363,7 +428,11 @@ impl Crt {
             t.texture.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
                 buffer: &t.buffer,
-                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(t.bpr), rows_per_image: None },
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(t.bpr),
+                    rows_per_image: None,
+                },
             },
             t.texture.size(),
         );
@@ -375,10 +444,16 @@ impl Crt {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
-        g.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| format!("GPU の待機に失敗しました: {e}"))?;
-        rx.recv().map_err(|e| e.to_string())?.map_err(|e| format!("読み戻しに失敗しました: {e}"))?;
+        g.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| format!("GPU の待機に失敗しました: {e}"))?;
+        rx.recv()
+            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("読み戻しに失敗しました: {e}"))?;
         {
-            let data = slice.get_mapped_range().map_err(|e| format!("読み戻しに失敗しました: {e:?}"))?;
+            let data = slice
+                .get_mapped_range()
+                .map_err(|e| format!("読み戻しに失敗しました: {e:?}"))?;
             let row = (ow * 4) as usize;
             self.out.clear();
             self.out.reserve(row * oh as usize);

@@ -10,12 +10,16 @@
 //!    - 磁性体の伝達特性 ([`magnetic`]) は記録するすべての信号に掛ける: クロマの包絡線の圧縮に加えて、
 //!      FM の RF (搬送波 + 低域変換クロマ) の瞬時値にも掛ける。Fm モデルでは実際に RF に通し、
 //!      Simple モデルでは搬送波の圧縮 (S/N の低下) と相互変調 (2 × 低域変換周波数のモアレ) で近似する
-//! 2. 媒体の欠陥: ドロップアウトとドロップアウト補償 (DOC)、しわ (クリース)、ヘッド目詰まり
-//!    (しわと目詰まりは再生 RF レベルの低下として扱い、ノイズ・ドロップアウト・時間軸の乱れに波及させる)
+//! 2. 媒体の欠陥: ドロップアウトとドロップアウト補償 (DOC)、しわ (クリース)、ヘッド目詰まり。
+//!    どれもヘッドとテープの間隔 (スペーシング) が広がる現象として扱い、損失 e^{-kd} ([`head`]) で
+//!    周波数の高い信号ほど大きく落とす (FM では搬送波の高い白から先に崩れ、浅いドロップアウトは白い部分だけに出る)。
+//!    トラッキングずれは再生できるトラック幅が減るだけなので、周波数によらない RF レベルの低下にする。
+//!    RF レベルの低下はノイズ・ドロップアウト・時間軸の乱れに波及させる
 //! 3. 走行系: ジッタ、ワウフラッタ、スキュー、ヘッド切替、トラッキングずれ (時間軸誤差として
 //!    ライン全体 = 同期・バーストごとずらす。補正は受像機の AFC/バースト同期に任せる)、垂直方向の揺れ
 
 pub mod fm;
+pub mod head;
 pub mod magnetic;
 
 use crate::filter::{Biquad, Cascade, fractional_shift};
@@ -31,10 +35,68 @@ const STREAM_PATH: u64 = 1;
 const STREAM_DROPOUT: u64 = 2;
 const STREAM_TRANSPORT: u64 = 3;
 const STREAM_DAMAGE: u64 = 5;
+const STREAM_DROPOUT_NOISE: u64 = 6;
+
+/// しわの中心でテープが浮く量 [m]。VHS の中心搬送波でおよそ −30 dB
+const CREASE_SPACING: f32 = 0.85e-6;
+/// 目詰まりでヘッドのギャップに付いた汚れの厚み [m] (ひどい側 / 軽い側の範囲)
+const CLOG_SPACING_FULL: f32 = 0.95e-6;
+const CLOG_SPACING_PARTIAL: (f32, f32) = (0.2e-6, 0.7e-6);
+/// ドロップアウトの縁 (スペーシングが立ち上がるまで) の長さ [サンプル]
+const DROPOUT_EDGE: usize = 6;
+
+/// ドロップアウト: [開始, 終了) [サンプル] と、その間のスペーシング [m]
+pub type Dropout = (usize, usize, f32);
+
+/// スペーシング損失を見積もるための値 (フィールドごとに作る)
+#[derive(Clone, Copy)]
+struct SpacingModel {
+    /// 書き込み速度 [m/s]
+    speed: f32,
+    /// 搬送波の中心周波数 [Hz] (DOC の検出と RF レベルの目安)
+    f_mid: f32,
+    /// 輝度レベル [IRE] → 搬送波周波数 [Hz]: f_sync + (y - sync) · hz_per_ire
+    f_sync: f32,
+    hz_per_ire: f32,
+    sync_ire: f32,
+    /// 低域変換周波数 [Hz]
+    f_cu: f32,
+}
+
+impl SpacingModel {
+    fn new(tp: &TapeParams, s: &Standard) -> Self {
+        let lv = s.ire;
+        Self {
+            speed: tp.writing_speed_mps.max(0.1),
+            f_mid: 0.5 * (tp.fm_sync_mhz + tp.fm_white_mhz) * 1e6,
+            f_sync: tp.fm_sync_mhz * 1e6,
+            hz_per_ire: (tp.fm_white_mhz - tp.fm_sync_mhz) * 1e6 / (lv.white - lv.sync),
+            sync_ire: lv.sync,
+            f_cu: tp.color_under_khz * 1e3,
+        }
+    }
+
+    /// 輝度レベル [IRE] を記録した搬送波の周波数 [Hz]
+    #[inline]
+    fn carrier(&self, y: f32) -> f32 {
+        (self.f_sync + (y - self.sync_ire) * self.hz_per_ire).max(0.0)
+    }
+
+    /// 周波数 f でスペーシング d のときの損失 (振幅比)
+    #[inline]
+    fn loss(&self, f: f32, d: f32) -> f32 {
+        head::spacing_loss(f, self.speed, d)
+    }
+}
 
 pub struct TapeSim {
     y_buf: Vec<f32>,
     c_buf: Vec<f32>,
+    /// トラッキングずれによる RF レベル (周波数によらない、1 = 正常)
+    rf_track: Vec<f32>,
+    /// しわ・目詰まりによるラインごとの余分なスペーシング [m]
+    line_spacing: Vec<f32>,
+    /// 実効の RF レベル (トラッキング × 中心搬送波でのスペーシング損失)。ノイズ・ドロップアウト・時間軸の乱れの目安
     rf_level: Vec<f32>,
     offsets: Vec<f32>,
     /// ジッタのランダムウォーク状態 (フィールドをまたいで連続)
@@ -49,8 +111,8 @@ pub struct TapeSim {
     crease: Option<(f32, f32, f32, f32)>,
     /// ヘッド目詰まりの残りフィールド数
     clog_left: f32,
-    /// ラインごとのドロップアウト区間 [開始, 終了) (Fm モデルで RF の欠落として使う)
-    drops: Vec<Vec<(usize, usize)>>,
+    /// ラインごとのドロップアウト (区間とスペーシング)
+    drops: Vec<Vec<Dropout>>,
     /// 直前のフィールドの再生信号 (垂直揺れでストリームの前のラインが入ってくるとき使う) と、その偶奇
     prev_y: Vec<f32>,
     prev_c: Vec<f32>,
@@ -58,7 +120,7 @@ pub struct TapeSim {
 }
 
 /// 色の低域変換記録 → 再生 (複素包絡線で等価的に扱う)
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ChromaRec {
     c_bp: Cascade,
     lp_i: Cascade,
@@ -101,11 +163,24 @@ struct SimpleRf {
 }
 
 impl SimpleRf {
-    fn new(mag: MagneticTransfer, tp: &TapeParams, s: &Standard) -> Self {
+    fn new(mag: &MagneticTransfer, tp: &TapeParams, s: &Standard) -> Self {
         use std::f32::consts::TAU;
         let dcu = TAU * tp.color_under_khz * 1e3 / s.fs;
         if mag.is_linear() {
             return Self { noise_gain: 1.0, imd: 0.0, dcu };
+        }
+        let k_cu = tp.color_under_level.max(0.0) / s.ire.burst.max(1e-3);
+        let dev_hz = (tp.fm_white_mhz - tp.fm_sync_mhz).max(0.1) * 1e6;
+        let ire_per_hz = (s.ire.white - s.ire.sync) / dev_hz;
+        if mag.is_jiles_atherton() {
+            // 状態付きの J-A で搬送波を記録して測る。基本波 F(c) は直流 c を重ねると偶関数で縮み
+            // (F(c) ≈ F0 - F2 c²)、振幅 b の色を重ねると a ± 2c に (F0 - F(b)) / 4 の側波帯が立つ。
+            // 小さい b は J-A の数値の揺れに埋もれるので、b = 0.1 で測って b² に比例させる
+            let f0 = mag.carrier_fundamental(0.0).max(0.05);
+            let b = k_cu.max(0.1);
+            let side = (f0 - mag.carrier_fundamental(b)).abs() / 4.0 * (k_cu / b).powi(2) / f0;
+            let imd = 0.5 * side * 2.0 * tp.color_under_khz * 1e3 * ire_per_hz;
+            return Self { noise_gain: 1.0 / f0, imd, dcu };
         }
         // 搬送波 (振幅 1) の基本波の振幅 = 飽和後の再生 RF レベル
         const N: usize = 64;
@@ -121,9 +196,6 @@ impl SimpleRf {
         // 対称な側波帯は AM でリミッタに消されるが、伝送路の傾きで半分ほどが PM になり、
         // 周波数偏移 r · 2 f_cu として復調される
         let sat = mag.saturation();
-        let k_cu = tp.color_under_level.max(0.0) / s.ire.burst.max(1e-3);
-        let dev_hz = (tp.fm_white_mhz - tp.fm_sync_mhz).max(0.1) * 1e6;
-        let ire_per_hz = (s.ire.white - s.ire.sync) / dev_hz;
         let imd = 0.5 * k_cu * k_cu / (4.0 * sat * sat) * 2.0 * tp.color_under_khz * 1e3 * ire_per_hz;
         Self { noise_gain: 1.0 / fund.max(0.05), imd, dcu }
     }
@@ -141,6 +213,8 @@ impl TapeSim {
         Self {
             y_buf: vec![0.0; n],
             c_buf: vec![0.0; n],
+            rf_track: vec![1.0; s.raster_lines],
+            line_spacing: vec![0.0; s.raster_lines],
             rf_level: vec![1.0; s.raster_lines],
             offsets: vec![0.0; s.raster_lines],
             jitter_state: 0.0,
@@ -163,35 +237,35 @@ impl TapeSim {
         if self.y_buf.len() != field.data.len() {
             *self = Self::new(field.std);
         }
-        self.compute_rf_level(field, tp, tr, seed);
-        if tp.luma_model == LumaModel::Fm {
-            // ドロップアウトは RF の欠落として FM 復調に通し、DOC はその後で掛ける
-            self.plan_dropouts(field, tp, seed);
-            self.signal_path(field, tp, seed);
-            self.compensate_dropouts(field, tp);
-        } else {
-            self.signal_path(field, tp, seed);
-            self.dropouts(field, tp, seed);
-        }
+        let sm = SpacingModel::new(tp, field.std);
+        self.compute_rf_level(field, tp, tr, seed, &sm);
+        // ドロップアウトはスペーシングの急な広がり。Fm モデルでは RF の損失として FM 復調に通す
+        self.plan_dropouts(field, tp, seed);
+        self.signal_path(field, tp, seed, &sm);
+        self.apply_dropouts(field, tp, seed, &sm);
         self.transport(field, tr, seed);
     }
 
-    /// トラッキングずれによるライン毎の再生 RF レベル (1 = 正常)
-    fn compute_rf_level(&mut self, field: &Field, tp: &TapeParams, tr: &TransportParams, seed: u64) {
+    /// ライン毎の再生 RF レベル: トラッキングずれ (周波数によらない) と、しわ・目詰まりのスペーシング
+    fn compute_rf_level(&mut self, field: &Field, tp: &TapeParams, tr: &TransportParams, seed: u64, sm: &SpacingModel) {
         let te = tr.tracking_error.clamp(0.0, 1.0);
         let band_h = 24.0;
         let period = field.std.raster_lines as f32 + 2.0 * band_h;
         let center = (field.index as f32 * tr.tracking_speed).rem_euclid(period) - band_h;
-        for (l, rf) in self.rf_level.iter_mut().enumerate() {
+        for (l, rf) in self.rf_track.iter_mut().enumerate() {
             let d = (l as f32 - center) / band_h;
             let bump = (-d * d * 2.0).exp();
             // トラッキングがずれると全体の RF もいくらか落ちる
             *rf = (1.0 - te * (0.3 + 0.7 * bump)).max(0.02);
         }
+        self.line_spacing.fill(0.0);
         self.damage(field, tp, seed);
+        for ((rf, &track), &d) in self.rf_level.iter_mut().zip(&self.rf_track).zip(&self.line_spacing) {
+            *rf = (track * sm.loss(sm.f_mid, d)).max(1e-3);
+        }
     }
 
-    /// しわ・ヘッド目詰まりのイベントを進め、RF レベルに反映する
+    /// しわ・ヘッド目詰まりのイベントを進め、ラインごとのスペーシングに足す
     fn damage(&mut self, field: &Field, tp: &TapeParams, seed: u64) {
         let mut rng = Rng::derive(seed, field.index, 0, STREAM_DAMAGE);
         let s = field.std;
@@ -208,11 +282,12 @@ impl TapeSim {
         if let Some((left, center, drift, height)) = self.crease.as_mut() {
             // 出始めと終わりは弱い
             let env = (*left / 3.0).min(1.0);
-            for (l, rf) in self.rf_level.iter_mut().enumerate() {
+            // しわの山でテープがヘッドから浮く
+            for (l, sp) in self.line_spacing.iter_mut().enumerate() {
                 let d = (l as f32 - *center).abs() / *height;
                 if d < 1.5 {
                     let depth = env * (1.0 - (d / 1.5).powi(2)) * (0.7 + 0.3 * rng.uniform());
-                    *rf = (*rf * (1.0 - 0.97 * depth)).max(0.02);
+                    *sp += CREASE_SPACING * depth;
                 }
             }
             *center += *drift + rng.normal() * 0.7;
@@ -226,16 +301,17 @@ impl TapeSim {
             self.clog_left = 3.0 + rng.exponential(12.0);
         }
         if self.clog_left > 0.0 {
-            // 片側ヘッドだけ詰まることが多いので、フィールドごとに程度が変わる
-            let depth = if field.parity == 0 { 0.98 } else { 0.6 + 0.35 * rng.uniform() };
-            for rf in self.rf_level.iter_mut() {
-                *rf = (*rf * (1.0 - depth)).max(0.02);
+            // ギャップに付いた汚れの厚みがスペーシングになる。片側ヘッドだけ詰まることが多いので、フィールドごとに程度が変わる
+            let (lo, hi) = CLOG_SPACING_PARTIAL;
+            let d = if field.parity == 0 { CLOG_SPACING_FULL } else { lo + (hi - lo) * rng.uniform() };
+            for sp in self.line_spacing.iter_mut() {
+                *sp += d;
             }
             self.clog_left -= 1.0;
         }
     }
 
-    fn signal_path(&mut self, field: &Field, tp: &TapeParams, seed: u64) {
+    fn signal_path(&mut self, field: &Field, tp: &TapeParams, seed: u64, sm: &SpacingModel) {
         let s = field.std;
         let (fs, ls) = (s.fs, s.line_samples);
         let lv = s.ire;
@@ -248,10 +324,20 @@ impl TapeSim {
         let c_bp = Cascade::new(&[Biquad::bandpass_at(s.fsc, 2.5, fs)]);
         let c_lp = Cascade::butter_lowpass_at(2, tp.chroma_bw_khz * 1e3, fs);
         let cn_lp = Cascade::butter_lowpass_at(2, tp.chroma_bw_khz * 1e3, fs);
-        let mag = MagneticTransfer::new(tp.magnetic_model, tp.saturation_ire.max(1.0));
+        // 色の包絡線の伝達特性。J-A では FM 搬送波がバイアスになり、色は搬送波に対して
+        // color_under_level / バースト振幅 の割合で記録される
+        let cu_per_ire = tp.color_under_level.max(0.0) / lv.burst.max(1e-3);
+        let mag = MagneticTransfer::chroma(
+            tp.magnetic_model,
+            tp.magnetic_media,
+            tp.saturation_ire.max(1.0),
+            tp.rf_drive_hc,
+            cu_per_ire,
+        );
         // FM の RF の伝達特性 (搬送波の振幅 = 1 の尺度)
-        let rf_mag = MagneticTransfer::new(tp.magnetic_model, tp.rf_saturation.max(0.05));
-        let simple_rf = SimpleRf::new(rf_mag, tp, s);
+        let rf_mag =
+            MagneticTransfer::rf(tp.magnetic_model, tp.magnetic_media, tp.rf_saturation.max(0.05), tp.rf_drive_hc);
+        let simple_rf = SimpleRf::new(&rf_mag, tp, s);
         let fm = (tp.luma_model == LumaModel::Fm).then(|| {
             FmChannel::new(&FmConfig {
                 fs,
@@ -263,16 +349,28 @@ impl TapeSim {
                 noise: tp.fm_noise.max(0.0),
                 color_under_hz: tp.color_under_khz * 1e3,
                 color_under_level: tp.color_under_level.max(0.0),
-                mag: rf_mag,
+                mag: rf_mag.clone(),
+                writing_speed: tp.writing_speed_mps,
+                extra_spacing: tp.head_spacing_um * 1e-6,
             })
         });
+        // 余分なスペーシング (再生 EQ が想定していないぶん: ヘッドの汚れ + しわ・目詰まり) の損失。
+        // ヘッドアンプのノイズは減らないので、信号が弱まったぶんだけ S/N が落ちる
+        // (再生側の AGC/ACC がレベルを戻すとノイズが持ち上がる)
+        let base_spacing = tp.head_spacing_um.max(0.0) * 1e-6;
+        let sm = *sm;
         let drops = &self.drops;
+        let (rf_track, line_spacing) = (&self.rf_track, &self.line_spacing);
 
         // 帯域制限した白色雑音の rms を 1 に戻す係数
         let luma_noise_norm = (0.5 * fs / (tp.luma_bw_mhz * 1e6)).sqrt();
         let chroma_noise_norm = (0.5 * fs / (tp.chroma_bw_khz * 1e3)).sqrt();
         let phase_noise = tp.chroma_phase_noise_deg.to_radians();
-        let delay = tp.chroma_delay_samples;
+        // VCR の Y/C 遅延の整合: 色の経路 (バンドパス + 低域変換のローパス) の遅れを輝度の経路
+        // (ノッチ + ローパス) との差だけ打ち消し、残りの位置ずれは chroma_delay_samples だけにする
+        let chroma_path = c_bp.group_delay(s.fsc, fs) + c_lp.group_delay(1e3, fs);
+        let luma_path = rec_notch.group_delay(1e3, fs) + rec_lp.group_delay(1e3, fs);
+        let delay = tp.chroma_delay_samples - (chroma_path - luma_path).round().max(0.0) as i32;
         let (parity, frame, index) = (field.parity, field.frame, field.index);
         let rf_level = &self.rf_level;
 
@@ -284,14 +382,16 @@ impl TapeSim {
                 let x = field.line(l);
                 let mut rng = Rng::derive(seed, index, l as u64, STREAM_PATH);
                 let base = s.line_phase_base(l, frame, parity);
-                let noise_gain = 1.0 / rf_level[l];
+                // トラッキング (周波数によらない) とスペーシング (周波数ごと) は分けて掛ける
+                let noise_gain = 1.0 / rf_track[l];
+                let spacing = base_spacing + line_spacing[l];
                 let (mut rec_notch, mut rec_lp, mut pre, mut de, mut noise_lp, mut sharp) =
                     (rec_notch, rec_lp, pre, de, noise_lp, sharp);
-                let cn = tp.chroma_noise_ire * chroma_noise_norm * noise_gain;
-                let mut chroma = ChromaRec { c_bp, lp_i: c_lp, lp_q: c_lp, n_i: cn_lp, n_q: cn_lp, mag, cn };
+                let cn = tp.chroma_noise_ire * chroma_noise_norm * noise_gain / sm.loss(sm.f_cu, spacing);
+                let mut chroma = ChromaRec { c_bp, lp_i: c_lp, lp_q: c_lp, n_i: cn_lp, n_q: cn_lp, mag: mag.clone(), cn };
 
                 // 再生時の低域変換クロマの位相誤差 (APC で取り切れない残留分)
-                let dphi = rng.normal() * phase_noise * noise_gain.min(4.0);
+                let dphi = rng.normal() * phase_noise * (1.0 / rf_level[l]).min(4.0);
                 let (cd, sd) = (dphi.cos(), dphi.sin());
                 let mut beard_left = 0u32;
                 let mut cu_phase = rng.uniform() * std::f32::consts::TAU;
@@ -327,7 +427,8 @@ impl TapeSim {
                         &rec[..ls],
                         &cu_i[..ls],
                         &cu_q[..ls],
-                        rf_level[l],
+                        rf_track[l],
+                        line_spacing[l],
                         &drops[l],
                         &mut rng,
                         &mut demod[..ls],
@@ -351,11 +452,16 @@ impl TapeSim {
                         // 過変調でキャリアが消え、復調出力が黒側へ跳ねる
                         beard_left = 4 + (rng.uniform() * 24.0 * tp.bearding_strength) as u32;
                     }
-                    let noise = noise_lp.process(rng.normal())
+                    let mut noise = noise_lp.process(rng.normal())
                         * luma_noise_norm
                         * tp.luma_noise_ire
                         * noise_gain
                         * simple_rf.noise_gain;
+                    if spacing > 0.0 {
+                        // その瞬間の搬送波周波数でのスペーシング損失ぶんノイズが増える (白ほど大きい)。
+                        // 搬送波がノイズに埋もれる先 (−34 dB) は砂嵐と同じなので頭打ちにする
+                        noise /= sm.loss(sm.carrier(pe), spacing).max(0.02);
+                    }
 
                     // ---- 色 (低域変換) ----
                     let (bi, bq) = chroma.step(xv, (n + base) & 3, &mut rng);
@@ -382,7 +488,8 @@ impl TapeSim {
             });
     }
 
-    /// Fm モデル用: ラインごとのドロップアウト区間を決める (発生確率は Simple モデルと同じ)
+    /// ラインごとのドロップアウトを決める。ドロップアウトはテープの傷・磁性体の欠け・ゴミでテープが
+    /// ヘッドから浮くこと (スペーシングの急な広がり) として扱う。浅いものは白い部分だけが崩れ、深いものは RF が消える
     fn plan_dropouts(&mut self, field: &Field, tp: &TapeParams, seed: u64) {
         let ls = field.std.line_samples;
         for (l, segs) in self.drops.iter_mut().enumerate() {
@@ -396,52 +503,51 @@ impl TapeSim {
             while segs.len() < 3 && rng.uniform() < prob {
                 let start = (rng.uniform() * ls as f32) as usize;
                 let len = rng.exponential(tp.dropout_length * (1.0 + 2.0 * (1.0 - rf))) as usize + 2;
-                segs.push((start, (start + len).min(ls)));
+                // 浮きの量: 最低でも平均の 0.3 倍、裾の長い分布 (平均 1.3 倍)
+                let depth = tp.dropout_depth_um.max(0.0) * 1e-6 * (0.3 + rng.exponential(1.0));
+                segs.push((start, (start + len).min(ls), depth));
             }
         }
     }
 
-    /// Fm モデル用: ドロップアウト補償 (DOC)。RF の欠落を検出して 1H 前のラインで置き換える。
-    /// 補償しない場合は、FM 復調器が拾ったノイズ (白黒の砂嵐) がそのまま残る
-    fn compensate_dropouts(&mut self, field: &Field, tp: &TapeParams) {
+    /// ドロップアウトの再生側の処理。
+    ///
+    /// - RF レベルが DOC のしきい値 (中心搬送波で `doc_threshold_db`) より落ちたところは RF の欠落として検出し、
+    ///   DOC が有効なら 1H 前のラインで置き換え、色は止める
+    /// - しきい値より浅いところは検出されず、そのまま再生される: Fm モデルでは RF の損失がすでに復調に効いている
+    ///   (白い部分だけノイズ・黒い筋が出る)。Simple モデルでは搬送波周波数ごとのノイズの増加で近似する。
+    ///   低域変換クロマは損失のぶん薄くなる
+    /// - 深いのに補償しないときは、FM 復調器がノイズのゼロ交差を拾った砂嵐になる (Fm モデルでは計算済み)
+    fn apply_dropouts(&mut self, field: &Field, tp: &TapeParams, seed: u64, sm: &SpacingModel) {
         let ls = field.std.line_samples;
+        let fm = tp.luma_model == LumaModel::Fm;
         for l in 0..field.std.raster_lines {
-            for &(start, end) in &self.drops[l] {
-                for n in start..end {
-                    let i = l * ls + n;
-                    if tp.dropout_compensation && l > 0 {
-                        self.y_buf[i] = self.y_buf[i - ls];
-                    }
-                    self.c_buf[i] = 0.0;
-                }
+            if self.drops[l].is_empty() {
+                continue;
             }
-        }
-    }
-
-    fn dropouts(&mut self, field: &Field, tp: &TapeParams, seed: u64) {
-        if tp.dropout_rate <= 0.0 {
-            return;
-        }
-        let ls = field.std.line_samples;
-        for l in 0..field.std.raster_lines {
-            let mut rng = Rng::derive(seed, field.index, l as u64, STREAM_DROPOUT);
+            let mut rng = Rng::derive(seed, field.index, l as u64, STREAM_DROPOUT_NOISE);
             let rf = self.rf_level[l];
-            let prob = (tp.dropout_rate * (1.0 + 30.0 * (1.0 - rf))).min(1.0);
-            let mut events = 0;
-            while events < 3 && rng.uniform() < prob {
-                events += 1;
-                let start = (rng.uniform() * ls as f32) as usize;
-                let len = rng.exponential(tp.dropout_length * (1.0 + 2.0 * (1.0 - rf))) as usize + 2;
-                let end = (start + len).min(ls);
+            for &(start, end, depth) in &self.drops[l] {
+                let level = rf * sm.loss(sm.f_mid, depth);
+                let detected = -20.0 * level.max(1e-9).log10() >= tp.doc_threshold_db;
+                let cu_loss = sm.loss(sm.f_cu, depth);
                 for n in start..end {
                     let i = l * ls + n;
-                    if tp.dropout_compensation && l > 0 {
-                        self.y_buf[i] = self.y_buf[i - ls];
+                    if detected {
+                        if tp.dropout_compensation && l > 0 {
+                            self.y_buf[i] = self.y_buf[i - ls];
+                        } else if !fm {
+                            // RF が途切れると FM 復調器はリミッタ雑音を出す (白っぽいスパークル)
+                            self.y_buf[i] = 75.0 + 30.0 * rng.normal();
+                        }
+                        self.c_buf[i] = 0.0;
                     } else {
-                        // RF が途切れると FM 復調器はリミッタ雑音を出す (白っぽいスパークル)
-                        self.y_buf[i] = 75.0 + 30.0 * rng.normal();
+                        if !fm {
+                            let gain = 1.0 / sm.loss(sm.carrier(self.y_buf[i]), depth).max(0.02);
+                            self.y_buf[i] += tp.luma_noise_ire * (gain - 1.0) * rng.normal();
+                        }
+                        self.c_buf[i] *= cu_loss;
                     }
-                    self.c_buf[i] = 0.0;
                 }
             }
         }

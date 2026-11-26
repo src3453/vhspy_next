@@ -20,6 +20,11 @@ pub struct ScopeField {
     /// バッファ先頭のライン番号 (1 始まり)
     pub first_line: usize,
     pub frame_total_lines: usize,
+    /// バッファのうちこのフィールドだけのライン数 (次のフィールドのバッファの先頭と重ならない部分)。
+    /// 続けて並べると切れ目のない信号になる
+    pub own_lines: usize,
+    /// 垂直同期の始まるライン番号 [第 1, 第 2 フィールド]
+    pub vsync_line: [f32; 2],
     pub fs: f32,
     pub data: Arc<Vec<f32>>,
 }
@@ -28,10 +33,18 @@ impl ScopeField {
     pub fn from_field(id: u64, field: &Field) -> Self {
         let s = field.std;
         let data = if field.separate {
-            field.data.iter().zip(&field.chroma).map(|(y, c)| y + c).collect()
+            field
+                .data
+                .iter()
+                .zip(&field.chroma)
+                .map(|(y, c)| y + c)
+                .collect()
         } else {
             field.data.clone()
         };
+        let p = field.parity as usize & 1;
+        let fl = s.raster_first_line;
+        let own_lines = (fl[1 - p] + s.frame_total_lines - fl[p]) % s.frame_total_lines;
         Self {
             id,
             pal: s.is_pal(),
@@ -40,6 +53,8 @@ impl ScopeField {
             raster_lines: s.raster_lines,
             first_line: s.raster_first_line[field.parity as usize & 1],
             frame_total_lines: s.frame_total_lines,
+            own_lines: own_lines.min(s.raster_lines),
+            vsync_line: s.vsync_line,
             fs: s.fs,
             data: Arc::new(data),
         }
@@ -49,7 +64,8 @@ impl ScopeField {
     fn line(&self, n: usize) -> Option<&[f32]> {
         let t = self.frame_total_lines;
         let i = (n + t - self.first_line % t) % t;
-        (i < self.raster_lines).then(|| &self.data[i * self.line_samples..(i + 1) * self.line_samples])
+        (i < self.raster_lines)
+            .then(|| &self.data[i * self.line_samples..(i + 1) * self.line_samples])
     }
 }
 
@@ -75,7 +91,14 @@ impl ScopeRing {
     pub fn newer(&self, after: u64, max_fields: usize) -> Vec<Arc<ScopeField>> {
         let newest = self.fields.back().map_or(0, |f| f.id);
         let after = if newest < after { 0 } else { after };
-        let mut v: Vec<_> = self.fields.iter().rev().filter(|f| f.id > after).take(max_fields.max(1)).cloned().collect();
+        let mut v: Vec<_> = self
+            .fields
+            .iter()
+            .rev()
+            .filter(|f| f.id > after)
+            .take(max_fields.max(1))
+            .cloned()
+            .collect();
         v.reverse();
         v
     }

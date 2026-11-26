@@ -463,6 +463,11 @@ impl Decoder {
         // NTSC は I/Q 軸 (U/V から 33°) で検波する。PAL は U/V 軸のまま
         let hue = if pal { p.hue_deg.to_radians() } else { p.hue_deg.to_radians() + 33f32.to_radians() };
         let (active_start, active_end) = (s.active_start, s.active_end());
+        // 輝度遅延線: 実機は色の経路 (バンドパス + 復調後のローパス) の遅れに合わせて輝度を遅らせる。
+        // ここでは同じだけ色を前へ出す
+        let luma_delay = if separate || use_comb || use_3d { 0.0 } else { notch.group_delay(1e3, s.fs) };
+        let chroma_lead =
+            (c_bp.group_delay(s.fsc, s.fs) + c_lp.group_delay(1e3, s.fs) - luma_delay).round().max(0.0) as usize;
         let (chroma, line_refs) = (&self.chroma, &self.line_refs);
         self.det_a.par_chunks_mut(aw).zip(self.det_b.par_chunks_mut(aw)).enumerate().for_each(|(k, (da, db))| {
             let j = j0 + k as i64;
@@ -481,12 +486,16 @@ impl Decoder {
                 sin_t[q] = a.sin();
             }
             let (mut alp, mut blp) = (c_lp, c_lp);
-            for n in 0..active_end {
-                let a = alp.process(2.0 * c[n] * cos_t[n & 3]);
-                let b = blp.process(2.0 * c[n] * sin_t[n & 3]);
-                if n >= active_start {
-                    da[n - active_start] = a;
-                    db[n - active_start] = b;
+            let (mut a, mut b) = (0.0, 0.0);
+            for n in 0..active_end + chroma_lead {
+                if n < ls {
+                    a = alp.process(2.0 * c[n] * cos_t[n & 3]);
+                    b = blp.process(2.0 * c[n] * sin_t[n & 3]);
+                }
+                // ラインの終わりを越えたぶんは最後の値を保つ
+                if n >= active_start + chroma_lead {
+                    da[n - active_start - chroma_lead] = a;
+                    db[n - active_start - chroma_lead] = b;
                 }
             }
         });
@@ -649,7 +658,8 @@ impl Decoder {
     /// バースト相関の位相 μ は NTSC では副搬送波位相 φ そのもの、PAL では φ - 45°·sV (スウィンギングバースト)。
     /// - PAL アイデント: 隣り合うラインの μ の差は (ライン当たりの位相の進み) - 90°·sV になるので、
     ///   投票を積み重ねて PAL スイッチ (フリップフロップ) の向きを決める
-    /// - PLL: 前のラインの基準位相 + ライン当たりの進みを予測とし、バーストとの差に `burst_pll` を掛けて追従する。
+    /// - PLL: 前のラインの基準位相 + ライン当たりの進み (受像機の VCXO の周波数ずれぶんを含む) を予測とし、
+    ///   バーストとの差に `burst_pll` を掛けて追従する (1 次ループなので周波数ずれは定常位相誤差として残る)。
     ///   バーストが弱い・ない (帰線区間) ラインは予測のまま惰性で回る
     fn lock_subcarrier(&mut self, start: u64, n_new: usize, p: &DecoderParams) {
         use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, TAU};
@@ -658,6 +668,8 @@ impl Decoder {
         let step = s.line_phase_step() as f32 * FRAC_PI_2;
         let pal = s.is_pal();
         let k = p.burst_pll.clamp(0.0, 1.0);
+        // VCXO が 1 ラインのあいだに余分に進む位相
+        let drift = TAU * p.vcxo_offset_hz * s.line_time();
         let cap = self.line_refs.len() as u64;
         for i in 0..n_new {
             let sl = start + i as u64;
@@ -688,7 +700,7 @@ impl Decoder {
             let phase = match self.pll_prev {
                 None => measured,
                 Some(ph) => {
-                    let pred = wrap(ph + step);
+                    let pred = wrap(ph + step + drift);
                     if !valid {
                         pred
                     } else if k >= 1.0 {

@@ -1,15 +1,19 @@
 //! 輝度の FM 記録・再生を実際に計算するモデル。
 //!
-//! 1 ラインごとに次の順で処理する (通常 2 倍、J-A は 4 倍にオーバーサンプリング)。
+//! 1 ラインごとに次の順で処理する (2 倍にオーバーサンプリング)。
 //!
-//! 1. オーバーサンプリング: Hi8 (白 7.7 MHz) でも搬送波と側波帯がナイキスト周波数に収まるようにする
+//! 1. オーバーサンプリング: Hi8 (白 7.7 MHz) でも搬送波と側波帯がナイキスト周波数に収まるようにする。
+//!    J-A では記録 (変調と磁性体) だけを 8 倍で計算し、ローパスを掛けて 2 倍に間引いてから再生側に渡す。
+//!    J-A で飽和した搬送波は方形波に近く高調波が多いので、低いレートで解くと折り返しが復調出力の揺れになる
 //! 2. 周波数変調: シンクチップ〜ホワイトピークを各フォーマットの搬送波周波数に割り当てる。
 //!    エンファシスで白のエッジが行き過ぎると、ホワイトピークより高い周波数まで振れる
 //! 3. 低域変換クロマの重畳と磁性体の伝達特性: 実機では色は FM 信号をバイアス代わりに同じトラックへ
 //!    記録される。和の瞬時値が磁性体で飽和すると、搬送波とクロマの相互変調積が搬送波の近くに立ち
 //!    (伝送路の傾きで AM が PM に変わり)、輝度のモアレになる
 //! 4. 再生の伝送路: ヘッド・テープの高域損失 (ローパス)、クロマを分けるハイパス、RF ノイズ。
-//!    RF レベル (トラッキング・しわ・ドロップアウト) は搬送波の振幅として効く
+//!    RF レベル (トラッキング・しわ・ドロップアウト) は搬送波の振幅として効く。
+//!    ローパスは再生 EQ で補った後の正味の特性で、EQ が想定していない余分なスペーシング (ヘッドの汚れ・
+//!    テープの浮き) は [`super::head`] のスペーシング損失 e^{-kd} として記録信号にだけ掛ける (ノイズは後から足す)
 //! 5. リミッタ + 周期計測型の復調: ゼロ交差の間隔から瞬時周波数を求めて輝度に戻す。
 //!    高い周波数ほど伝送路で搬送波が弱まり、下側波帯が勝つとゼロ交差を見落として周波数が落ちる
 //!    (白のエッジの右に黒い筋 = ベアディング)。搬送波が消えるとノイズのゼロ交差を拾い、白黒の砂嵐になる
@@ -23,16 +27,21 @@ use crate::timing::{Levels, MAX_LINE_SAMPLES};
 pub const OVERSAMPLE: usize = 2;
 /// ライン先頭の前に流す助走 (元のレートのサンプル数)。フィルタと復調器を落ち着かせる
 const PRE_ROLL: usize = 48;
-const JA_OVERSAMPLE: usize = 4;
-const MAX_OVERSAMPLE: usize = JA_OVERSAMPLE;
-const MAX_LEN: usize = (MAX_LINE_SAMPLES + PRE_ROLL) * MAX_OVERSAMPLE;
+/// J-A の記録を計算するオーバーサンプリング倍率 ([`OVERSAMPLE`] の倍数)
+const JA_OVERSAMPLE: usize = 8;
+/// 再生側 (伝送路・復調) のバッファの長さ
+const MAX_LEN: usize = (MAX_LINE_SAMPLES + PRE_ROLL) * OVERSAMPLE;
+/// スペーシング損失の FIR の片側の最大タップ数
+const SPACING_HALF_MAX: usize = 160;
 
 /// FM 伝送路の設定 (フィールドごとに作る)
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct FmChannel {
-    /// J-A は 4 倍、それ以外は従来どおり 2 倍で処理する
+    /// 記録を計算するオーバーサンプリング倍率 (J-A は 8 倍、それ以外は 2 倍)
     oversample: usize,
-    /// オーバーサンプリング後のサンプリング周波数 [Hz]
+    /// 記録を再生側のレート (2 倍) に間引くときのアンチエイリアスのローパス (J-A のみ)
+    decimate: Option<Cascade>,
+    /// 再生側 (2 倍オーバーサンプリング) のサンプリング周波数 [Hz]
     fs2: f32,
     /// シンクチップ・ホワイトピークの搬送波周波数 [Hz]
     f_sync: f32,
@@ -50,6 +59,11 @@ pub struct FmChannel {
     mag: MagneticTransfer,
     /// 伝送路と復調後のフィルタの遅れ [オーバーサンプリング後のサンプル]。出力を前にずらして打ち消す
     delay: f32,
+    /// 余分なスペーシングの損失 (零位相 FIR、長さ 2 * spacing_half + 1)。spacing_half = 0 なら掛けない
+    spacing: [f32; 2 * SPACING_HALF_MAX + 1],
+    spacing_half: usize,
+    /// 2π / 書き込み速度 [s/m]。周波数 f、スペーシング d の損失は e^{-spacing_k f d}
+    spacing_k: f32,
 }
 
 /// `x[m-1]` と `x[m]` の間のゼロ交差の位置 (0..1)。
@@ -182,19 +196,36 @@ pub struct FmConfig {
     pub color_under_level: f32,
     /// 磁性体の伝達特性 (飽和レベルは搬送波の振幅 = 1 の尺度)
     pub mag: MagneticTransfer,
+    /// ヘッドとテープの相対速度 (書き込み速度) [m/s]
+    pub writing_speed: f32,
+    /// 再生 EQ が想定していない余分なスペーシング [m]
+    pub extra_spacing: f32,
 }
 
 impl FmChannel {
     pub fn new(c: &FmConfig) -> Self {
         let oversample = if c.mag.is_jiles_atherton() { JA_OVERSAMPLE } else { OVERSAMPLE };
-        let fs2 = c.fs * oversample as f32;
+        let fs2 = c.fs * OVERSAMPLE as f32;
         let bw = c.channel_bw_hz.clamp(0.5e6, 0.45 * fs2);
+        // 間引きのローパス: 伝送路の帯域は通し、間引いた後に帯域へ折り返す成分 (fs2 - bw 以上) を十分落とす
+        let decimate = (oversample > OVERSAMPLE).then(|| {
+            Cascade::butter_lowpass_at(8, (1.15 * bw).min(0.42 * fs2), c.fs * oversample as f32)
+        });
+        let decimate_delay = decimate.map_or(0.0, |f| dc_delay(f) / (oversample / OVERSAMPLE) as f32);
         // 低域変換クロマ (〜1.2 MHz) と搬送波の下側波帯の間で切る
         let hp = (0.4 * c.f_sync_hz).clamp(0.3e6, 0.4 * bw);
         let rf_lp = Cascade::butter_lowpass_at(4, bw, fs2);
         let post_lp = Cascade::butter_lowpass_at(4, c.luma_bw_hz.clamp(0.3e6, 0.4 * c.fs), fs2);
+        // e^{-k d} = e^{-2π f d / v} → 離散時間では e^{-|ω| τ}、τ = d / v · fs2 [サンプル]
+        let mut spacing = [0f32; 2 * SPACING_HALF_MAX + 1];
+        let tau = c.extra_spacing.max(0.0) / c.writing_speed.max(0.1) * fs2;
+        let spacing_half = if tau > 1e-3 { ((16.0 * tau).ceil() as usize).clamp(4, SPACING_HALF_MAX) } else { 0 };
+        if spacing_half > 0 {
+            super::head::spacing_kernel(tau, &mut spacing[..2 * spacing_half + 1]);
+        }
         Self {
             oversample,
+            decimate,
             fs2,
             f_sync: c.f_sync_hz,
             f_white: c.f_white_hz.max(c.f_sync_hz + 0.1e6),
@@ -203,12 +234,15 @@ impl FmChannel {
             rf_hp: Cascade::butter_highpass_at(2, hp, fs2),
             post_lp,
             // 周期計測の復調は直前の半周期の平均を出すので、さらに約 1/4 周期遅れる
-            delay: dc_delay(rf_lp) + dc_delay(post_lp) + 0.25 * fs2 / c.f_sync_hz,
+            delay: dc_delay(rf_lp) + dc_delay(post_lp) + 0.25 * fs2 / c.f_sync_hz + decimate_delay,
             // 白色雑音を帯域 bw で切ると rms は sqrt(2 bw / fs2) 倍になるので戻しておく
             noise: c.noise * (0.5 * fs2 / bw).sqrt(),
             cu_freq: c.color_under_hz,
             cu_gain: c.color_under_level / c.levels.burst.max(1e-3),
-            mag: c.mag,
+            mag: c.mag.clone(),
+            spacing,
+            spacing_half,
+            spacing_k: std::f32::consts::TAU / c.writing_speed.max(0.1),
         }
     }
 
@@ -228,15 +262,22 @@ impl FmChannel {
     ///
     /// - `luma`: 記録する輝度 (エンファシス・クリップ後) [IRE]
     /// - `cu_i`, `cu_q`: 低域変換クロマの複素包絡線 [IRE] (色がなければ空でよい)
-    /// - `amp`: 搬送波の振幅 (RF レベル)。ドロップアウト区間は `drop` で 0 近くまで落とす
+    /// - `amp`: 搬送波の振幅 (トラッキングずれによる RF レベル。周波数によらない)
+    /// - `line_spacing`: このラインの余分なスペーシング (しわ・目詰まり) [m]
+    /// - `drop`: ドロップアウト ([開始, 終了) [サンプル] とスペーシング [m])。縁はなだらかに立ち上げる
     /// - `out`: 復調した輝度 [IRE] (ディエンファシス前)
+    ///
+    /// ライン・ドロップアウトのスペーシングは時間とともに変わるので FIR にせず、その瞬間の搬送波周波数での
+    /// 損失 e^{-2π f d / v} を振幅に掛ける (準静的な近似。側波帯ごとの傾きは無視する)
+    #[allow(clippy::too_many_arguments)]
     pub fn process_line(
         &self,
         luma: &[f32],
         cu_i: &[f32],
         cu_q: &[f32],
         amp: f32,
-        drop: &[(usize, usize)],
+        line_spacing: f32,
+        drop: &[super::Dropout],
         rng: &mut Rng,
         out: &mut [f32],
     ) {
@@ -244,7 +285,9 @@ impl FmChannel {
         let n = luma.len();
         debug_assert!(n <= MAX_LINE_SAMPLES && out.len() == n);
         let os = self.oversample;
-        let len = (n + PRE_ROLL) * os;
+        let decim = os / OVERSAMPLE;
+        let len_gen = (n + PRE_ROLL) * os;
+        let len = (n + PRE_ROLL) * OVERSAMPLE;
         let has_cu = cu_i.len() == n && cu_q.len() == n && self.cu_gain > 0.0;
 
         // 元のレートでの値 (助走区間はシンクチップ)
@@ -257,16 +300,17 @@ impl FmChannel {
         let mut rf = [0f32; MAX_LEN];
         let mut phase = rng.uniform() * TAU;
         let mut cu_phase = rng.uniform() * TAU;
-        let (dphi_k, dcu) = (TAU / self.fs2, TAU * self.cu_freq / self.fs2);
+        let fs_gen = self.fs2 * decim as f32;
+        let (dphi_k, dcu) = (TAU / fs_gen, TAU * self.cu_freq / fs_gen);
         let (mut lp, mut hp) = (self.rf_lp, self.rf_hp);
+        let mut aa = self.decimate;
         // Line-local state keeps this PoC compatible with the existing parallel line renderer.
         // The sync-carrier pre-roll gives the hysteresis loop several cycles to settle.
         let mut magnetic = self.mag.state();
         let ct = cos_table();
-        for m in 0..len {
+        for m in 0..len_gen {
             let i = (m / os) as isize;
-            // Catmull-Rom interpolation. At 2x this is the previous midpoint formula;
-            // the J-A model uses quarter-sample points for its 4x RF oversampling.
+            // Catmull-Rom interpolation. At 2x this is the previous midpoint formula.
             let frac = (m % os) as f32 / os as f32;
             let v = if frac == 0.0 {
                 at(i)
@@ -279,20 +323,25 @@ impl FmChannel {
                     + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
                     + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3)
             };
-            phase += dphi_k * self.freq_of(v);
+            let f_inst = self.freq_of(v);
+            phase += dphi_k * f_inst;
             if phase > TAU {
                 phase -= TAU;
             }
-            // 搬送波の振幅: ドロップアウト区間は端をなだらかにして落とす
+            // 搬送波の振幅: しわ・目詰まり・ドロップアウトのスペーシング損失 (ドロップアウトは縁をなだらかに)
             let src = (m / os).saturating_sub(PRE_ROLL);
-            let mut a = amp;
+            let mut spacing = line_spacing;
             if m >= PRE_ROLL * os {
-                for &(s, e) in drop {
+                for &(s, e, depth) in drop {
                     let d = if src < s { s - src } else if src >= e { src + 1 - e } else { 0 };
-                    if d < 6 {
-                        a *= 0.03 + 0.97 * d as f32 / 6.0;
+                    if d < super::DROPOUT_EDGE {
+                        spacing += depth * (1.0 - d as f32 / super::DROPOUT_EDGE as f32);
                     }
                 }
+            }
+            let mut a = amp;
+            if spacing > 0.0 {
+                a *= (-self.spacing_k * f_inst.max(0.0) * spacing).exp();
             }
             // 記録: 搬送波 + 低域変換クロマを磁性体の伝達特性に通す
             let mut rec = fast_cos(ct, phase);
@@ -305,9 +354,35 @@ impl FmChannel {
                 rec += self.cu_gain * (cu_i[j] * fast_cos(ct, cu_phase) - cu_q[j] * fast_sin(ct, cu_phase));
             }
             // 再生: 同じトラックなので、クロマも RF レベルの影響を同じだけ受ける
-            let recorded = magnetic.process(rec, self.fs2);
-            let x = a * recorded + self.noise * rng.normal();
-            rf[m] = hp.process(lp.process(x));
+            let y = a * magnetic.process(rec);
+            match aa.as_mut() {
+                None => rf[m] = y,
+                Some(f) => {
+                    let y = f.process(y);
+                    if m % decim == 0 {
+                        rf[m / decim] = y;
+                    }
+                }
+            }
+        }
+        // 余分なスペーシング: テープから出る信号だけが弱まり、ヘッドアンプのノイズはそのまま (S/N が落ちる)
+        if self.spacing_half > 0 {
+            let h = self.spacing_half;
+            let taps = &self.spacing[..2 * h + 1];
+            let mut src = [0f32; MAX_LEN];
+            src[..len].copy_from_slice(&rf[..len]);
+            for (m, o) in rf.iter_mut().enumerate().take(len) {
+                let mut acc = 0f32;
+                for (j, t) in taps.iter().enumerate() {
+                    let i = (m + j).saturating_sub(h).min(len - 1);
+                    acc += t * src[i];
+                }
+                *o = acc;
+            }
+        }
+        for v in rf.iter_mut().take(len) {
+            let x = *v + self.noise * rng.normal();
+            *v = hp.process(lp.process(x));
         }
 
         // --- リミッタ + 周期計測型の復調 ---
@@ -343,7 +418,7 @@ impl FmChannel {
         }
         // --- 遅れを打ち消して間引く ---
         for (j, o) in out.iter_mut().enumerate() {
-            let t = ((j + PRE_ROLL) * os) as f32 + self.delay;
+            let t = ((j + PRE_ROLL) * OVERSAMPLE) as f32 + self.delay;
             let i0 = (t.floor() as usize).min(len - 2);
             let fr = (t - i0 as f32).clamp(0.0, 1.0);
             *o = self.level_of(freq[i0] + (freq[i0 + 1] - freq[i0]) * fr);
@@ -357,6 +432,10 @@ mod tests {
     use crate::timing::NTSC;
 
     fn channel(noise: f32) -> FmChannel {
+        channel_with_spacing(noise, 0.0)
+    }
+
+    fn channel_with_spacing(noise: f32, extra_spacing: f32) -> FmChannel {
         FmChannel::new(&FmConfig {
             fs: NTSC.fs,
             f_sync_hz: 3.4e6,
@@ -368,7 +447,59 @@ mod tests {
             color_under_hz: 629e3,
             color_under_level: 0.0,
             mag: MagneticTransfer::new(crate::params::MagneticModel::Linear, 1.0),
+            writing_speed: 5.8,
+            extra_spacing,
         })
+    }
+
+    /// 余分なスペーシングでは信号だけが弱まるので、高い搬送波 (白) ほど S/N が落ちる。
+    /// ノイズがなければ復調したレベルは変わらない
+    #[test]
+    fn spacing_hurts_white_more_than_black() {
+        let quiet = channel_with_spacing(0.0, 0.3e-6);
+        for level in [7.5f32, 100.0] {
+            let input = vec![level; 910];
+            let mut out = vec![0f32; 910];
+            quiet.process_line(&input, &[], &[], 1.0, 0.0, &[], &mut Rng::new(1), &mut out);
+            let (mean, sd, _, _) = stats(&out[100..800]);
+            assert!((mean - level).abs() < 0.5 && sd < 0.3, "level {level}: mean {mean} sd {sd}");
+        }
+        let sd_at = |spacing: f32, level: f32| {
+            let ch = channel_with_spacing(0.08, spacing);
+            let input = vec![level; 910];
+            let mut out = vec![0f32; 910];
+            ch.process_line(&input, &[], &[], 1.0, 0.0, &[], &mut Rng::new(7), &mut out);
+            stats(&out[100..800]).1
+        };
+        let (black0, white0) = (sd_at(0.0, 7.5), sd_at(0.0, 100.0));
+        let (black, white) = (sd_at(0.3e-6, 7.5), sd_at(0.3e-6, 100.0));
+        assert!(black > black0 && white > white0, "noise must grow: {black0}->{black}, {white0}->{white}");
+        assert!(white / white0 > black / black0, "white {white0}->{white}, black {black0}->{black}");
+    }
+
+    /// 浅いドロップアウト (スペーシング) は区間の中だけで効き、黒より白を大きく乱す。
+    /// ライン全体のスペーシング (しわ・目詰まり) も同じ向きに効く
+    #[test]
+    fn shallow_dropout_and_line_spacing_hit_white_first() {
+        let ch = channel(0.05);
+        let sd_in = |level: f32, line_spacing: f32, drop: &[crate::tape::Dropout], range: std::ops::Range<usize>| {
+            let input = vec![level; 910];
+            let mut out = vec![0f32; 910];
+            ch.process_line(&input, &[], &[], 1.0, line_spacing, drop, &mut Rng::new(3), &mut out);
+            stats(&out[range]).1
+        };
+        let drop = [(300usize, 600usize, 0.35e-6f32)];
+        for level in [7.5f32, 100.0] {
+            // 区間の外は乱れない
+            let outside = sd_in(level, 0.0, &drop, 100..250);
+            assert!((outside - sd_in(level, 0.0, &[], 100..250)).abs() < 1e-4, "level {level}");
+        }
+        let ratio = |level: f32| sd_in(level, 0.0, &drop, 330..570) / sd_in(level, 0.0, &[], 330..570);
+        let (black, white) = (ratio(7.5), ratio(100.0));
+        assert!(black > 1.0 && white > black, "dropout noise ratio: black {black}, white {white}");
+        let line = |level: f32| sd_in(level, 0.35e-6, &[], 100..800) / sd_in(level, 0.0, &[], 100..800);
+        let (black, white) = (line(7.5), line(100.0));
+        assert!(black > 1.0 && white > black, "line spacing noise ratio: black {black}, white {white}");
     }
 
     fn stats(v: &[f32]) -> (f32, f32, f32, f32) {
@@ -385,9 +516,36 @@ mod tests {
             let input = vec![level; 910];
             let mut out = vec![0f32; 910];
             let mut rng = Rng::new(1);
-            ch.process_line(&input, &[], &[], 1.0, &[], &mut rng, &mut out);
+            ch.process_line(&input, &[], &[], 1.0, 0.0, &[], &mut rng, &mut out);
             let (mean, sd, _, _) = stats(&out[100..800]);
             assert!((mean - level).abs() < 0.5 && sd < 0.3, "level {level}: mean {mean} sd {sd}");
+        }
+    }
+
+    /// J-A (メタルテープ、記録磁界 3 Hc) で RF を記録しても、FM なので輝度のレベルは保たれる
+    #[test]
+    fn jiles_atherton_rf_keeps_levels() {
+        use crate::params::{MagneticMedia, MagneticModel};
+        let ch = FmChannel::new(&FmConfig {
+            fs: NTSC.fs,
+            f_sync_hz: 3.4e6,
+            f_white_hz: 4.4e6,
+            levels: NTSC.ire,
+            channel_bw_hz: 5.5e6,
+            luma_bw_hz: 3.0e6,
+            noise: 0.0,
+            color_under_hz: 629e3,
+            color_under_level: 0.0,
+            mag: MagneticTransfer::rf(MagneticModel::JilesAtherton, MagneticMedia::MetalParticle, 1.0, 3.0),
+            writing_speed: 5.8,
+            extra_spacing: 0.0,
+        });
+        for level in [7.5f32, 50.0, 100.0] {
+            let input = vec![level; 910];
+            let mut out = vec![0f32; 910];
+            ch.process_line(&input, &[], &[], 1.0, 0.0, &[], &mut Rng::new(1), &mut out);
+            let (mean, sd, _, _) = stats(&out[100..800]);
+            assert!((mean - level).abs() < 1.0 && sd < 0.5, "level {level}: mean {mean} sd {sd}");
         }
     }
 }

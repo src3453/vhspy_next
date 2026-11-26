@@ -55,6 +55,7 @@ mod tests {
     fn clean_roundtrip_preserves_color() {
         let mut p = Params::default();
         p.tape.enabled = false;
+        p.decoder.vcxo_offset_hz = 0.0;
         p.decoder.yc_separation = params::YcSeparation::Comb;
         for (r, g, b) in [(200, 40, 40), (40, 200, 40), (40, 40, 200), (230, 200, 30), (128, 128, 128)] {
             let mut pl = Pipeline::new(p.clone());
@@ -162,6 +163,8 @@ mod tests {
         p.standard = TvStandard::Pal;
         p.encoder.luma_bw_mhz = 5.0;
         p.tape.enabled = false;
+        // 色の正確さを見るテスト用なので、受像機の発振器は理想 (周波数ずれなし) にする
+        p.decoder.vcxo_offset_hz = 0.0;
         p
     }
 
@@ -275,6 +278,7 @@ mod tests {
         for pal in [false, true] {
             let mut p = if pal { pal_clean() } else { Params::default() };
             p.tape.enabled = false;
+            p.decoder.vcxo_offset_hz = 0.0;
             p.decoder.yc_separation = params::YcSeparation::Comb3d;
             for rgb in COLORS {
                 let pl = run_flat(&p, rgb, 10);
@@ -379,6 +383,7 @@ mod tests {
             let mut p = if pal { pal_clean() } else { Params::default() };
             p.tape.enabled = false;
             p.decoder.burst_pll = 0.2;
+            p.decoder.vcxo_offset_hz = 0.0;
             for rgb in COLORS {
                 let pl = run_flat(&p, rgb, 4);
                 let (w, h) = pl.output_size();
@@ -390,6 +395,27 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 受像機の VCXO の周波数ずれは、PLL の追従が有限なら定常位相誤差 (NTSC の色相ずれ) として残り、
+    /// ラインごとの即時同期なら消える
+    #[test]
+    fn vcxo_offset_shifts_hue_only_with_finite_pll() {
+        let mut p = Params::default();
+        p.tape.enabled = false;
+        let rgb = [200u8, 60, 60];
+        let hue_err = |k: f32, hz: f32| {
+            let mut q = p.clone();
+            q.decoder.burst_pll = k;
+            q.decoder.vcxo_offset_hz = hz;
+            let pl = run_flat(&q, rgb, 4);
+            let (w, h) = pl.output_size();
+            let got = pixel(&pl, h / 2, w / 2);
+            (0..3).map(|c| (got[c] - rgb[c] as i32).abs()).max().unwrap()
+        };
+        assert!(hue_err(1.0, 300.0) <= 10, "instant lock should cancel the offset");
+        assert!(hue_err(0.2, 0.0) <= 10);
+        assert!(hue_err(0.2, 300.0) > 20, "finite PLL should leave a static hue error");
     }
 
     /// FM モデル: ノイズ・クロマ重畳なしなら、変調 → 伝送路 → 復調で輝度と色がほぼ保たれる (NTSC / PAL)
@@ -646,5 +672,68 @@ mod tests {
         }
         let rows = dec.captions().rows();
         assert!(rows.iter().any(|r| r.contains("VHS NEXT CLOSED CAPTION TEST")), "{rows:?}");
+    }
+}
+
+/// 輝度と色の境目の位置合わせ (Y/C 遅延)
+#[cfg(test)]
+mod yc_delay_tests {
+    use super::*;
+
+    /// 左右で色を切り替えた画像を通し、出力の中央付近の行で輝度と色 (R − G) の境目の位置 [入力の画素] を返す
+    fn edge(p: &Params, left: [u8; 3], right: [u8; 3]) -> (f32, f32) {
+        let s = p.standard.spec();
+        let (w, h) = s.image_size();
+        let mut f = RgbFrame::new(w, h);
+        for (k, px) in f.data.chunks_exact_mut(3).enumerate() {
+            px.copy_from_slice(if k % w < w / 2 { &left } else { &right });
+        }
+        let mut pl = Pipeline::new(p.clone());
+        for _ in 0..6 {
+            pl.process_field(&f);
+        }
+        let (ow, oh) = pl.output_size();
+        let d = &pl.output().data;
+        let rows = oh / 3..2 * oh / 3;
+        let n = rows.len() as f32;
+        let (mut luma, mut chroma) = (vec![0f32; ow], vec![0f32; ow]);
+        for y in rows {
+            for x in 0..ow {
+                let i = (y * ow + x) * 4;
+                let (r, g, b) = (d[i] as f32, d[i + 1] as f32, d[i + 2] as f32);
+                luma[x] += (0.299 * r + 0.587 * g + 0.114 * b) / n;
+                chroma[x] += (r - g) / n;
+            }
+        }
+        let cross = |v: &[f32]| {
+            let (a, b) = (v[ow / 4], v[3 * ow / 4]);
+            let mid = 0.5 * (a + b);
+            let x = (ow / 4..3 * ow / 4).find(|&x| (v[x] - mid) * (b - a) >= 0.0).unwrap();
+            x as f32 * w as f32 / ow as f32
+        };
+        (cross(&luma), cross(&chroma))
+    }
+
+    /// 色の境目は輝度の境目とほぼ揃う。テープを通すと chroma_delay_samples ぶんだけ右にずれる
+    #[test]
+    fn chroma_lines_up_with_luma() {
+        for pal in [false, true] {
+            let mut p = Params::default();
+            if pal {
+                p.standard = TvStandard::Pal;
+            }
+            p.tape.luma_noise_ire = 0.0;
+            p.tape.chroma_noise_ire = 0.0;
+            p.tape.chroma_phase_noise_deg = 0.0;
+            p.tape.dropout_rate = 0.0;
+            for tape in [false, true] {
+                p.tape.enabled = tape;
+                let (yl, _) = edge(&p, [0, 0, 0], [255, 255, 255]);
+                // 輝度のほぼ等しい灰 → 赤紫で、色だけの境目を作る
+                let (_, cl) = edge(&p, [120, 120, 120], [200, 80, 160]);
+                let want = if tape { p.tape.chroma_delay_samples as f32 } else { 0.0 };
+                assert!((cl - yl - want).abs() <= 2.5, "pal={pal} tape={tape}: luma {yl}, chroma {cl}");
+            }
+        }
     }
 }

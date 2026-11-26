@@ -35,6 +35,7 @@ struct CompositeParams_0
     uint colorKiller_0;
     uint palDelayLine_0;
     uint outputLinear_0;
+    float vcxoOffsetHz_0;
 };
 
 StructuredBuffer<CompositeParams_0 > paramBuffer : register(t0);

@@ -6,6 +6,7 @@
   import { groups, help, getPath, setPath, isActive, presets, applyDiff, retarget, type Params } from "#lib/params.ts";
   import Scopes from "#lib/Scopes.svelte";
   import Oscilloscope from "#lib/Oscilloscope.svelte";
+  import SyncView from "#lib/SyncView.svelte";
   import ScopeOverlay from "#lib/ScopeOverlay.svelte";
   import Immersive from "#lib/Immersive.svelte";
   import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -36,12 +37,44 @@
   let stats = $state<Stats | null>(null);
   let cameras = $state<string[]>([]);
   let camera = $state("");
+  let cameraScaling = $state("area");
+  let windowTitle = $state("");
+  let windowCropX = $state(0);
+  let windowCropY = $state(0);
+  let windowCropWidth = $state(1280);
+  let windowCropHeight = $state(720);
+  let windowScaling = $state("area");
+  let patternType = $state("pattern");
   let message = $state("");
   let exporting = $state<ExportProgress | null>(null);
   let canvas: HTMLCanvasElement;
   /** オシロスコープのオーバーレイが重ねる先 (マウント後に入る) */
   let canvasEl = $state<HTMLCanvasElement>();
   let scopes: Scopes | undefined = $state();
+  // 画面の下のパネル (タブで 1 つだけ開く。開いているタブを押すと閉じる)
+  type PanelTab = "scopes" | "osc" | "sync";
+  const PANEL_TABS: { id: PanelTab; label: string; title: string }[] = [
+    { id: "scopes", label: "スコープ", title: "映像波形とベクトルスコープ" },
+    { id: "osc", label: "オシロスコープ", title: "コンポジット信号をライン番号で選んで波形で見る" },
+    { id: "sync", label: "生信号", title: "コンポジット信号をデコードせずに白黒の画像で見る (帰線区間・同期も含めて全部。垂直同期で揃える)" },
+  ];
+  const PANEL_KEY = "vhs-panel-tab";
+  let panelTab = $state<PanelTab | null>(
+    (() => {
+      try {
+        const v = localStorage.getItem(PANEL_KEY);
+        return PANEL_TABS.some((t) => t.id === v) ? (v as PanelTab) : null;
+      } catch {
+        return null;
+      }
+    })(),
+  );
+  $effect(() => {
+    try {
+      if (panelTab) localStorage.setItem(PANEL_KEY, panelTab);
+      else localStorage.removeItem(PANEL_KEY);
+    } catch {}
+  });
   let crtInfo = $state<CrtInfo | null>(null);
   let crtVersion = -1;
   let crtFilter = $state("");
@@ -90,11 +123,26 @@
   }
 
   function openCamera() {
-    run(() => invoke("open_source", { req: { kind: "camera", device: camera } }));
+    run(() => invoke("open_source", { req: { kind: "camera", device: camera, scaling: cameraScaling } }));
   }
 
-  function openPattern() {
-    run(() => invoke("open_source", { req: { kind: "pattern" } }));
+  function openWindow() {
+    if (!windowTitle.trim()) {
+      message = "キャプチャするウィンドウのタイトルを入力してください";
+      return;
+    }
+    if (windowCropX < 0 || windowCropY < 0 || windowCropWidth < 1 || windowCropHeight < 1) {
+      message = "クロップ位置は 0 以上、幅と高さは 1 以上にしてください";
+      return;
+    }
+    run(() => invoke("open_source", { req: {
+      kind: "window", title: windowTitle.trim(), crop_x: windowCropX, crop_y: windowCropY,
+      crop_width: windowCropWidth, crop_height: windowCropHeight, scaling: windowScaling,
+    } }));
+  }
+
+  function openPattern(kind = patternType) {
+    run(() => invoke("open_source", { req: { kind } }));
   }
 
   async function openFile() {
@@ -357,7 +405,9 @@
     {cameras}
     bind:camera
     actions={{
-      openPattern,
+      openPattern: () => openPattern("pattern"),
+      openSmpte: () => openPattern("smpte"),
+      openEbu: () => openPattern("ebu"),
       openCamera,
       openFile,
       refreshCameras: () => run(refreshCameras),
@@ -372,12 +422,35 @@
 <main class:immersive>
   <section class="stage">
     <div class="toolbar">
-      <button onclick={openPattern}>テストパターン</button>
+      <select bind:value={patternType} title="テストパターンの種類">
+        <option value="pattern">診断パターン</option>
+        <option value="smpte">SMPTE カラーバー</option>
+        <option value="ebu">EBU カラーバー</option>
+      </select>
+      <button onclick={() => openPattern()}>パターンを表示</button>
       <select bind:value={camera} title="カメラ">
         {#each cameras as c}<option value={c}>{c}</option>{/each}
       </select>
       <button onclick={() => run(refreshCameras)} title="カメラ一覧を更新">⟳</button>
+      <label>補間方式
+        <select bind:value={cameraScaling} title="カメラのスケーリング方式">
+          <option value="nearest">Nearest</option><option value="bilinear">Bilinear</option><option value="bicubic">Bicubic</option><option value="area">Area</option><option value="lanczos">Lanczos</option>
+        </select>
+      </label>
       <button onclick={openCamera} disabled={!camera}>カメラを開く</button>
+      <label>ウィンドウ
+        <input class="capture-title" type="text" bind:value={windowTitle} placeholder="ウィンドウタイトル" title="キャプチャ対象のウィンドウタイトル" />
+      </label>
+      <label>クロップ X <input class="crop-num" type="number" min="0" bind:value={windowCropX} /></label>
+      <label>Y <input class="crop-num" type="number" min="0" bind:value={windowCropY} /></label>
+      <label>幅 <input class="crop-num" type="number" min="1" bind:value={windowCropWidth} /></label>
+      <label>高さ <input class="crop-num" type="number" min="1" bind:value={windowCropHeight} /></label>
+      <label>補間方式
+        <select bind:value={windowScaling} title="ウィンドウキャプチャのスケーリング方式">
+          <option value="nearest">Nearest</option><option value="bilinear">Bilinear</option><option value="bicubic">Bicubic</option><option value="area">Area</option><option value="lanczos">Lanczos</option>
+        </select>
+      </label>
+      <button onclick={openWindow}>ウィンドウを開く</button>
       <button onclick={openFile}>ファイルを開く…</button>
       <span class="spacer"></span>
       <button class:rec={!!stats?.recording} onclick={toggleRecording}>
@@ -392,8 +465,25 @@
       <ScopeOverlay target={canvasEl} hidden={immersive} />
     </div>
 
-    <Scopes bind:this={scopes} standard={params?.standard ?? "ntsc"} />
-    <Oscilloscope standard={params?.standard ?? "ntsc"} />
+    <div class="panels">
+      <div class="tabs" role="tablist">
+        {#each PANEL_TABS as t (t.id)}
+          <button
+            role="tab"
+            class:on={panelTab === t.id}
+            aria-selected={panelTab === t.id}
+            title={t.title}
+            onclick={() => (panelTab = panelTab === t.id ? null : t.id)}>{t.label}</button
+          >
+        {/each}
+        {#if panelTab}
+          <button class="tab-close" onclick={() => (panelTab = null)} title="パネルを閉じる">▾</button>
+        {/if}
+      </div>
+      <Scopes bind:this={scopes} standard={params?.standard ?? "ntsc"} open={panelTab === "scopes"} />
+      <Oscilloscope standard={params?.standard ?? "ntsc"} open={panelTab === "osc"} />
+      <SyncView standard={params?.standard ?? "ntsc"} open={panelTab === "sync"} />
+    </div>
 
     <div class="status">
       <span>{stats?.source ?? "…"}</span>
@@ -874,6 +964,20 @@
   .toolbar select {
     max-width: 220px;
   }
+  .toolbar label {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  .toolbar input.capture-title {
+    width: 150px;
+  }
+  .toolbar input.crop-num {
+    width: 58px;
+    padding: 3px 5px;
+  }
   .row input[type="text"] {
     min-width: 0;
   }
@@ -901,6 +1005,43 @@
   .name.changed {
     color: var(--accent);
   }
+  .panels {
+    border-top: 1px solid var(--line);
+    background: #0c0d10;
+  }
+  .panels :global(.scopes),
+  .panels :global(.osc) {
+    border-top: none;
+  }
+  .tabs {
+    display: flex;
+    align-items: flex-end;
+    gap: 2px;
+    padding: 4px 8px 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .tabs button {
+    padding: 3px 12px;
+    border: 1px solid transparent;
+    border-bottom: none;
+    border-radius: 4px 4px 0 0;
+    background: none;
+    color: var(--muted);
+    margin-bottom: -1px;
+  }
+  .tabs button:hover {
+    color: var(--text);
+  }
+  .tabs button.on {
+    color: var(--text);
+    background: #0c0d10;
+    border-color: var(--line);
+    border-bottom: 1px solid #0c0d10;
+    font-weight: 600;
+  }
+  .tabs .tab-close {
+    margin-left: auto;
+  }
   /* イマーシブモード: 映像だけを全画面に出す */
   main.immersive {
     grid-template-columns: 1fr;
@@ -909,8 +1050,7 @@
   main.immersive .toolbar,
   main.immersive .status,
   main.immersive .panel,
-  main.immersive :global(.scopes),
-  main.immersive :global(.osc) {
+  main.immersive .panels {
     display: none;
   }
   main.immersive .screen {
