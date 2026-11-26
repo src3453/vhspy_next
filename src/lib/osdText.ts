@@ -348,7 +348,7 @@ export const controlLabels: Record<string, string> = {
 /** 選択肢のラベル (path → value → ラベル)。ないものは元のラベルを変換して使う */
 export const optionLabels: Record<string, Record<string, string>> = {
   standard: { ntsc: "NTSC", pal: "PAL" },
-  "image.fit": { stretch: "ﾋｷﾉﾊﾞｼ", cover: "ｵｵｳ", contain: "ｵｻﾒﾙ" },
+  "image.fit": { stretch: "ﾋｷﾉﾊﾞｼ", original: "ｵﾘｼﾞﾅﾙ", cover: "ｵｵｳ", contain: "ｵｻﾒﾙ" },
   "osd.mode": { direct: "ﾀﾞｲﾚｸﾄ", capture: "ｷｬﾌﾟﾁｬ", composite: "ﾃﾞｯｷ ｼｭﾂﾘｮｸ", tape: "ﾃｰﾌﾟ ﾔｷｺﾐ" },
   "tape.format": { beta: "BETA", custom: "ｶｽﾀﾑ", dv: "DV", digital8: "Digital8" },
   "tape.luma_model": { fm: "FM ｹｲｻﾝ", simple: "ｶﾝｲ" },

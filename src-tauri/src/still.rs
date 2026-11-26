@@ -95,6 +95,7 @@ impl Still {
         let fw_sq = fw as f32 / sa;
         let (kx, ky) = match p.fit {
             ImageFit::Stretch => (fw_sq / w as f32, fh as f32 / h as f32),
+            ImageFit::Original => (1.0 / sa, 1.0),
             ImageFit::Cover => {
                 let k = (fw_sq / w as f32).max(fh as f32 / h as f32);
                 (k, k)

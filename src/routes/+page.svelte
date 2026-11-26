@@ -6,6 +6,7 @@
   import { groups, help, getPath, setPath, isActive, presets, applyDiff, retarget, type Params } from "#lib/params.ts";
   import Scopes from "#lib/Scopes.svelte";
   import Oscilloscope from "#lib/Oscilloscope.svelte";
+  import ScopeOverlay from "#lib/ScopeOverlay.svelte";
   import Immersive from "#lib/Immersive.svelte";
   import { getCurrentWindow } from "@tauri-apps/api/window";
 
@@ -38,6 +39,8 @@
   let message = $state("");
   let exporting = $state<ExportProgress | null>(null);
   let canvas: HTMLCanvasElement;
+  /** オシロスコープのオーバーレイが重ねる先 (マウント後に入る) */
+  let canvasEl = $state<HTMLCanvasElement>();
   let scopes: Scopes | undefined = $state();
   let crtInfo = $state<CrtInfo | null>(null);
   let crtVersion = -1;
@@ -259,6 +262,7 @@
     let alive = true;
     let lastId = 0;
     const ctx = canvas.getContext("2d")!;
+    canvasEl = canvas;
 
     // 新しいフレームがあれば取得して描画する (描画周期に合わせたプル型)
     const loop = async () => {
@@ -385,6 +389,7 @@
 
     <div class="screen">
       <canvas bind:this={canvas} width="754" height="480"></canvas>
+      <ScopeOverlay target={canvasEl} hidden={immersive} />
     </div>
 
     <Scopes bind:this={scopes} standard={params?.standard ?? "ntsc"} />
@@ -731,6 +736,7 @@
     flex: 1;
   }
   .screen {
+    position: relative;
     flex: 1;
     display: flex;
     align-items: center;

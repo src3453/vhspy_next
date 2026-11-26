@@ -1,6 +1,7 @@
 mod crt;
 mod engine;
 mod ffmpeg;
+mod scope;
 mod still;
 
 use engine::{Engine, SourceSpec, Stats};
@@ -78,13 +79,23 @@ async fn get_frame(engine: State<'_, Engine>, after: u64) -> Result<Response, St
 #[tauri::command]
 fn set_scope_active(engine: State<'_, Engine>, active: bool) {
     engine.shared.scope_active.store(active, std::sync::atomic::Ordering::Relaxed);
+    if !active {
+        engine.shared.scope.lock().unwrap().clear();
+    }
 }
 
-/// `after` より新しいフィールドのコンポジット信号があれば返す (なければ空)。形式は `engine::composite_bytes`
+/// `after` より新しいフィールド (新しい方から最大 `max_fields`) の、ライン番号 `line` から `count` ラインの
+/// コンポジット信号。形式は `scope::extract`
 #[tauri::command]
-async fn get_composite(engine: State<'_, Engine>, after: u64) -> Result<Response, String> {
-    let slot = engine.shared.composite.lock().unwrap();
-    if slot.id > after { Ok(Response::new(slot.bytes.clone())) } else { Ok(Response::new(Vec::new())) }
+async fn get_composite(
+    engine: State<'_, Engine>,
+    after: u64,
+    line: usize,
+    count: usize,
+    max_fields: usize,
+) -> Result<Response, String> {
+    let fields = engine.shared.scope.lock().unwrap().newer(after, max_fields.min(scope::RING_FIELDS));
+    Ok(Response::new(scope::extract(&fields, line, count)))
 }
 
 #[tauri::command]

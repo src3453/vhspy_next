@@ -1,9 +1,12 @@
 <script lang="ts">
   // コンポジット信号のオシロスコープ (ライン選択付きの波形モニタ)。
-  // 受像機に入る直前の信号 (帰線区間・同期・VBI のデータ込み) を、ライン番号で選んで描く。
+  // 受像機に入る直前の信号 (帰線区間・同期・VBI のデータ込み) を、ライン番号で選んで CRT のビームで描く。
+  // 表示の更新ごとに、前回より後に来たフィールドを全部受け取って蛍光面に積み重ねる (残光)。
   // 開いている間だけエンジンに信号を写してもらう。
   import { invoke } from "@tauri-apps/api/core";
-  import { onDestroy } from "svelte";
+  import { onDestroy, untrack } from "svelte";
+  import { CrtBeam } from "#lib/crtBeam.ts";
+  import { scopeView } from "#lib/scopeView.svelte.ts";
 
   type Standard = "ntsc" | "pal";
   let { standard = "ntsc" as Standard } = $props();
@@ -11,10 +14,39 @@
   // ---- 表示設定 (localStorage に保存) ----
   type Span = "1" | "2" | "3" | "9" | "22" | "v";
   type Filter = "flat" | "lpass" | "chroma";
-  type Saved = { open: boolean; line: Record<Standard, number>; span: Span; filter: Filter; persist: boolean };
+  /** analog = CRT ビーム (残光・輝度・フォーカス)、dso = デジタルオシロ風 (最新フィールドの細い線だけ) */
+  type Mode = "analog" | "dso";
+  type Saved = {
+    open: boolean;
+    mode: Mode;
+    /** デコード画面に、見ているラインを重ねて表示する */
+    overlay: boolean;
+    line: Record<Standard, number>;
+    span: Span;
+    filter: Filter;
+    /** 残光 [s] (見た目の明るさが 1/10 になるまで)。0 = なし、-1 = 無限 */
+    persistence: number;
+    fps: number;
+    intensity: number;
+    focus: number;
+    /** DSO の線の太さ [CSS px] */
+    dsoWidth: number;
+  };
   const STORE_KEY = "vhs-oscilloscope";
   function load(): Saved {
-    const d: Saved = { open: false, line: { ntsc: 21, pal: 23 }, span: "1", filter: "flat", persist: true };
+    const d: Saved = {
+      open: false,
+      mode: "analog",
+      overlay: true,
+      line: { ntsc: 21, pal: 23 },
+      span: "1",
+      filter: "flat",
+      persistence: 0.2,
+      fps: 30,
+      intensity: 1,
+      focus: 1.3,
+      dsoWidth: 1,
+    };
     try {
       return { ...d, ...JSON.parse(localStorage.getItem(STORE_KEY) ?? "{}") };
     } catch {
@@ -23,18 +55,26 @@
   }
   const saved = load();
   let open = $state(saved.open);
+  let mode = $state<Mode>(saved.mode === "dso" ? "dso" : "analog");
+  let overlay = $state(saved.overlay !== false);
   let lines = $state(saved.line);
   let span = $state<Span>(saved.span);
   let filter = $state<Filter>(saved.filter);
-  let persist = $state(saved.persist);
+  let persistence = $state(saved.persistence);
+  let fps = $state(saved.fps);
+  let intensity = $state(saved.intensity);
+  let focus = $state(saved.focus);
+  let dsoWidth = $state(saved.dsoWidth);
   $effect(() => {
-    const s = JSON.stringify({ open, line: lines, span, filter, persist });
+    const s = JSON.stringify({ open, mode, overlay, line: lines, span, filter, persistence, fps, intensity, focus, dsoWidth });
     try {
       localStorage.setItem(STORE_KEY, s);
     } catch {}
   });
 
   const TOTAL: Record<Standard, number> = { ntsc: 525, pal: 625 };
+  const FIELD_RATE: Record<Standard, number> = { ntsc: 60000 / 1001, pal: 50 };
+  const LS: Record<Standard, number> = { ntsc: 910, pal: 1135 };
   const total = $derived(TOTAL[standard]);
   const line = $derived(Math.min(Math.max(1, lines[standard] ?? 1), TOTAL[standard]));
   function setLine(v: number) {
@@ -46,235 +86,335 @@
   /** 表示するライン数 */
   const count = $derived(span === "v" ? (standard === "ntsc" ? 263 : 313) : Number(span));
 
-  // ---- 受け取った信号 (第 1 / 第 2 フィールドのバッファを別々に持つ) ----
-  type Buf = {
-    id: number;
-    pal: boolean;
-    parity: number;
-    frame: number;
-    raster: number;
-    ls: number;
-    first: number;
-    total: number;
-    separate: boolean;
-    fs: number;
-    syncEnd: number;
-    burstStart: number;
-    burstEnd: number;
-    activeStart: number;
-    activeWidth: number;
-    y: Float32Array;
-    c: Float32Array | null;
-  };
-  let bufs: (Buf | null)[] = [null, null];
-  let latest: Buf | null = $state(null);
-  let lastId = 0;
-
-  function parse(ab: ArrayBuffer): Buf | null {
-    if (ab.byteLength < 68) return null;
-    const dv = new DataView(ab);
-    const u = (o: number) => dv.getUint32(o, true);
-    const raster = u(24),
-      ls = u(28);
-    const n = raster * ls;
-    const separate = u(40) === 1;
-    if (ab.byteLength < 68 + n * 4 * (separate ? 2 : 1)) return null;
-    return {
-      id: Number(dv.getBigUint64(0, true)),
-      pal: u(8) === 1,
-      parity: u(12),
-      frame: Number(dv.getBigUint64(16, true)),
-      raster,
-      ls,
-      first: u(32),
-      total: u(36),
-      separate,
-      fs: dv.getFloat32(44, true),
-      syncEnd: u(48),
-      burstStart: u(52),
-      burstEnd: u(56),
-      activeStart: u(60),
-      activeWidth: u(64),
-      y: new Float32Array(ab, 68, n),
-      c: separate ? new Float32Array(ab, 68 + n * 4, n) : null,
-    };
-  }
-
-  /** ライン番号 n (1 始まり) の信号。新しいフィールドのバッファから探す */
-  function lineData(n: number): { b: Buf; at: number } | null {
-    const order = [bufs[0], bufs[1]].filter((b): b is Buf => !!b).sort((a, b) => b.id - a.id);
-    for (const b of order) {
-      const i = (((n - b.first) % b.total) + b.total) % b.total;
-      if (i < b.raster) return { b, at: i * b.ls };
-    }
-    return null;
-  }
-
-  // ---- 取得ループ ----
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  let busy = false;
-  async function poll() {
-    timer = null;
-    if (!open) return;
-    if (!busy) {
-      busy = true;
-      try {
-        const ab = await invoke<ArrayBuffer>("get_composite", { after: lastId });
-        const b = ab && ab.byteLength ? parse(ab) : null;
-        if (b && (b.pal ? "pal" : "ntsc") === standard) {
-          lastId = b.id;
-          bufs[b.parity & 1] = b;
-          latest = b;
-          draw();
-        } else if (b) {
-          lastId = b.id;
-        }
-      } catch {
-        // エンジンが止まっている間などは次で取り直す
-      } finally {
-        busy = false;
-      }
-    }
-    if (open) timer = setTimeout(poll, 40);
-  }
-
+  // デコード画面のオーバーレイへ、見ているラインを知らせる
   $effect(() => {
-    const active = open;
-    invoke("set_scope_active", { active }).catch(() => {});
-    if (active) {
-      bufs = [null, null];
-      lastId = 0;
-      poll();
-    } else if (timer) {
-      clearTimeout(timer);
-      timer = null;
-    }
+    scopeView.active = open && overlay;
+    scopeView.standard = standard;
+    scopeView.line = line;
+    scopeView.count = count;
   });
   onDestroy(() => {
-    if (timer) clearTimeout(timer);
-    invoke("set_scope_active", { active: false }).catch(() => {});
+    scopeView.active = false;
   });
-  // 方式が変わったら古い信号を捨てる
-  $effect(() => {
-    void standard;
-    bufs = [null, null];
-    latest = null;
-  });
+
+  // ---- 受け取った信号 ----
+  type FieldRec = { id: number; pal: boolean; ls: number; fs: number; lines: { n: number; data: Float32Array }[] };
+  let lastId = 0;
+  let hasSignal = $state(false);
+  /** ライン番号 → 最後に受け取った信号 (カーソルの読み取り用) */
+  const lineCache = new Map<number, Float32Array>();
+  let lastFs = 0;
+
+  function parse(ab: ArrayBuffer): FieldRec[] {
+    const out: FieldRec[] = [];
+    if (ab.byteLength < 4) return out;
+    const dv = new DataView(ab);
+    let o = 0;
+    const nf = dv.getUint32(o, true);
+    o += 4;
+    for (let f = 0; f < nf; f++) {
+      const id = Number(dv.getBigUint64(o, true));
+      const pal = dv.getUint32(o + 8, true) === 1;
+      const ls = dv.getUint32(o + 16, true);
+      const fs = dv.getFloat32(o + 20, true);
+      const nl = dv.getUint32(o + 24, true);
+      o += 28;
+      const ls_: { n: number; data: Float32Array }[] = [];
+      for (let k = 0; k < nl; k++) {
+        const n = dv.getUint32(o, true);
+        ls_.push({ n, data: new Float32Array(ab, o + 4, ls) });
+        o += 4 + ls * 4;
+      }
+      out.push({ id, pal, ls, fs, lines: ls_ });
+    }
+    return out;
+  }
 
   // ---- 縦軸 [IRE] ----
   const IRE_HI = 130;
   const IRE_LO = -50;
   const GUTTER = 44;
   const FOOT = 18;
-
-  let dataCanvas: HTMLCanvasElement | undefined = $state();
-  let gridCanvas: HTMLCanvasElement | undefined = $state();
-
-  function fit(c: HTMLCanvasElement, clear = true) {
-    const dpr = window.devicePixelRatio || 1;
-    const w = Math.max(1, Math.round(c.clientWidth * dpr));
-    const h = Math.max(1, Math.round(c.clientHeight * dpr));
-    let resized = false;
-    if (c.width !== w || c.height !== h) {
-      c.width = w;
-      c.height = h;
-      resized = true;
-    }
-    const ctx = c.getContext("2d")!;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    if (clear) ctx.clearRect(0, 0, c.clientWidth, c.clientHeight);
-    return { ctx, w: c.clientWidth, h: c.clientHeight, resized };
-  }
-
   const yOf = (ire: number, h: number) => ((IRE_HI - ire) / (IRE_HI - IRE_LO)) * (h - FOOT);
 
-  /** 表示の 1 サンプル (フィルタ込み)。LPASS は副搬送波 1 周期 (4 サンプル) の平均で色を落とす */
-  function sampleAt(b: Buf, at: number, k: number): number {
-    const v = (i: number) => {
-      const j = Math.min(Math.max(i, 0), b.ls - 1);
-      return b.y[at + j] + (b.c ? b.c[at + j] : 0);
-    };
+  let beamCanvas: HTMLCanvasElement | undefined = $state();
+  let gridCanvas: HTMLCanvasElement | undefined = $state();
+  let dsoCanvas: HTMLCanvasElement | undefined = $state();
+  let beam: CrtBeam | null = null;
+  /** DSO で最後に描いたフィールド (表示サイズが変わったときの描き直し用) */
+  let dsoLast: FieldRec | null = null;
+  let glError = $state("");
+
+  /** 表示の 1 サンプル (フィルタ込み)。LPASS は副搬送波 1 周期ぶんの平均で色を落とす */
+  function filtered(d: Float32Array, k: number): number {
+    const ls = d.length;
+    const v = (i: number) => d[i < 0 ? 0 : i >= ls ? ls - 1 : i];
     if (filter === "flat") return v(k);
     const lp = 0.125 * v(k - 2) + 0.25 * (v(k - 1) + v(k) + v(k + 1)) + 0.125 * v(k + 2);
-    return filter === "lpass" ? lp : v(k) - lp;
+    return filter === "lpass" ? lp : v(k) - lp + 50;
   }
 
-  function draw() {
-    if (!dataCanvas || !open) return;
-    const { ctx, w, h, resized } = fit(dataCanvas, false);
-    const x0 = GUTTER;
-    const pw = w - x0;
-    if (persist && !resized) {
-      // 蛍光面の残光
-      ctx.fillStyle = "rgba(0,0,0,0.35)";
-      ctx.fillRect(0, 0, w, h);
-    } else {
-      ctx.clearRect(0, 0, w, h);
+  // ---- ビームの線分を作る ----
+  let segs = new Float32Array(5 * 65536);
+  function grow(n: number) {
+    if (n * 5 > segs.length) {
+      const next = new Float32Array(Math.max(n * 5, segs.length * 2));
+      next.set(segs);
+      segs = next;
     }
-    const ref = latest;
-    if (!ref) return;
-    const ls = ref.ls;
-    const n = count;
-    const totalSamples = n * ls;
-    const off = filter === "chroma" ? 50 : 0;
-    ctx.strokeStyle = "rgba(130,255,160,0.9)";
-    ctx.lineWidth = 1.1;
-    ctx.beginPath();
-    if (totalSamples <= pw * 2) {
-      // 折れ線
-      let started = false;
-      for (let l = 0; l < n; l++) {
-        const src = lineData(line + l);
-        if (!src) {
-          started = false;
-          continue;
+  }
+
+  /**
+   * 1 フィールドぶんのビームの線分を作る。戻り値は線分の数。
+   * 1 画素に何サンプルも入るときは、列ごとの最小・最大を往復する点にまとめ、その列のサンプル数ぶんのエネルギーを置く
+   */
+  function buildField(rec: FieldRec, energy: number, sc = beam?.scale ?? 1): number {
+    if (!gridCanvas) return 0;
+    const cssW = gridCanvas.clientWidth,
+      cssH = gridCanvas.clientHeight;
+    const x0 = GUTTER * sc;
+    const pw = (cssW - GUTTER) * sc;
+    const ph = cssH * sc;
+    const ls = rec.ls;
+    const totalSamples = count * ls;
+    const yPx = (ire: number) => yOf(ire, cssH) * sc;
+    // 1 ステップのエネルギー: 1 回の掃引で画面幅ぶんの光を置く (掃引の速さで明るさが変わらないように)
+    const base = (energy * pw) / totalSamples;
+    const perPx = totalSamples / pw;
+    let n = 0;
+    let px = NaN,
+      py = NaN;
+    const point = (x: number, y: number, e: number) => {
+      if (!Number.isNaN(px)) {
+        grow(n + 1);
+        const o = n * 5;
+        segs[o] = px;
+        segs[o + 1] = py;
+        segs[o + 2] = x;
+        segs[o + 3] = y;
+        segs[o + 4] = e;
+        n++;
+      }
+      px = x;
+      py = y;
+    };
+    let prevK = -2;
+    for (const { n: num, data } of rec.lines) {
+      const k = (num - line + total) % total;
+      if (k >= count) continue;
+      // 続いていないライン (このフィールドにない) の所ではビームを切る
+      if (k !== prevK + 1) px = py = NaN;
+      prevK = k;
+      const start = k * ls;
+      if (perPx <= 2) {
+        for (let s = 0; s < ls; s++) {
+          point(x0 + ((start + s) / totalSamples) * pw, yPx(filtered(data, s)), base);
         }
-        for (let k = 0; k < ls; k++) {
-          const x = x0 + ((l * ls + k) / totalSamples) * pw;
-          const y = yOf(sampleAt(src.b, src.at, k) + off, h);
-          if (!started) {
-            ctx.moveTo(x, y);
-            started = true;
-          } else ctx.lineTo(x, y);
+      } else {
+        // 列ごとの最小・最大
+        const c0 = Math.floor((start / totalSamples) * pw);
+        const c1 = Math.ceil(((start + ls) / totalSamples) * pw);
+        let up = true;
+        for (let c = c0; c < c1; c++) {
+          const s0 = Math.max(0, Math.floor((c / pw) * totalSamples) - start);
+          const s1 = Math.min(ls, Math.floor(((c + 1) / pw) * totalSamples) - start);
+          if (s1 <= s0) continue;
+          let lo = Infinity,
+            hi = -Infinity;
+          for (let s = s0; s < s1; s++) {
+            const v = filtered(data, s);
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+          }
+          const e = (base * (s1 - s0)) / 2;
+          const x = x0 + c + 0.5;
+          if (up) {
+            point(x, yPx(lo), e);
+            point(x, yPx(hi), e);
+          } else {
+            point(x, yPx(hi), e);
+            point(x, yPx(lo), e);
+          }
+          up = !up;
         }
       }
+    }
+    return n;
+  }
+
+  // ---- 取得と描画のループ ----
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let busy = false;
+  let lastDraw = 0;
+
+  async function tick() {
+    timer = null;
+    if (!open) return;
+    const started = performance.now();
+    if (!busy && (mode === "dso" ? dsoCanvas : beam)) {
+      busy = true;
+      try {
+        const ls = LS[standard];
+        // 残光があるときは、前回の更新から後のフィールドを全部受け取る (1 回に送る量は抑える)
+        const between = Math.ceil(FIELD_RATE[standard] / Math.max(1, fps)) + 1;
+        const budget = Math.max(1, Math.floor(2_400_000 / (count * ls)));
+        // 最新の 1 フィールドだけにすると、片方のフィールドにしかないライン (21 など) は、更新の周期が
+        // フィールドの周期の整数倍のときにいつも逆のフィールドを引いて止まる。2 フィールド取って新しい方から選ぶ
+        const maxFields = mode === "dso" || persistence === 0 ? 2 : Math.min(between, budget, 16);
+        const ab = await invoke<ArrayBuffer>("get_composite", { after: lastId, line, count, maxFields });
+        const recs = parse(ab).filter((r) => (r.pal ? "pal" : "ntsc") === standard);
+        if (mode === "dso") renderDso(recs);
+        else render(recs);
+      } catch {
+        // エンジンが止まっている間などは次で取り直す
+      } finally {
+        busy = false;
+      }
+    }
+    if (open && timer === null) {
+      const period = 1000 / Math.max(1, fps);
+      timer = setTimeout(tick, Math.max(0, period - (performance.now() - started)));
+    }
+  }
+
+  function render(recs: FieldRec[]) {
+    if (!beam) return;
+    if (beam.resize()) drawGrid();
+    beam.sigma = focus;
+    const now = performance.now();
+    const dt = lastDraw ? Math.min(1, (now - lastDraw) / 1000) : 1 / fps;
+    lastDraw = now;
+    // 選んだラインの入っているフィールドだけが光る (ライン選択の掃引)
+    let lit = ingest(recs);
+    if (persistence === 0) lit = lit.slice(-1);
+    if (lit.length) hasSignal = true;
+
+    // 残光: 蛍光面を減衰させてから、届いたフィールドを足す。
+    // 定常状態の明るさが更新の速さ・残光の長さによらないように、1 フィールドのエネルギーを (1 - 減衰) / 本数 にする
+    let decay: number, gain: number;
+    if (persistence === 0) {
+      decay = lit.length ? 0 : 1;
+      gain = 1;
+    } else if (persistence < 0) {
+      decay = 1;
+      gain = 1 - Math.exp(-dt / 1.0);
     } else {
-      // 1 画素の列ごとの最小・最大 (包絡線)
-      const cols = Math.max(1, Math.floor(pw));
-      let prevLo = NaN,
-        prevHi = NaN;
-      let cache: { l: number; src: ReturnType<typeof lineData> } = { l: -1, src: null };
-      for (let x = 0; x < cols; x++) {
-        const s0 = Math.floor((x / cols) * totalSamples);
-        const s1 = Math.max(s0 + 1, Math.floor(((x + 1) / cols) * totalSamples));
-        let lo = Infinity,
-          hi = -Infinity;
-        for (let s = s0; s < s1; s++) {
-          const l = Math.floor(s / ls);
-          if (cache.l !== l) cache = { l, src: lineData(line + l) };
-          if (!cache.src) continue;
-          const v = sampleAt(cache.src.b, cache.src.at, s - l * ls) + off;
-          if (v < lo) lo = v;
-          if (v > hi) hi = v;
-        }
-        if (lo > hi) {
-          prevLo = prevHi = NaN;
-          continue;
-        }
-        // 隣の列とつなげる
-        if (!Number.isNaN(prevLo)) {
-          lo = Math.min(lo, prevHi);
-          hi = Math.max(hi, prevLo);
-        }
-        const xx = x0 + x + 0.5;
-        ctx.moveTo(xx, yOf(hi, h));
-        ctx.lineTo(xx, yOf(lo, h) + 0.6);
-        prevLo = lo;
-        prevHi = hi;
-      }
+      // 残光の設定値は「見た目の明るさが 1/10 に落ちるまでの時間」。
+      // 蛍光面の値は表示ガンマ (1/γ 乗) を通るので、見た目が 1/10 になるのは光量が 10^-γ になったとき。
+      // 時定数をそのまま exp(-dt / 残光) に使うと、暗い尾が ln(10)·γ ≈ 5 倍長く見えてしまう
+      const k = Math.LN10 * beam.gamma;
+      decay = Math.exp((-dt * k) / persistence);
+      gain = 1 - decay;
+    }
+    beam.fade(decay);
+    for (const r of lit) {
+      const n = buildField(r, (intensity * gain) / Math.max(1, lit.length));
+      beam.drawBeam(segs, n);
+    }
+    beam.present();
+  }
+
+  /** 受け取ったフィールドの記録を取り込み、選んだラインの入っているものだけ返す */
+  function ingest(recs: FieldRec[]): FieldRec[] {
+    for (const r of recs) {
+      // 番号が戻った (エンジンの作り直し) ときもそのまま追う
+      lastId = r.id < lastId && r === recs[0] ? r.id : Math.max(lastId, r.id);
+      lastFs = r.fs;
+      for (const l of r.lines) lineCache.set(l.n, l.data);
+    }
+    return recs.filter((r) => r.lines.some((l) => (l.n - line + total) % total < count));
+  }
+
+  // ---- DSO 表示 (CRT エミュレーションなし): 最新のフィールドを細い線で描くだけ ----
+  function renderDso(recs: FieldRec[]) {
+    const lit = ingest(recs);
+    if (lit.length) {
+      hasSignal = true;
+      dsoLast = lit[lit.length - 1];
+    }
+    drawDso();
+  }
+
+  function drawDso() {
+    if (!dsoCanvas) return;
+    const { ctx } = fitGrid(dsoCanvas);
+    if (!dsoLast) return;
+    const n = buildField(dsoLast, 0, 1);
+    ctx.strokeStyle = "#ffe14a";
+    ctx.lineWidth = dsoWidth;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    let ex = NaN,
+      ey = NaN;
+    for (let i = 0; i < n; i++) {
+      const o = i * 5;
+      // 線分の始点が前の終点と違えばビームが切れている所
+      if (segs[o] !== ex || segs[o + 1] !== ey) ctx.moveTo(segs[o], segs[o + 1]);
+      ex = segs[o + 2];
+      ey = segs[o + 3];
+      ctx.lineTo(ex, ey);
     }
     ctx.stroke();
   }
+
+  function clearScreen() {
+    beam?.clear();
+    beam?.present();
+    dsoLast = null;
+    if (dsoCanvas) fitGrid(dsoCanvas);
+  }
+
+  // 開閉だけに反応する (tick が読む設定値を依存に入れると、設定を変えるたびにループが増える)
+  $effect(() => {
+    const active = open;
+    untrack(() => {
+      invoke("set_scope_active", { active }).catch(() => {});
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      if (active) {
+        lastId = 0;
+        hasSignal = false;
+        lastDraw = 0;
+        timer = setTimeout(tick, 0);
+      }
+    });
+  });
+
+  // ビームの描画先 (アナログ表示で開いているときだけ作る)
+  $effect(() => {
+    if (!open || mode !== "analog" || !beamCanvas) return;
+    try {
+      beam = new CrtBeam(beamCanvas);
+      beam.resize();
+      glError = "";
+    } catch (e) {
+      glError = String(e);
+      beam = null;
+    }
+    return () => {
+      beam?.dispose();
+      beam = null;
+    };
+  });
+
+  onDestroy(() => {
+    if (timer) clearTimeout(timer);
+    invoke("set_scope_active", { active: false }).catch(() => {});
+  });
+
+  // 方式・ライン・範囲・フィルタを変えたら蛍光面を消す
+  $effect(() => {
+    void standard;
+    void line;
+    void span;
+    void filter;
+    void mode;
+    lineCache.clear();
+    untrack(clearScreen);
+  });
 
   // ---- 目盛り ----
   function lineLabel(std: Standard, n: number): string {
@@ -301,9 +441,23 @@
     return n <= 312 ? "第 1 フィールド" : "第 2 フィールド";
   }
 
+  function fitGrid(c: HTMLCanvasElement) {
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.max(1, Math.round(c.clientWidth * dpr));
+    const h = Math.max(1, Math.round(c.clientHeight * dpr));
+    if (c.width !== w || c.height !== h) {
+      c.width = w;
+      c.height = h;
+    }
+    const ctx = c.getContext("2d")!;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, c.clientWidth, c.clientHeight);
+    return { ctx, w: c.clientWidth, h: c.clientHeight };
+  }
+
   function drawGrid() {
     if (!gridCanvas) return;
-    const { ctx, w, h } = fit(gridCanvas);
+    const { ctx, w, h } = fitGrid(gridCanvas);
     const x0 = GUTTER;
     const pw = w - x0;
     const ph = h - FOOT;
@@ -351,10 +505,10 @@
     }
     ctx.fillStyle = "rgba(255,210,120,0.75)";
     ctx.textAlign = "left";
-    ctx.fillText("IRE", 4, 9);
+    ctx.fillText(filter === "chroma" ? "IRE (+50)" : "IRE", 4, 9);
 
     // 横軸
-    const ls = pal ? 1135 : 910;
+    const ls = LS[standard];
     const fs = pal ? 4 * 4_433_618.75 : (4 * 315e6) / 88;
     const n = count;
     const lineUs = (ls / fs) * 1e6;
@@ -374,7 +528,7 @@
         band(seg.bs, seg.be, "rgba(255,210,80,0.8)");
         band(seg.as, seg.as + seg.aw, "rgba(120,200,255,0.5)");
         for (let t = 0; t < lineUs; t += 1) {
-          const x = Math.round(xl((t * 1e-6 * fs))) + 0.5;
+          const x = Math.round(xl(t * 1e-6 * fs)) + 0.5;
           const major = t % 10 === 0;
           ctx.strokeStyle = major ? "rgba(255,200,80,0.25)" : "rgba(255,200,80,0.08)";
           ctx.beginPath();
@@ -428,20 +582,16 @@
     void standard;
     void span;
     void line;
-    if (!open || !gridCanvas || !dataCanvas) return;
+    void filter;
+    if (!open || !gridCanvas) return;
     drawGrid();
-    draw();
     const ro = new ResizeObserver(() => {
       drawGrid();
-      draw();
+      if (beam?.resize()) beam.present();
+      if (mode === "dso") drawDso();
     });
     ro.observe(gridCanvas);
     return () => ro.disconnect();
-  });
-  $effect(() => {
-    void filter;
-    void persist;
-    draw();
   });
 
   // ---- カーソル読み取り ----
@@ -452,20 +602,20 @@
     const x = e.clientX - r.left - GUTTER;
     const y = e.clientY - r.top;
     const pw = r.width - GUTTER;
-    if (x < 0 || x > pw || !latest) {
+    if (x < 0 || x > pw || !lastFs) {
       readout = "";
       return;
     }
-    const ls = latest.ls;
+    const ls = LS[standard];
     const s = (x / pw) * count * ls;
     const l = Math.floor(s / ls);
     const k = s - l * ls;
     const num = ((line - 1 + l) % total) + 1;
     const ire = IRE_HI - (y / (r.height - FOOT)) * (IRE_HI - IRE_LO);
-    const src = lineData(num);
-    const v = src ? sampleAt(src.b, src.at, Math.floor(k)) : NaN;
+    const d = lineCache.get(num);
+    const v = d ? filtered(d, Math.floor(k)) : NaN;
     readout =
-      `ライン ${num} · ${((k / latest.fs) * 1e6).toFixed(2)} µs · カーソル ${ire.toFixed(1)} IRE` +
+      `ライン ${num} · ${((k / lastFs) * 1e6).toFixed(2)} µs · カーソル ${ire.toFixed(1)} IRE` +
       (Number.isFinite(v) ? ` · 信号 ${v.toFixed(1)} IRE` : "");
   }
   function onWheel(e: WheelEvent) {
@@ -506,25 +656,97 @@
         <option value="lpass">LPASS (輝度)</option>
         <option value="chroma">CHROMA (+50 IRE)</option>
       </select>
-      <label class="check" title="蛍光面の残光">
-        <input type="checkbox" bind:checked={persist} /> 残光
+      <span class="seg" role="group" aria-label="表示方式">
+        <button class:on={mode === "analog"} onclick={() => (mode = "analog")} title="CRT のビームを再現 (残光・輝度・フォーカス)">アナログ</button>
+        <button class:on={mode === "dso"} onclick={() => (mode = "dso")} title="デジタルオシロ風。最新のフィールドを細い線で描く (CRT エミュレーションなし)">DSO</button>
+      </span>
+      {#if mode === "analog"}
+      <label title="蛍光面の残光 (見た目の明るさが 1/10 に落ちるまでの時間)">
+        残光
+        <select bind:value={persistence}>
+          <option value={0}>なし</option>
+          <option value={0.05}>0.05 s</option>
+          <option value={0.2}>0.2 s</option>
+          <option value={0.5}>0.5 s</option>
+          <option value={1}>1 s</option>
+          <option value={3}>3 s</option>
+          <option value={-1}>無限</option>
+        </select>
       </label>
+      <label title="表示の更新の速さ。残光があれば間のフィールドもすべて積み重ねる">
+        更新
+        <select bind:value={fps}>
+          <option value={5}>5 fps</option>
+          <option value={10}>10 fps</option>
+          <option value={15}>15 fps</option>
+          <option value={20}>20 fps</option>
+          <option value={30}>30 fps</option>
+          <option value={60}>60 fps</option>
+        </select>
+      </label>
+      <label class="slider" title="ビームの明るさ (ダブルクリックで既定値)">
+        輝度
+        <input
+          type="range"
+          min="-3"
+          max="3"
+          step="0.05"
+          value={Math.log2(intensity)}
+          oninput={(e) => (intensity = 2 ** Number((e.target as HTMLInputElement).value))}
+          ondblclick={() => (intensity = 1)}
+        />
+      </label>
+      <label class="slider" title="ビームの太さ (ダブルクリックで既定値)">
+        フォーカス
+        <input
+          type="range"
+          min="0.5"
+          max="4"
+          step="0.05"
+          bind:value={focus}
+          ondblclick={() => (focus = 1.3)}
+        />
+      </label>
+      {:else}
+      <label class="slider" title="線の太さ (ダブルクリックで既定値)">
+        線幅
+        <input
+          type="range"
+          min="0.5"
+          max="5"
+          step="0.25"
+          bind:value={dsoWidth}
+          oninput={() => drawDso()}
+          ondblclick={() => (dsoWidth = 1)}
+        />
+        <span class="num">{dsoWidth.toFixed(2)} px</span>
+      </label>
+      {/if}
       <span class="presets">
         <button onclick={() => { setLine(standard === "ntsc" ? 1 : 309); span = "22"; }} title="垂直帰線区間">V 帰線</button>
         {#if standard === "ntsc"}
           <button onclick={() => { setLine(21); span = "1"; }} title="ライン 21 の字幕">字幕</button>
         {/if}
         <button onclick={() => { setLine(17); span = "2"; }} title="挿入試験信号">VITS</button>
+        <button onclick={clearScreen} title="表示を消す">消去</button>
+        <button class:on={overlay} onclick={() => (overlay = !overlay)} title="見ているラインをデコード画面に重ねて表示する">画面に表示</button>
       </span>
-      {#if latest?.separate}<span class="note">S 映像: Y + C を合成して表示</span>{/if}
     {/if}
   </header>
   {#if open}
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div class="screen" style:--gutter="{GUTTER}px" onpointermove={onMove} onpointerleave={() => (readout = "")} onwheel={onWheel}>
       <canvas class="grid" bind:this={gridCanvas}></canvas>
-      <canvas class="data" bind:this={dataCanvas}></canvas>
-      {#if !latest}<div class="wait">信号を待っています… (コンポジット信号を通しているときだけ表示)</div>{/if}
+      {#if mode === "analog"}
+        <canvas class="beam" bind:this={beamCanvas}></canvas>
+      {:else}
+        <canvas class="dso" bind:this={dsoCanvas}></canvas>
+      {/if}
+      {#if glError}
+        <div class="wait">ビームを描けません: {glError}</div>
+      {:else if !hasSignal}
+        <div class="wait">信号を待っています… (コンポジット信号を通しているときだけ表示)</div>
+      {/if}
       {#if readout}<div class="readout">{readout}</div>{/if}
     </div>
   {/if}
@@ -563,6 +785,13 @@
   input[type="number"] {
     width: 58px;
   }
+  .slider input {
+    width: 80px;
+  }
+  .num {
+    min-width: 4.2em;
+    font-variant-numeric: tabular-nums;
+  }
   .step {
     padding: 0 5px;
   }
@@ -574,12 +803,27 @@
     display: flex;
     gap: 4px;
   }
-  .note {
-    color: #9cf;
+  .seg {
+    display: flex;
+  }
+  .seg button {
+    padding: 1px 8px;
+    border-radius: 0;
+  }
+  .seg button:first-child {
+    border-radius: 3px 0 0 3px;
+  }
+  .seg button:last-child {
+    border-radius: 0 3px 3px 0;
+  }
+  .seg button.on,
+  .presets button.on {
+    background: #ffd27a;
+    color: #000;
   }
   .screen {
     position: relative;
-    height: 240px;
+    height: 260px;
     margin: 0 8px 8px;
     background: #000;
     border: 1px solid var(--line);
@@ -592,12 +836,9 @@
     width: 100%;
     height: 100%;
     display: block;
-  }
-  .grid {
     pointer-events: none;
   }
-  .data {
-    pointer-events: none;
+  .beam {
     mix-blend-mode: screen;
   }
   .wait,

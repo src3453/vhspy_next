@@ -259,7 +259,7 @@ export type Params = {
   };
   /** 静止画入力の配置・パン */
   image: {
-    fit: "stretch" | "cover" | "contain";
+    fit: "stretch" | "original" | "cover" | "contain";
     zoom: number;
     pan_x: number;
     pan_y: number;
@@ -307,6 +307,7 @@ export const groups: Group[] = [
         kind: "select", path: "image.fit", label: "配置",
         options: [
           { value: "stretch", label: "引き伸ばし (縦横比を無視)" },
+          { value: "original", label: "オリジナルサイズ (画像の画素を維持)" },
           { value: "cover", label: "画面を覆う (はみ出しはパンで見る)" },
           { value: "contain", label: "画面に収める (余白は黒)" },
         ],
@@ -777,7 +778,7 @@ export const groups: Group[] = [
 // ツールチップ用の説明 (path → 説明文)。
 export const help: Record<string, string> = {
   // 画像入力
-  "image.fit": "画像を画面 (4:3) に合わせる方法。「覆う」や拡大で画面からはみ出した部分を、位置・パンで見る。",
+  "image.fit": "画像を画面 (4:3) に合わせる方法。「オリジナルサイズ」は画像の画素数を保ち、画面より大きい部分は位置・パンで見る。",
   "image.zoom": "配置した大きさからの拡大率。",
   "image.pan_x": "表示位置。-1 で左端、1 で右端が見える (画像が画面より小さいときは画像が左右に寄る)。",
   "image.pan_y": "表示位置。-1 で上端、1 で下端が見える。",
