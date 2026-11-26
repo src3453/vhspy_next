@@ -1,7 +1,8 @@
 <script lang="ts">
   // 生信号ビュー (MMSSTV の Sync 画面のようなもの)。
-  // 受像機に入る直前のコンポジット信号をデコードせずに白黒の画像にし、帰線区間・同期・VBI も含めて全部見せる。
+  // 受像機に入る直前のコンポジット信号をデコードせずに画像にし、帰線区間・同期・VBI も含めて全部見せる。
   // 縦は信号の垂直同期で揃え、横は同期を取らない (ライン長をずらすと水平同期の帯が斜めになる)。
+  // 画素は信号のレベル [IRE] で、疑似カラーとレベル (表示する範囲) はここで決める。
   import { invoke } from "@tauri-apps/api/core";
   import { onDestroy, untrack } from "svelte";
   import { imageRow } from "#lib/scopeView.svelte.ts";
@@ -10,8 +11,13 @@
   let { standard = "ntsc" as Standard, open = false } = $props();
 
   // ---- 表示設定 (localStorage に保存) ----
+  /** gray = 白黒、bipolar = 帰線レベル (0 IRE) を黒にして + を暖色・- を青、heat = 黒→赤→黄→白、rainbow = 等高線のような虹色 */
+  type Palette = "gray" | "bipolar" | "heat" | "rainbow";
+  /** 揃える垂直同期: f1 = 第 1 フィールド、f2 = 第 2 フィールド、either = どちらでも (新しい方) */
+  type Anchor = "f1" | "f2" | "either";
   type Saved = {
     frame: boolean;
+    anchor: Anchor;
     sync: boolean;
     /** ライン長のずれ [サンプル] (方式ごと) */
     slant: Record<Standard, number>;
@@ -20,17 +26,25 @@
     preLines: number;
     invert: boolean;
     fps: number;
+    palette: Palette;
+    /** 表示する範囲 [IRE] (これより下・上は端の色) */
+    levelLo: number;
+    levelHi: number;
   };
   const STORE_KEY = "vhs-syncview";
   function load(): Saved {
     const d: Saved = {
       frame: true,
+      anchor: "f1",
       sync: true,
       slant: { ntsc: 0, pal: 0 },
       phase: { ntsc: 0, pal: 0 },
       preLines: 3,
       invert: false,
       fps: 30,
+      palette: "bipolar",
+      levelLo: -45,
+      levelHi: 105,
     };
     try {
       return { ...d, ...JSON.parse(localStorage.getItem(STORE_KEY) ?? "{}") };
@@ -40,14 +54,18 @@
   }
   const saved = load();
   let frame = $state(saved.frame);
+  let anchor = $state<Anchor>(saved.anchor);
   let sync = $state(saved.sync);
   let slants = $state(saved.slant);
   let phases = $state(saved.phase);
   let preLines = $state(saved.preLines);
   let invert = $state(saved.invert);
   let fps = $state(saved.fps);
+  let palette = $state<Palette>(saved.palette);
+  let levelLo = $state(saved.levelLo);
+  let levelHi = $state(saved.levelHi);
   $effect(() => {
-    const s = JSON.stringify({ frame, sync, slant: slants, phase: phases, preLines, invert, fps });
+    const s = JSON.stringify({ frame, anchor, sync, slant: slants, phase: phases, preLines, invert, fps, palette, levelLo, levelHi });
     try {
       localStorage.setItem(STORE_KEY, s);
     } catch {}
@@ -79,31 +97,38 @@
     id: number;
     width: number;
     height: number;
-    locked: boolean;
+    /** 0 = フリーラン、1 = 垂直同期で揃えた、2 = 見失ったので前の位置を保っている */
+    lock: 0 | 1 | 2;
     pal: boolean;
     total: number;
     firstLine: number;
     linesPerRow: number;
     fs: number;
+    /** 画素 0 と 255 に当たるレベル [IRE] */
+    rangeLo: number;
+    rangeHi: number;
     gray: Uint8Array;
   };
+  const HEADER = 56;
   function parse(ab: ArrayBuffer): Img | null {
-    if (ab.byteLength < 48) return null;
+    if (ab.byteLength < HEADER) return null;
     const dv = new DataView(ab);
     const w = dv.getUint32(8, true);
     const h = dv.getUint32(12, true);
-    if (ab.byteLength < 48 + w * h) return null;
+    if (ab.byteLength < HEADER + w * h) return null;
     return {
       id: Number(dv.getBigUint64(0, true)),
       width: w,
       height: h,
-      locked: dv.getUint32(16, true) === 1,
+      lock: Math.min(2, dv.getUint32(16, true)) as 0 | 1 | 2,
       pal: dv.getUint32(20, true) === 1,
       total: dv.getUint32(24, true),
       firstLine: dv.getFloat64(28, true),
       linesPerRow: dv.getFloat64(36, true),
       fs: dv.getFloat32(44, true),
-      gray: new Uint8Array(ab, 48, w * h),
+      rangeLo: dv.getFloat32(48, true),
+      rangeHi: dv.getFloat32(52, true),
+      gray: new Uint8Array(ab, HEADER, w * h),
     };
   }
 
@@ -113,6 +138,99 @@
   let lastId = 0;
   /** 設定が変わったので、新しいフィールドがなくても描き直す */
   let dirty = true;
+  /** 垂直同期を見失ったときに保つ位置 (最後に揃えた画像の 1 行目のライン番号) */
+  let holdLine: number | null = null;
+
+  // ---- 疑似カラー ----
+  type RGB = [number, number, number];
+  const clamp01 = (x: number) => (x < 0 ? 0 : x > 1 ? 1 : x);
+  /** 区分線形のカラーマップ */
+  function ramp(stops: [number, RGB][], t: number): RGB {
+    t = clamp01(t);
+    for (let i = 1; i < stops.length; i++) {
+      const [t1, c1] = stops[i];
+      if (t <= t1) {
+        const [t0, c0] = stops[i - 1];
+        const u = t1 > t0 ? (t - t0) / (t1 - t0) : 0;
+        return [c0[0] + (c1[0] - c0[0]) * u, c0[1] + (c1[1] - c0[1]) * u, c0[2] + (c1[2] - c0[2]) * u];
+      }
+    }
+    return stops[stops.length - 1][1];
+  }
+  const HEAT: [number, RGB][] = [
+    [0, [0, 0, 0]],
+    [0.35, [0.75, 0.05, 0.02]],
+    [0.65, [1, 0.6, 0.05]],
+    [0.85, [1, 0.95, 0.4]],
+    [1, [1, 1, 1]],
+  ];
+  const RAINBOW: [number, RGB][] = [
+    [0, [0.1, 0, 0.35]],
+    [0.15, [0.15, 0.2, 1]],
+    [0.35, [0, 0.85, 1]],
+    [0.5, [0.1, 0.9, 0.2]],
+    [0.68, [1, 0.95, 0.1]],
+    [0.85, [1, 0.4, 0]],
+    [1, [0.9, 0, 0.1]],
+  ];
+  /** - 側: 黒 → 紺 → 青 → 水色 (同期の先端ほど明るい) */
+  const NEG: [number, RGB][] = [
+    [0, [0, 0, 0]],
+    [0.35, [0.05, 0.12, 0.55]],
+    [0.75, [0.1, 0.45, 1]],
+    [1, [0.55, 0.95, 1]],
+  ];
+  /** + 側: 黒 → 焦げ茶 → 橙 → クリーム → 白 */
+  const POS: [number, RGB][] = [
+    [0, [0, 0, 0]],
+    [0.3, [0.4, 0.2, 0.06]],
+    [0.65, [0.9, 0.62, 0.3]],
+    [1, [1, 0.98, 0.92]],
+  ];
+
+  /** レベル [IRE] → 色 (0..1) */
+  function colorOf(ire: number): RGB {
+    const lo = Math.min(levelLo, levelHi - 1);
+    const hi = Math.max(levelHi, lo + 1);
+    const t = (ire - lo) / (hi - lo);
+    let c: RGB;
+    switch (palette) {
+      case "gray": {
+        const v = clamp01(t);
+        c = [v, v, v];
+        break;
+      }
+      case "heat":
+        c = ramp(HEAT, t);
+        break;
+      case "rainbow":
+        c = ramp(RAINBOW, t);
+        break;
+      default: {
+        // 帰線レベル (0 IRE) を黒にして、+ と - を別の色で伸ばす。範囲の片側が 0 を越えていなければ全体を片側の色にする
+        if (ire < 0) c = lo < 0 ? ramp(NEG, ire / lo) : [0, 0, 0];
+        else c = hi > 0 ? ramp(POS, ire / hi) : [0, 0, 0];
+      }
+    }
+    return invert ? [1 - c[0], 1 - c[1], 1 - c[2]] : c;
+  }
+
+  /** 画素値 (0..255) → RGBA の表。範囲とパレットが変わったときだけ作る */
+  let lut = new Uint8ClampedArray(256 * 4);
+  let lutKey = "";
+  function ensureLut(img: Img) {
+    const key = `${palette}|${levelLo}|${levelHi}|${invert}|${img.rangeLo}|${img.rangeHi}`;
+    if (key === lutKey) return;
+    lutKey = key;
+    for (let i = 0; i < 256; i++) {
+      const c = colorOf(img.rangeLo + (i / 255) * (img.rangeHi - img.rangeLo));
+      lut[i * 4] = c[0] * 255 + 0.5;
+      lut[i * 4 + 1] = c[1] * 255 + 0.5;
+      lut[i * 4 + 2] = c[2] * 255 + 0.5;
+      lut[i * 4 + 3] = 255;
+    }
+  }
+  const ireOf = (img: Img, code: number) => img.rangeLo + (code / 255) * (img.rangeHi - img.rangeLo);
 
   function draw(img: Img) {
     if (!canvas) return;
@@ -122,15 +240,14 @@
     }
     const ctx = canvas.getContext("2d")!;
     const id = ctx.createImageData(img.width, img.height);
-    const px = id.data;
+    ensureLut(img);
+    const px = new Uint32Array(id.data.buffer);
+    const lut32 = new Uint32Array(lut.buffer);
     const g = img.gray;
-    for (let i = 0, o = 0; i < g.length; i++, o += 4) {
-      const v = invert ? 255 - g[i] : g[i];
-      px[o] = px[o + 1] = px[o + 2] = v;
-      px[o + 3] = 255;
-    }
+    for (let i = 0; i < g.length; i++) px[i] = lut32[g[i]];
     ctx.putImageData(id, 0, 0);
     drawOverlay();
+    drawLegend();
   }
 
   // ---- 取得のループ ----
@@ -150,8 +267,10 @@
           width,
           phase,
           frame,
+          anchor: anchor === "f1" ? 0 : anchor === "f2" ? 1 : 2,
           sync,
           preLines,
+          hold: holdLine,
         });
         const img = parse(ab);
         if (img && (img.pal ? "pal" : "ntsc") === standard) {
@@ -161,6 +280,7 @@
             ls = img.width;
             dirty = true;
           }
+          if (img.lock === 1) holdLine = img.firstLine;
           last = img;
           draw(img);
         }
@@ -188,6 +308,7 @@
       if (active) {
         lastId = 0;
         dirty = true;
+        holdLine = null;
         last = null;
         timer = setTimeout(tick, 0);
       }
@@ -203,15 +324,85 @@
     void width;
     void phase;
     void frame;
+    void anchor;
     void sync;
     void preLines;
     void standard;
     dirty = true;
+    // 保っていた位置は前の設定のものなので捨てる
+    holdLine = null;
   });
+  // 色とレベルは手元で描き直すだけ
   $effect(() => {
     void invert;
+    void palette;
+    void levelLo;
+    void levelHi;
     untrack(() => last && draw(last));
   });
+
+  // ---- レベル ----
+  const LEVEL_PRESETS: { label: string; lo: number; hi: number; title: string }[] = [
+    { label: "標準", lo: -45, hi: 105, title: "同期の先端から白まで" },
+    { label: "全域", lo: -60, hi: 140, title: "受け取った範囲すべて (同期の下・スーパーホワイトの上も)" },
+    { label: "同期", lo: -50, hi: 10, title: "同期とその周り (同期の深さ・等化パルス・セレーションを見る)" },
+    { label: "映像", lo: 0, hi: 110, title: "帰線レベルから白まで (映像とバースト・VBI のデータ)" },
+  ];
+  function setLevels(lo: number, hi: number) {
+    levelLo = Math.round(Math.max(-60, Math.min(139, lo)));
+    levelHi = Math.round(Math.max(levelLo + 1, Math.min(140, hi)));
+  }
+  /** 今の画像の 0.2 % 〜 99.8 % に合わせる */
+  function autoLevels() {
+    const img = last;
+    if (!img) return;
+    const hist = new Uint32Array(256);
+    for (let i = 0; i < img.gray.length; i++) hist[img.gray[i]]++;
+    const n = img.gray.length;
+    let acc = 0,
+      lo = 0,
+      hi = 255;
+    for (let i = 0; i < 256; i++) {
+      acc += hist[i];
+      if (acc >= n * 0.002) {
+        lo = i;
+        break;
+      }
+    }
+    acc = 0;
+    for (let i = 255; i >= 0; i--) {
+      acc += hist[i];
+      if (acc >= n * 0.002) {
+        hi = i;
+        break;
+      }
+    }
+    setLevels(Math.floor(ireOf(img, lo)), Math.ceil(ireOf(img, hi)));
+  }
+
+  // ---- 色の凡例 ----
+  let legend: HTMLCanvasElement | undefined = $state();
+  function drawLegend() {
+    if (!legend || !last) return;
+    const W = 256;
+    if (legend.width !== W) {
+      legend.width = W;
+      legend.height = 1;
+    }
+    const ctx = legend.getContext("2d")!;
+    const id = ctx.createImageData(W, 1);
+    // 凡例は表示範囲 (levelLo..levelHi) を左から右へ
+    for (let x = 0; x < W; x++) {
+      const c = colorOf(levelLo + ((x + 0.5) / W) * (levelHi - levelLo));
+      id.data[x * 4] = c[0] * 255;
+      id.data[x * 4 + 1] = c[1] * 255;
+      id.data[x * 4 + 2] = c[2] * 255;
+      id.data[x * 4 + 3] = 255;
+    }
+    ctx.putImageData(id, 0, 0);
+  }
+  /** 凡例の上で 0 IRE (帰線) の位置 [%] */
+  const zeroAt = $derived(((0 - levelLo) / Math.max(1, levelHi - levelLo)) * 100);
 
   // ---- 目盛り (左にライン番号、右に区間の色) ----
   const GUTTER = 40;
@@ -279,7 +470,7 @@
   });
 
   // ---- 自動調整 ----
-  /** 行ごとに水平同期 (いちばん暗い所) の位置を探す。戻り値は列の位置 (列数を法として連続にしたもの) */
+  /** 行ごとに水平同期 (いちばん低い所) の位置を探す。戻り値は列の位置 (列数を法として連続にしたもの) */
   function syncColumns(img: Img): { r: number; x: number }[] {
     const W = img.width;
     const box = Math.max(4, Math.round(W * 0.06)); // 同期パルス程度の幅
@@ -300,8 +491,8 @@
           bx = x;
         }
       }
-      // 暗い所が同期レベル付近でなければ使わない
-      if (best / box > 40) continue;
+      // 低い所が同期レベル付近でなければ使わない
+      if (ireOf(img, best / box) > -20) continue;
       let x = bx;
       if (prev !== null) {
         while (x - prev > W / 2) x -= W;
@@ -360,9 +551,8 @@
     const pos = rowLine(img, row) + fx * img.linesPerRow;
     const n = Math.floor(((pos - 1) % img.total + img.total) % img.total) + 1;
     const us = (((pos - Math.floor(pos)) * ls) / img.fs) * 1e6;
-    const sync = img.pal ? -300 / 7 : -40;
-    const ire = sync + (img.gray[row * img.width + col] / 255) * (100 - sync);
-    readout = `ライン ${n} · ${us.toFixed(2)} µs · ${ire.toFixed(0)} IRE`;
+    const ire = ireOf(img, img.gray[row * img.width + col]);
+    readout = `ライン ${n} · ${us.toFixed(2)} µs · ${ire >= 0 ? "+" : ""}${ire.toFixed(1)} IRE`;
   }
   function onWheel(e: WheelEvent) {
     e.preventDefault();
@@ -375,8 +565,13 @@
   <section class="syncview">
     <header>
       <span class="seg" role="group" aria-label="表示範囲">
-        <button class:on={!frame} onclick={() => (frame = false)} title="1 フィールド (どちらのフィールドの垂直同期でも揃える)">1V</button>
-        <button class:on={frame} onclick={() => (frame = true)} title="1 フレーム (第 1 フィールドの垂直同期で揃える)">2V</button>
+        <button class:on={!frame} onclick={() => (frame = false)} title="1 フィールドぶん見せる">1V</button>
+        <button class:on={frame} onclick={() => (frame = true)} title="1 フレーム (2 フィールド) ぶん見せる">2V</button>
+      </span>
+      <span class="seg" role="group" aria-label="揃えるフィールド">
+        <button class:on={anchor === "f1"} onclick={() => (anchor = "f1")} title="第 1 フィールドの垂直同期で揃える (毎回同じ絵になる)">F1</button>
+        <button class:on={anchor === "f2"} onclick={() => (anchor = "f2")} title="第 2 フィールドの垂直同期で揃える">F2</button>
+        <button class:on={anchor === "either"} onclick={() => (anchor = "either")} title="新しい方の垂直同期で揃える (更新ごとに第 1・第 2 フィールドが入れ替わる)">交互</button>
       </span>
       <span class="seg" role="group" aria-label="同期">
         <button class:on={sync} onclick={() => (sync = true)} title="信号の垂直同期で縦を揃える">VSYNC</button>
@@ -424,12 +619,44 @@
         <button onclick={autoPhase} title="水平同期が左端に来るように横の位置を合わせる">Phase</button>
         <button onclick={autoSlant} title="水平同期の帯の傾きからライン長を合わせる">Slant</button>
         <button onclick={() => setSlant(0)} title="ライン長を規格の値に戻す">規定長</button>
-        <button class:on={invert} onclick={() => (invert = !invert)} title="白黒を反転 (同期が白になる)">反転</button>
       </span>
       {#if last}
-        <span class="lock" class:locked={last.locked}>{last.locked ? "● V ロック" : "○ フリーラン"}</span>
+        <span class="lock" class:locked={last.lock === 1} class:hold={last.lock === 2}
+          title={last.lock === 2 ? "垂直同期を見失ったので、最後に揃えた位置を保っています" : ""}
+          >{last.lock === 1 ? "● V ロック" : last.lock === 2 ? "◐ 保持" : "○ フリーラン"}</span
+        >
       {/if}
     </header>
+    <div class="levels">
+      <label title="色の付け方">
+        色
+        <select bind:value={palette}>
+          <option value="bipolar">± (帰線で分ける)</option>
+          <option value="gray">白黒</option>
+          <option value="heat">ヒート</option>
+          <option value="rainbow">レインボー</option>
+        </select>
+      </label>
+      <label title="表示範囲の下端 [IRE] (これより低いところは下端の色)">
+        下
+        <input type="number" step="1" value={levelLo} onchange={(e) => setLevels(Number((e.target as HTMLInputElement).value), levelHi)} class="short" />
+      </label>
+      <div class="legend" title="色とレベルの対応 (白い線が 0 IRE = 帰線レベル)">
+        <canvas bind:this={legend}></canvas>
+        {#if zeroAt > 0 && zeroAt < 100}<span class="zero" style:left="{zeroAt}%"></span>{/if}
+      </div>
+      <label title="表示範囲の上端 [IRE] (これより高いところは上端の色)">
+        上
+        <input type="number" step="1" value={levelHi} onchange={(e) => setLevels(levelLo, Number((e.target as HTMLInputElement).value))} class="short" />
+      </label>
+      <span class="presets">
+        {#each LEVEL_PRESETS as p (p.label)}
+          <button class:on={levelLo === p.lo && levelHi === p.hi} onclick={() => setLevels(p.lo, p.hi)} title={p.title}>{p.label}</button>
+        {/each}
+        <button onclick={autoLevels} title="今の画像のレベルの分布に合わせる">自動</button>
+        <button class:on={invert} onclick={() => (invert = !invert)} title="色を反転">反転</button>
+      </span>
+    </div>
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div class="screen" style:--gutter="{GUTTER}px" style:--band="{BAND}px" onpointermove={onMove} onpointerleave={() => (readout = "")} onwheel={onWheel}>
       <canvas class="img" bind:this={canvas}></canvas>
@@ -503,6 +730,39 @@
   }
   .lock.locked {
     color: #8fe08f;
+  }
+  .lock.hold {
+    color: #ffd27a;
+  }
+  .levels {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 0 8px 4px;
+    color: var(--muted);
+  }
+  .legend {
+    position: relative;
+    width: 180px;
+    height: 12px;
+    border: 1px solid var(--line);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .legend canvas {
+    position: static;
+    width: 100%;
+    height: 100%;
+    image-rendering: auto;
+  }
+  .legend .zero {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 1px;
+    background: #fff;
+    mix-blend-mode: difference;
   }
   .screen {
     position: relative;

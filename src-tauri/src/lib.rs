@@ -151,7 +151,7 @@ fn set_scope_active(engine: State<'_, Engine>, active: bool, who: Option<u32>) {
     }
 }
 
-/// 生信号ビュー: 最近のフィールドのコンポジット信号をデコードせずに白黒の画像にする。
+/// 生信号ビュー: 最近のフィールドのコンポジット信号をデコードせずに画像にする。
 /// `after` より新しいフィールドがなければ空。形式は `syncview::SyncImage::to_bytes`
 #[tauri::command]
 async fn get_sync_view(
@@ -160,8 +160,10 @@ async fn get_sync_view(
     width: f64,
     phase: f64,
     frame: bool,
+    anchor: u8,
     sync: bool,
     pre_lines: f64,
+    hold: Option<f64>,
 ) -> Result<Response, String> {
     let fields = {
         let ring = engine.shared.scope.lock().unwrap();
@@ -173,7 +175,13 @@ async fn get_sync_view(
         let n = f.len().min(if frame { 6 } else { 4 });
         f[f.len() - n..].to_vec()
     };
-    let req = syncview::SyncViewReq { width, phase, frame, sync, pre_lines };
+    // anchor: 0 = 第 1 フィールド、1 = 第 2 フィールド、それ以外 = どちらでも
+    let anchor = match anchor {
+        0 => syncview::Anchor::Field1,
+        1 => syncview::Anchor::Field2,
+        _ => syncview::Anchor::Either,
+    };
+    let req = syncview::SyncViewReq { width, phase, frame, anchor, sync, pre_lines, hold };
     Ok(Response::new(
         syncview::render(&fields, &req).map_or_else(Vec::new, |i| i.to_bytes()),
     ))
