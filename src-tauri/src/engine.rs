@@ -212,7 +212,7 @@ impl Drop for TempFile {
 }
 
 fn export(app: &AppHandle, input: &Path, output: &Path, params: Params, cancel: &AtomicBool) -> Result<(), String> {
-    let tv = params.standard.spec();
+    let tv = params.tv();
     let total = probe_duration(input).map(|d| (d * tv.field_rate_ratio.0 as f64 / tv.field_rate_ratio.1 as f64) as u64);
 
     // 音声は先に全部処理して一時 WAV にする (映像より桁違いに軽い)

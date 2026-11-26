@@ -39,6 +39,38 @@ impl Pixels {
             Pixels::Linear(f) => Pixels::Linear(f.resized(w, h)),
         }
     }
+
+    /// 1 画素を kx × ky 画素に複製する (補間しない)
+    fn replicated(&self, kx: usize, ky: usize) -> Pixels {
+        fn rep<T: Copy>(src: &[T], (w, h): (usize, usize), kx: usize, ky: usize) -> Vec<T> {
+            let mut out = Vec::with_capacity(src.len() * kx * ky);
+            for y in 0..h {
+                let start = out.len();
+                for px in src[y * w * 3..(y + 1) * w * 3].chunks_exact(3) {
+                    for _ in 0..kx {
+                        out.extend_from_slice(px);
+                    }
+                }
+                for _ in 1..ky {
+                    out.extend_from_within(start..start + w * kx * 3);
+                }
+            }
+            out
+        }
+        let (w, h) = self.size();
+        match self {
+            _ if (kx, ky) == (1, 1) => self.clone(),
+            Pixels::Rgb(f) => Pixels::Rgb(RgbFrame::from_raw(w * kx, h * ky, rep(&f.data, (w, h), kx, ky)).unwrap()),
+            Pixels::Linear(f) => {
+                Pixels::Linear(LinearFrame::from_raw(w * kx, h * ky, rep(&f.data, (w, h), kx, ky)).unwrap())
+            }
+        }
+    }
+}
+
+/// ドットクロック同期の配置の整数倍率 (横 [サンプル/画素], 縦 [ライン/画素])。画面に収まる最大の整数 (最低 1)
+fn pixel_factors((w, h): (usize, usize), (fw, fh): (usize, usize)) -> (usize, usize) {
+    ((fw / w.max(1)).max(1), (fh / h.max(1)).max(1))
 }
 
 /// 拡大後の画像のキャッシュを作り直す条件
@@ -89,13 +121,17 @@ impl Still {
     fn scaled_size(&self, p: &ImageParams, tv: &Standard) -> (usize, usize) {
         let (fw, fh) = tv.image_size();
         let (w, h) = self.original.size();
+        if p.fit == ImageFit::Pixel {
+            let (kx, ky) = pixel_factors((w, h), (fw, fh));
+            return (w * kx, h * ky);
+        }
         let sa = tv.sample_aspect();
         let zoom = p.zoom.clamp(1.0, MAX_ZOOM);
         // 正方画素での画面の幅
         let fw_sq = fw as f32 / sa;
         let (kx, ky) = match p.fit {
             ImageFit::Stretch => (fw_sq / w as f32, fh as f32 / h as f32),
-            ImageFit::Original => (1.0 / sa, 1.0),
+            ImageFit::Original | ImageFit::Pixel => (1.0 / sa, 1.0),
             ImageFit::Cover => {
                 let k = (fw_sq / w as f32).max(fh as f32 / h as f32);
                 (k, k)
@@ -115,8 +151,14 @@ impl Still {
         let frame = tv.image_size();
         let key = ScaleKey { fit: p.fit, zoom: p.zoom.clamp(1.0, MAX_ZOOM), frame };
         if self.scaled.as_ref().is_none_or(|(k, _)| *k != key) {
-            let (sw, sh) = self.scaled_size(p, tv);
-            self.scaled = Some((key, self.original.resized(sw, sh)));
+            let scaled = if p.fit == ImageFit::Pixel {
+                let (kx, ky) = pixel_factors(self.original.size(), frame);
+                self.original.replicated(kx, ky)
+            } else {
+                let (sw, sh) = self.scaled_size(p, tv);
+                self.original.resized(sw, sh)
+            };
+            self.scaled = Some((key, scaled));
         }
         let scaled = &self.scaled.as_ref().unwrap().1;
         let (sw, sh) = scaled.size();
@@ -148,6 +190,14 @@ impl Still {
             }
             // 画像の左上の画面上の位置。画像が大きければ pos=1 で右端が見え、小さければ画像が右に寄る
             origin[i] = (fsize[i] - ssize[i]) * (1.0 + self.pos[i]) / 2.0;
+        }
+        if p.fit == ImageFit::Pixel {
+            // 横は副搬送波の 1 周期 (4 サンプル) 単位に揃えてから位相ぶんずらす。画面の x = 0 は
+            // 有効区間の先頭 (active_start) なので、そこからの位相も加えて副搬送波の位相 0 に揃える。
+            // 縦は 2 ライン単位 (両フィールドに同じ行が来る) に揃える
+            let base = (4 - tv.active_start % 4) % 4;
+            origin[0] = (origin[0] / 4.0).floor() * 4.0 + base as f32 + (p.pixel_phase % 4) as f32;
+            origin[1] = (origin[1] / 2.0).floor() * 2.0;
         }
 
         match scaled {
@@ -251,6 +301,33 @@ fn place<T: Sample>(src: &[T], (sw, sh): (usize, usize), dst: &mut [T], (dw, dh)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ドットクロック同期: 640×200 は 1 サンプル × 2 ラインで補間せず置き、左端の画素が副搬送波の位相 0 に来る
+    #[test]
+    fn pixel_fit_is_integer_and_phase_aligned() {
+        let (w, h) = (640u32, 200u32);
+        let img = image::RgbImage::from_fn(w, h, |x, _| if x % 4 < 2 { image::Rgb([255; 3]) } else { image::Rgb([0; 3]) });
+        let path = std::env::temp_dir().join(format!("vhs_still_pixel_{}.png", std::process::id()));
+        DynamicImage::ImageRgb8(img).save(&path).unwrap();
+        let mut still = Still::load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let tv = &vhs_core::timing::NTSC_228;
+        let (fw, _) = tv.image_size();
+        for phase in 0..4u8 {
+            let p = ImageParams { fit: ImageFit::Pixel, pixel_phase: phase, ..Default::default() };
+            let StillFrame::Rgb(f) = still.render(&p, tv, 1.0 / 60.0) else { panic!() };
+            let row = |y: usize| &f.data[y * fw * 3..(y + 1) * fw * 3];
+            // 縦は 2 ライン単位で同じ行
+            let top = (0..f.height).find(|&y| row(y).iter().any(|&v| v > 0)).unwrap();
+            assert_eq!(top % 2, 0);
+            assert_eq!(row(top), row(top + 1));
+            // 最初の白画素の位置 (有効区間の先頭からの副搬送波位相) が phase になる
+            let x = row(top).chunks_exact(3).position(|px| px[0] == 255).unwrap();
+            assert_eq!((x + tv.active_start) % 4, phase as usize, "phase {phase}");
+            // 補間なし: 0 / 255 だけ
+            assert!(row(top).iter().all(|&v| v == 0 || v == 255));
+        }
+    }
 
     #[test]
     fn place_integer_and_fractional() {

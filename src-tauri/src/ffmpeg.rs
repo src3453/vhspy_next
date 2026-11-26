@@ -394,7 +394,7 @@ mod tests {
         let latency = proc.latency();
         let has = process_audio(&input, &wav, latency, &AtomicBool::new(false), |b| proc.process(b)).unwrap();
         assert!(has);
-        let tv = params.standard.spec();
+        let tv = params.tv();
         let rec = Recorder::start(&out, Some(AudioTrack { path: &wav, kbps: 64, mono: true }), tv, None).unwrap();
         let (ow, oh) = tv.image_size();
         let frame = vec![128u8; ow * oh * 4];

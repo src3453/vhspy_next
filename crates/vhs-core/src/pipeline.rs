@@ -69,7 +69,7 @@ pub struct Pipeline {
 
 impl Pipeline {
     pub fn new(params: Params) -> Self {
-        let std = params.standard.spec();
+        let std = params.tv();
         let (w, h) = std.image_size();
         let mut camera = CameraSim::default();
         camera.set_field_rate(std.field_rate);
@@ -100,10 +100,10 @@ impl Pipeline {
         &self.params
     }
 
-    /// パラメータを差し替える。テレビ方式が変わったときは内部状態を作り直す
+    /// パラメータを差し替える。テレビ方式 (228 周期ラインの切り替えを含む) が変わったときは内部状態を作り直す
     /// (画像サイズが変わるので、入力も [`Pipeline::input_size`] に合わせ直すこと)。
     pub fn set_params(&mut self, params: Params) {
-        if params.standard != self.params.standard {
+        if !std::ptr::eq(params.tv(), self.field.std) {
             let index = self.field_index;
             let menu = self.menu_params.take();
             *self = Self::new(params);

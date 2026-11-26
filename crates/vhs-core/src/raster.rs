@@ -191,12 +191,12 @@ pub fn render_blanking(s: &Standard, info: &LineInfo, out: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::timing::{NTSC, PAL};
+    use crate::timing::{NTSC, NTSC_228, PAL};
 
     /// バッファは垂直同期の後から始まり、次のフィールドの垂直同期を末尾に含む。ストリームは途切れない
     #[test]
     fn field_buffers_frame_the_picture() {
-        for s in [&NTSC, &PAL] {
+        for s in [&NTSC, &NTSC_228, &PAL] {
             for p in 0..2u8 {
                 let first = line_info(s, s.stream_line(0, 0, p));
                 assert!(first.halves.iter().all(|h| *h != Pulse::Broad), "{:?} parity {p}", s.kind);
@@ -229,7 +229,7 @@ mod tests {
     /// 1 フィールドの幅広パルス・等化パルスの数
     #[test]
     fn vertical_interval_pulse_counts() {
-        for s in [&NTSC, &PAL] {
+        for s in [&NTSC, &NTSC_228, &PAL] {
             for p in 0..2u8 {
                 let (mut eq, mut broad) = (0, 0);
                 // 垂直同期の前 6 ライン〜後 8 ライン

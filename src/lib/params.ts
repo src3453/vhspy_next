@@ -10,6 +10,8 @@ export const isDigitalFormat = (f: TapeFormat): f is DigitalFormat => f === "dv"
 export type Params = {
   /** テレビ方式 */
   standard: Standard;
+  /** NTSC を 1 ライン 228 周期の非標準ラインにする (CGA・Apple II などの出力) */
+  ntsc_228: boolean;
   /** 入力映像の画質調整 (カメラの有無に関わらずすべての映像に掛かる) */
   input: {
     enabled: boolean;
@@ -259,13 +261,15 @@ export type Params = {
   };
   /** 静止画入力の配置・パン */
   image: {
-    fit: "stretch" | "original" | "cover" | "contain";
+    fit: "stretch" | "original" | "cover" | "contain" | "pixel";
     zoom: number;
     pan_x: number;
     pan_y: number;
     speed_x: number;
     speed_y: number;
     exposure_ev: number;
+    /** ドットクロック同期の配置で右へずらすサンプル数 (0..3) */
+    pixel_phase: number;
   };
   seed: number;
 };
@@ -297,6 +301,7 @@ export const groups: Group[] = [
           { value: "pal", label: "PAL-B/G (625 / 50 Hz)" },
         ],
       },
+      b("ntsc_228", "228 周期ライン (コンピュータ出力)"),
     ],
   },
   {
@@ -310,6 +315,7 @@ export const groups: Group[] = [
           { value: "original", label: "オリジナルサイズ (画像の画素を維持)" },
           { value: "cover", label: "画面を覆う (はみ出しはパンで見る)" },
           { value: "contain", label: "画面に収める (余白は黒)" },
+          { value: "pixel", label: "ドットクロック同期 (アーティファクトカラー)" },
         ],
       },
       r("image.zoom", "拡大", 1, 4, 0.01, "×"),
@@ -318,6 +324,7 @@ export const groups: Group[] = [
       r("image.speed_x", "横パン速度", -1, 1, 0.005, "画面/s"),
       r("image.speed_y", "縦パン速度", -1, 1, 0.005, "画面/s"),
       r("image.exposure_ev", "HDR 露出", -8, 8, 0.1, "EV"),
+      r("image.pixel_phase", "ドット位相", 0, 3, 1, "サンプル"),
     ],
   },
   {
@@ -778,7 +785,13 @@ export const groups: Group[] = [
 // ツールチップ用の説明 (path → 説明文)。
 export const help: Record<string, string> = {
   // 画像入力
-  "image.fit": "画像を画面 (4:3) に合わせる方法。「オリジナルサイズ」は画像の画素数を保ち、画面より大きい部分は位置・パンで見る。",
+  "image.fit": "画像を画面 (4:3) に合わせる方法。「オリジナルサイズ」は画像の画素数を保ち、画面より大きい部分は位置・パンで見る。「ドットクロック同期」は 1 画素を 4fsc の整数サンプル × 整数ラインに補間せず置き (640 幅 → 1 サンプル、320 幅 → 2 サンプル)、横位置を副搬送波の周期に揃える。CGA・Apple II の画面のアーティファクトカラー用。",
+  ntsc_228:
+    "NTSC の 1 ラインを 227.5 周期ではなく 228 周期 (912 サンプル) にする。CGA・Apple II などのコンピュータの出力と同じ非標準ライン。" +
+    "副搬送波の位相がラインごとに反転しないので、画素の縞によるアーティファクトカラーが全ラインで同じ色になる。" +
+    "くし形・3 次元 Y/C 分離では色が消える (実機のくし形フィルタ付きテレビと同じ) のでトラップ (ノッチ) で見る。",
+  "image.pixel_phase":
+    "ドットクロック同期の配置で画像を右にずらすサンプル数。副搬送波との位相が 90° ずつ変わり、アーティファクトカラーの色相が変わる。",
   "image.zoom": "配置した大きさからの拡大率。",
   "image.pan_x": "表示位置。-1 で左端、1 で右端が見える (画像が画面より小さいときは画像が左右に寄る)。",
   "image.pan_y": "表示位置。-1 で上端、1 で下端が見える。",
@@ -1215,6 +1228,8 @@ const activeWhen: Record<string, (p: Params) => boolean> = {
   "decoder.dnr_motion_threshold_ire": (p) => analogTape(p) && p.decoder.dnr_strength > 0,
   "decoder.nr_bits": analogTape,
   "decoder.pal_delay_line": (p) => p.standard === "pal",
+  ntsc_228: (p) => p.standard === "ntsc",
+  "image.pixel_phase": (p) => p.image.fit === "pixel",
   "output.deinterlace_params.weave_temporal_weight_pct": (p) => p.output.deinterlace === "weave",
   "output.deinterlace_params.bob_blend_pct": (p) => p.output.deinterlace === "bob",
   "output.deinterlace_params.blend_strength_pct": (p) => p.output.deinterlace === "blend",

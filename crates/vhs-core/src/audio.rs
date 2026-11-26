@@ -69,7 +69,7 @@ impl AudioProcessor {
     pub fn new(params: &Params, sample_rate: u32) -> Self {
         let p = params.audio.clone();
         let fs = sample_rate as f32;
-        let field_rate = params.standard.spec().field_rate;
+        let field_rate = params.tv().field_rate;
         let linear = p.mode == AudioMode::Linear;
         let band = if linear {
             let lo = Cascade::butter_highpass_at(2, p.low_cut_hz.max(5.0), fs);

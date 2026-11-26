@@ -107,6 +107,7 @@ export const groupLabels: Record<string, string> = {
 /** コントロールのラベル (path → 18 文字以内) */
 export const controlLabels: Record<string, string> = {
   standard: "ﾎｳｼｷ",
+  ntsc_228: "228 ｼｭｳｷ ﾗｲﾝ",
   "image.fit": "ﾊｲﾁ",
   "image.zoom": "ｶｸﾀﾞｲ",
   "image.pan_x": "ﾖｺ ｲﾁ",
@@ -114,6 +115,7 @@ export const controlLabels: Record<string, string> = {
   "image.speed_x": "ﾖｺ ﾊﾟﾝ",
   "image.speed_y": "ﾀﾃ ﾊﾟﾝ",
   "image.exposure_ev": "HDR ﾛｼｭﾂ",
+  "image.pixel_phase": "ﾄﾞｯﾄ ｲｿｳ",
 
   "input.enabled": "ｶﾞｼﾂﾁｮｳｾｲ",
   "input.blur_px": "ﾎﾞｹ",
@@ -348,7 +350,7 @@ export const controlLabels: Record<string, string> = {
 /** 選択肢のラベル (path → value → ラベル)。ないものは元のラベルを変換して使う */
 export const optionLabels: Record<string, Record<string, string>> = {
   standard: { ntsc: "NTSC", pal: "PAL" },
-  "image.fit": { stretch: "ﾋｷﾉﾊﾞｼ", original: "ｵﾘｼﾞﾅﾙ", cover: "ｵｵｳ", contain: "ｵｻﾒﾙ" },
+  "image.fit": { stretch: "ﾋｷﾉﾊﾞｼ", original: "ｵﾘｼﾞﾅﾙ", cover: "ｵｵｳ", contain: "ｵｻﾒﾙ", pixel: "ﾄﾞｯﾄ" },
   "osd.mode": { direct: "ﾀﾞｲﾚｸﾄ", capture: "ｷｬﾌﾟﾁｬ", composite: "ﾃﾞｯｷ ｼｭﾂﾘｮｸ", tape: "ﾃｰﾌﾟ ﾔｷｺﾐ" },
   "tape.format": { beta: "BETA", custom: "ｶｽﾀﾑ", dv: "DV", digital8: "Digital8" },
   "tape.luma_model": { fm: "FM ｹｲｻﾝ", simple: "ｶﾝｲ" },

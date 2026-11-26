@@ -165,6 +165,37 @@ mod tests {
         p
     }
 
+    /// アーティファクトカラー: 4fsc に同期した白黒の縞 (2 サンプル白・2 サンプル黒) は、
+    /// 228 周期ラインなら全ラインで同じ色になり、227.5 周期ならラインごとに補色へ入れ替わる
+    #[test]
+    fn artifact_color_needs_228_cycle_lines() {
+        let row_diff = |line_228: bool| {
+            let mut p = Params::default();
+            p.ntsc_228 = line_228;
+            p.tape.enabled = false;
+            let s = p.tv();
+            let (w, h) = s.image_size();
+            let mut input = RgbFrame::new(w, h);
+            for (i, px) in input.data.chunks_exact_mut(3).enumerate() {
+                let v = if ((i % w) + s.active_start) & 2 == 0 { 255 } else { 0 };
+                px.fill(v);
+            }
+            let mut pl = Pipeline::new(p);
+            for _ in 0..4 {
+                pl.process_field(&input);
+            }
+            let (ow, oh) = pl.output_size();
+            let (a, b) = (pixel(&pl, oh / 2, ow / 2), pixel(&pl, oh / 2 + 1, ow / 2));
+            let chroma = (a[0] - a[1]).abs().max((a[1] - a[2]).abs()).max((a[0] - a[2]).abs());
+            let diff = (0..3).map(|c| (a[c] - b[c]).abs()).max().unwrap();
+            (chroma, diff, a, b)
+        };
+        let (chroma, diff, a, b) = row_diff(true);
+        assert!(chroma > 60 && diff < 12, "228: {a:?} / {b:?}");
+        let (_, diff, a, b) = row_diff(false);
+        assert!(diff > 60, "227.5: {a:?} / {b:?}");
+    }
+
     const COLORS: [[u8; 3]; 5] = [[200, 40, 40], [40, 200, 40], [40, 40, 200], [230, 200, 30], [128, 128, 128]];
 
     /// PAL: テープなしで色が保たれる (ノッチ / 2H くし形、遅延線あり / なし)

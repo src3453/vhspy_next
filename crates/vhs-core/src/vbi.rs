@@ -453,7 +453,7 @@ fn render_wss(s: &Standard, y: &mut [f32]) {
 mod tests {
     use super::*;
     use crate::raster::line_info;
-    use crate::timing::{NTSC, PAL};
+    use crate::timing::{NTSC, NTSC_228, PAL};
 
     #[test]
     fn caption_slices_back() {
@@ -470,7 +470,7 @@ mod tests {
     #[test]
     fn line_assignment_does_not_collide() {
         let p = VbiParams { vitc: true, teletext: true, wss: true, teletext_lines: 20, ..VbiParams::default() };
-        for s in [&NTSC, &PAL] {
+        for s in [&NTSC, &NTSC_228, &PAL] {
             let mut tele = 0;
             for n in 1..=s.frame_total_lines {
                 if service(s, n, &p) == Some(VbiService::Teletext) {

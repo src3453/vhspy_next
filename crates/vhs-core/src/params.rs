@@ -10,6 +10,9 @@ pub use crate::timing::TvStandard;
 pub struct Params {
     /// テレビ方式 (信号のタイミング・色の符号化)
     pub standard: TvStandard,
+    /// NTSC を 1 ライン 228 周期の非標準ラインにする (CGA・Apple II などのコンピュータの出力)。
+    /// 画素の縞によるアーティファクトカラーがラインごとに反転しなくなる ([`crate::timing::NTSC_228`])
+    pub ntsc_228: bool,
     /// 入力映像の画質調整 (パイプラインの先頭。カメラの有無に関わらずすべての映像に掛かる)
     pub input: InputParams,
     /// 撮像管カメラ (入力映像の画質調整の後)
@@ -40,6 +43,13 @@ pub struct Params {
     pub image: ImageParams,
     /// 乱数シード (同じシードなら同じ劣化パターン)
     pub seed: u64,
+}
+
+impl Params {
+    /// 使うテレビ方式のタイミング (`standard` と `ntsc_228` から決まる)
+    pub fn tv(&self) -> &'static crate::timing::Standard {
+        self.standard.spec_with(self.ntsc_228)
+    }
 }
 
 /// 送出側の個別信号要素 (ジッタ・レベル減衰・雑音)。減衰は 0..100 [%]。
@@ -840,6 +850,11 @@ pub enum ImageFit {
     Cover,
     /// 縦横比を保って画面に収める (余白は黒)
     Contain,
+    /// ドットクロック同期: 元画像の 1 画素を 4fsc の整数サンプル (横) × 整数ライン (縦) にそのまま置く
+    /// (補間しない)。倍率は画面に収まる最大の整数 (640 → 1 サンプル、320 → 2 サンプル、200 → 2 ライン)。
+    /// 横位置は副搬送波の 1 周期 (4 サンプル) 単位に揃えるので、画素の縞が副搬送波と同期して
+    /// アーティファクトカラーになる。拡大率は使わない
+    Pixel,
 }
 
 /// 静止画入力の配置とパン (カメラを振る動き)
@@ -857,11 +872,14 @@ pub struct ImageParams {
     pub speed_y: f32,
     /// HDR 画像 (OpenEXR) の露出 [EV]
     pub exposure_ev: f32,
+    /// ドットクロック同期の配置で、画像を右へずらすサンプル数 (0..3)。副搬送波との位相が 90° ずつ変わり、
+    /// アーティファクトカラーの色相が変わる
+    pub pixel_phase: u8,
 }
 
 impl Default for ImageParams {
     fn default() -> Self {
-        Self { fit: ImageFit::Stretch, zoom: 1.0, pan_x: 0.0, pan_y: 0.0, speed_x: 0.0, speed_y: 0.0, exposure_ev: 0.0 }
+        Self { fit: ImageFit::Stretch, zoom: 1.0, pan_x: 0.0, pan_y: 0.0, speed_x: 0.0, speed_y: 0.0, exposure_ev: 0.0, pixel_phase: 0 }
     }
 }
 

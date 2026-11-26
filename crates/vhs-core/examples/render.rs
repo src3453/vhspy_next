@@ -65,7 +65,7 @@ fn main() {
             Some(p) => serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap(),
             None => Params::default(),
         };
-        let input = test_pattern(params.standard.spec());
+        let input = test_pattern(params.tv());
         let mut p = Pipeline::new(params);
         for _ in 0..30 {
             p.process_field(&input);
@@ -94,7 +94,7 @@ fn main() {
         Some(p) => serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap(),
         None => Params::default(),
     };
-    let std = params.standard.spec();
+    let std = params.tv();
     let input = match args.first().map(|s| s.as_str()) {
         Some("--pattern") | None => Input::Rgb(test_pattern(std)),
         Some(path) => load_input(path, std),

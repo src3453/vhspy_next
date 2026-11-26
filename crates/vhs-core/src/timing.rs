@@ -30,6 +30,14 @@ impl TvStandard {
             TvStandard::Pal => &PAL,
         }
     }
+
+    /// `line_228` なら NTSC を 1 ライン 228 周期 (912 サンプル) の非標準ラインにする ([`NTSC_228`])。PAL には効かない
+    pub fn spec_with(self, line_228: bool) -> &'static Standard {
+        match self {
+            TvStandard::Ntsc if line_228 => &NTSC_228,
+            _ => self.spec(),
+        }
+    }
 }
 
 /// 信号レベル [IRE]
@@ -238,7 +246,9 @@ impl Standard {
 pub const MAX_LINE_SAMPLES: usize = 1152;
 pub const MAX_ACTIVE_WIDTH: usize = 1024;
 
-pub static NTSC: Standard = Standard {
+pub static NTSC: Standard = NTSC_FIELDS;
+
+const NTSC_FIELDS: Standard = Standard {
     kind: TvStandard::Ntsc,
     fsc: 315.0e6 / 88.0,
     fs: 4.0 * (315.0e6 / 88.0),
@@ -265,6 +275,13 @@ pub static NTSC: Standard = Standard {
     video_bw_hz: 4.2e6,
     ire: Levels { sync: -40.0, blank: 0.0, black: 7.5, white: 100.0, burst: 20.0 },
 };
+
+/// NTSC の非標準ライン: 1 ライン = 228 周期 (912 サンプル = 63.7 µs)。
+/// CGA・Apple II などのコンピュータは画素クロックを 4fsc (14.318 MHz) から作り、1 ラインを 912 クロックにしている。
+/// 副搬送波の位相がラインごと・フレームごとに反転しないので、画素の縞 (アーティファクトカラー) が
+/// どのラインでも同じ色になる。代わりにくし形 Y/C 分離では色が消える (上下のラインで色が打ち消し合わない)。
+/// それ以外の値 (同期・バースト・有効区間・ライン数) は [`NTSC`] と同じ
+pub static NTSC_228: Standard = Standard { line_samples: 912, ..NTSC_FIELDS };
 
 /// PAL-B/G。4fsc = 17.734475 MHz、1 ライン 64 µs = 1135 サンプル。
 /// 同期 4.7 µs、バースト 10 周期 (同期の立ち下がりから 5.6 µs)、有効映像 52 µs (10.5 µs から)
@@ -297,6 +314,7 @@ pub static PAL: Standard = Standard {
 };
 
 const _: () = assert!(NTSC.line_samples <= MAX_LINE_SAMPLES && NTSC.active_width <= MAX_ACTIVE_WIDTH);
+const _: () = assert!(NTSC_228.line_samples <= MAX_LINE_SAMPLES);
 const _: () = assert!(PAL.line_samples <= MAX_LINE_SAMPLES && PAL.active_width <= MAX_ACTIVE_WIDTH);
 
 /// サブキャリアの 4 象限位相テーブル (4fsc サンプリングでは位相は 90° 刻みになる)
