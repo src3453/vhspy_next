@@ -809,7 +809,7 @@ impl Default for DecoderParams {
             acc: true,
             color_killer: true,
             h_pll: 0.25,
-            burst_pll: 0.2,
+            burst_pll: 0.7,
             vcxo_offset_hz: 50.0,
             pal_delay_line: true,
             ynr_strength: 0.0,
