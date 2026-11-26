@@ -79,6 +79,7 @@ export type Params = {
     vitc: boolean;
     vits: boolean;
     teletext: boolean;
+    teletext_system: "nabts" | "jtes";
     teletext_lines: number;
     wss: boolean;
   };
@@ -672,7 +673,14 @@ export const groups: Group[] = [
       r("vbi.caption_channel", "字幕の送出チャンネル (CC1〜CC4)", 1, 4, 1),
       b("vbi.vits", "VITS (試験信号)"),
       b("vbi.vitc", "VITC (タイムコード)"),
-      b("vbi.teletext", "文字多重 (PAL WST / NTSC NABTS)"),
+      b("vbi.teletext", "文字多重 (PAL WST / NTSC NABTS・JTES)"),
+      {
+        kind: "select", path: "vbi.teletext_system", label: "NTSC 文字多重の方式",
+        options: [
+          { value: "nabts", label: "NABTS (北米)" },
+          { value: "jtes", label: "JTES (日本の文字放送)" },
+        ],
+      },
       r("vbi.teletext_lines", "文字多重のライン数", 1, 16, 1, "line"),
       b("vbi.wss", "WSS / CGMS-A (画面サイズ識別)"),
     ],
@@ -1010,6 +1018,7 @@ export const help: Record<string, string> = {
   "vbi.vits": "白バー・2T パルス・変調パルス・変調階段波とマルチバースト (NTSC ライン 17/18、PAL 17/18)。",
   "vbi.vitc": "SMPTE 12M の垂直間隔タイムコード (NTSC ライン 14/16、PAL 19/21)。90 ビットの白黒の縞。",
   "vbi.teletext": "PAL は WST テレテキスト (6.9 Mbit/s)、NTSC は NABTS。VHS の輝度帯域では潰れて灰色の帯になる。",
+  "vbi.teletext_system": "NTSC の文字多重の方式。JTES は日本の文字放送 (ITU-R System D) で、14〜16・21 H / 277〜279・284 H のうち字幕・VITC が使っていないラインに、(272,190) 符号付きの 296 ビットのデータラインを送る。PAL は常に WST。",
   "vbi.teletext_lines": "文字多重に使うライン数 (フィールドあたり)。",
   "vbi.wss": "PAL はライン 23 前半の WSS、NTSC はライン 20 の CGMS-A (IEC 61880)。",
   "decoder.v_hold_pct": "垂直発振器の自走周波数のずれ。少し負 (自走が遅い) なら垂直同期で引き込まれる。正や大きく負にすると同期が取れず、画面が上下に流れて帰線区間の黒帯が見える。",

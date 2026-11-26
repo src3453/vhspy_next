@@ -8,7 +8,8 @@
 //!   (同期ビット 1,0 + 8 ビット) × 9 群 = 90 ビット。最後の群は CRC (x⁸ + 1)
 //! - VITS (挿入試験信号): 白バー・2T パルス・変調パルス・変調階段波 (NTSC 17/280、PAL 17/330) と
 //!   マルチバースト (NTSC 18/281、PAL 18/331)
-//! - 文字多重: PAL は WST テレテキスト (6.9375 Mbit/s、444 fH)、NTSC は NABTS (5.7272 Mbit/s、364 fH)
+//! - 文字多重: PAL は WST テレテキスト (6.9375 Mbit/s、444 fH)、NTSC は NABTS か JTES (どちらも 5.7272 Mbit/s、364 fH)。
+//!   JTES の物理層・データラインは `jtes` クレート
 //! - 識別信号: PAL は WSS (ライン 23 前半、5 MHz の 137 エレメント、バイフェーズ)、
 //!   NTSC は IEC 61880 / CGMS-A (ライン 20/283、fsc/8 の 20 ビット + CRC)
 //!
@@ -16,7 +17,7 @@
 //! ビットの位相を合わせて 2 バイトを取り出す。字幕の組み立てと表示は [`crate::caption`]。
 
 use crate::caption;
-use crate::params::VbiParams;
+use crate::params::{TeletextSystem, VbiParams};
 use crate::raster::LineInfo;
 use crate::timing::{SIN4, Standard, TvStandard};
 
@@ -124,10 +125,22 @@ pub fn service(s: &Standard, n: usize, p: &VbiParams) -> Option<VbiService> {
         return fixed;
     }
     // 文字多重は空いているラインに先頭から割り当てる
-    let ranges: [std::ops::RangeInclusive<usize>; 2] = if ntsc { [10..=20, 273..=283] } else { [7..=22, 320..=335] };
-    let range = ranges.iter().find(|r| r.contains(&n))?;
+    if ntsc && p.teletext_system == TeletextSystem::Jtes {
+        // 省令第77号で使えるライン。第 1 フィールドの n H を使うときは第 2 フィールドの (n + 263) H も使うので、
+        // 両方が空いている対だけを割り当てる
+        let i = JTES_LINES.iter().find_map(|f| f.iter().position(|&m| m == n))?;
+        let free = |k: usize| JTES_LINES.iter().all(|f| service_fixed_free(s, f[k], p));
+        let used = (0..i).filter(|&k| free(k)).count();
+        return (free(i) && used < p.teletext_lines as usize).then_some(Teletext);
+    }
+    let candidates: [&[usize]; 2] = if ntsc {
+        [&NABTS_LINES[0], &NABTS_LINES[1]]
+    } else {
+        [&WST_LINES[0], &WST_LINES[1]]
+    };
+    let range = candidates.iter().find(|r| r.contains(&n))?;
     let mut used = 0;
-    for m in range.clone() {
+    for &m in range.iter() {
         if service_fixed_free(s, m, p) {
             if m == n {
                 return (used < p.teletext_lines as usize).then_some(Teletext);
@@ -137,6 +150,20 @@ pub fn service(s: &Standard, n: usize, p: &VbiParams) -> Option<VbiService> {
     }
     None
 }
+
+const fn range_lines<const N: usize>(first: usize) -> [usize; N] {
+    let mut a = [0; N];
+    let mut i = 0;
+    while i < N {
+        a[i] = first + i;
+        i += 1;
+    }
+    a
+}
+const NABTS_LINES: [[usize; 11]; 2] = [range_lines(10), range_lines(273)];
+const WST_LINES: [[usize; 16]; 2] = [range_lines(7), range_lines(320)];
+/// JTES の重畳ライン (第 1 フィールド, 第 2 フィールド)。同じ添字どうしが n H と (n + 263) H の対
+pub const JTES_LINES: [[usize; 4]; 2] = [[14, 15, 16, 21], [277, 278, 279, 284]];
 
 fn service_fixed_free(s: &Standard, n: usize, p: &VbiParams) -> bool {
     let q = VbiParams { teletext: false, ..p.clone() };
@@ -396,6 +423,9 @@ fn render_teletext(s: &Standard, info: &LineInfo, p: &VbiParams, y: &mut [f32]) 
         let bits = bytes_lsb(&bytes);
         let period = s.line_samples as f32 / 444.0;
         nrz(y, &bits, us(s, 10.3), period, period, 462.0 / 7.0);
+    } else if p.teletext_system == TeletextSystem::Jtes {
+        let packet = jtes_packet(s, info);
+        jtes::wave::render(y, &packet, &jtes_format(s));
     } else {
         // NABTS: ランイン、フレーミングコード 0xE7、33 バイトのパケット (内容は擬似乱数)
         let mut bytes = vec![0x55, 0x55, 0xE7];
@@ -405,6 +435,27 @@ fn render_teletext(s: &Standard, info: &LineInfo, p: &VbiParams, y: &mut [f32]) 
         let period = s.line_samples as f32 / 364.0;
         nrz(y, &bits, us(s, 10.5), period, period, 70.0);
     }
+}
+
+/// JTES のライン形式 (ペデスタル = 0 IRE、白 = 100 IRE。日本の NTSC はセットアップなし)
+pub fn jtes_format(s: &Standard) -> jtes::LineFormat {
+    jtes::LineFormat::for_line(s.line_samples as f32, 100.0)
+}
+
+/// このラインで送る JTES のパケット。
+/// TODO: データグループ・番組データの層ができるまでは、送出第1モードの空パケット (全 NUL) を送る。
+/// 連続性指標はラインごとに、フィールドが進むたびに 1 ずつ巡回させる
+fn jtes_packet(s: &Standard, info: &LineInfo) -> jtes::Packet {
+    let second_field = info.number > s.frame_total_lines / 2 + 1;
+    let field = info.frame * 2 + second_field as u64;
+    let mut p = jtes::Packet::empty(jtes::Service::Mode1, (field % 16) as u8);
+    p.transmission_start = field == 0;
+    p
+}
+
+/// AFC 後の輝度ライン (IRE) から JTES のパケットを取り出して誤り訂正する。(パケット, 訂正したビット数)
+pub fn slice_jtes(s: &Standard, line: &[f32]) -> Option<(jtes::Packet, usize)> {
+    jtes::wave::receive(line, &jtes_format(s))
 }
 
 // ---------------------------------------------------------------- 識別信号
@@ -480,6 +531,60 @@ mod tests {
                 }
             }
             assert!(tele > 0);
+        }
+    }
+
+    #[test]
+    fn jtes_uses_allowed_free_lines() {
+        let jt = |vitc: bool, cc: bool| VbiParams {
+            teletext: true,
+            teletext_system: TeletextSystem::Jtes,
+            teletext_lines: 8,
+            vitc,
+            closed_caption: cc,
+            ..VbiParams::default()
+        };
+        let lines = |p: &VbiParams| -> Vec<usize> {
+            (1..=NTSC.frame_total_lines).filter(|&n| service(&NTSC, n, p) == Some(VbiService::Teletext)).collect()
+        };
+        assert_eq!(lines(&jt(false, false)), [14, 15, 16, 21, 277, 278, 279, 284]);
+        // 字幕・VITC があるラインは避ける
+        assert_eq!(lines(&jt(false, true)), [14, 15, 16, 277, 278, 279]);
+        assert_eq!(lines(&jt(true, true)), [15, 278]);
+        // 対は n と n + 263
+        for k in 0..JTES_LINES[0].len() {
+            assert_eq!(JTES_LINES[1][k], JTES_LINES[0][k] + 263);
+        }
+        // ライン数の上限は対の数で数える
+        assert_eq!(lines(&VbiParams { teletext_lines: 2, ..jt(false, false) }), [14, 15, 277, 278]);
+        // PAL は WST のまま
+        assert!(service(&PAL, 7, &jt(false, false)) == Some(VbiService::Teletext));
+    }
+
+    #[test]
+    fn jtes_line_slices_back_through_transmit_filter() {
+        let p = VbiParams {
+            teletext: true,
+            teletext_system: TeletextSystem::Jtes,
+            closed_caption: false,
+            vits: false,
+            ..VbiParams::default()
+        };
+        for s in [&NTSC, &NTSC_228] {
+            for (frame, n) in [(0u64, 14usize), (3, 21), (3, 284)] {
+                let sl = frame * s.frame_total_lines as u64 + (n - 1) as u64;
+                let info = line_info(s, sl);
+                assert_eq!(info.number, n);
+                let mut y = vec![0f32; s.line_samples];
+                let mut c = vec![0f32; s.line_samples];
+                assert!(render_line(s, &info, &p, 0, &mut y, &mut c));
+                // 送出側の輝度帯域 (4.2 MHz の 4 次バターワース) を通す
+                let mut lp = crate::filter::Cascade::butter_lowpass_at(4, 4.2e6, s.fs);
+                lp.process_slice(&mut y);
+                let (packet, corrected) = slice_jtes(s, &y).unwrap_or_else(|| panic!("{:?} line {n}", s.kind));
+                assert_eq!(packet, jtes_packet(s, &info));
+                assert!(corrected <= 2, "{corrected}");
+            }
         }
     }
 

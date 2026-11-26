@@ -9,6 +9,7 @@ license.workspace = true
 rayon.workspace = true
 serde.workspace = true
 fontdue = "0.9"
+jtes = { path = "../jtes" }
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "hdr", "exr"] }

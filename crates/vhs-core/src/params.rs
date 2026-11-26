@@ -100,8 +100,10 @@ pub struct VbiParams {
     pub vitc: bool,
     /// VITS (挿入試験信号: 白バー・2T パルス・変調階段波・マルチバースト)
     pub vits: bool,
-    /// 文字多重 (PAL: WST テレテキスト、NTSC: NABTS)
+    /// 文字多重 (PAL: WST テレテキスト、NTSC: [`TeletextSystem`])
     pub teletext: bool,
+    /// NTSC の文字多重の方式 (PAL は常に WST)
+    pub teletext_system: TeletextSystem,
     /// 文字多重に使うライン数 (フィールドあたり)
     pub teletext_lines: u32,
     /// 画面サイズ・複製制御の識別信号 (PAL: WSS ライン 23、NTSC: IEC 61880 ライン 20)
@@ -119,10 +121,22 @@ impl Default for VbiParams {
             vitc: false,
             vits: true,
             teletext: false,
+            teletext_system: TeletextSystem::Nabts,
             teletext_lines: 8,
             wss: false,
         }
     }
+}
+
+/// NTSC の文字多重の方式
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeletextSystem {
+    /// NABTS (北米、10〜20 H / 273〜283 H の空きライン。内容は擬似乱数)
+    #[default]
+    Nabts,
+    /// 日本の文字多重放送 (JTES / BT.653 System D)。14〜16・21 H / 277〜279・284 H のうち空いているライン
+    Jtes,
 }
 
 /// 入力映像の画質調整。昔のビデオカメラの甘いレンズ・強い輪郭強調・色の癖などを作る。

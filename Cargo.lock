@@ -2495,6 +2495,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "jtes"
+version = "0.1.0"
+
+[[package]]
 name = "keyboard-types"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5483,6 +5487,7 @@ version = "0.1.0"
 dependencies = [
  "fontdue",
  "image",
+ "jtes",
  "rayon",
  "serde",
  "serde_json",

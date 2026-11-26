@@ -276,6 +276,7 @@ export const controlLabels: Record<string, string> = {
   "vbi.vits": "VITS",
   "vbi.vitc": "VITC",
   "vbi.teletext": "ﾓｼﾞ ﾀｼﾞｭｳ",
+  "vbi.teletext_system": "ﾓｼﾞ ﾀｼﾞｭｳ ﾎｳｼｷ",
   "vbi.teletext_lines": "ﾓｼﾞ ﾀｼﾞｭｳ ﾗｲﾝ",
   "vbi.wss": "WSS/CGMS",
   "signal.vertical_sync.jitter": "V SYNC ｼﾞｯﾀ",

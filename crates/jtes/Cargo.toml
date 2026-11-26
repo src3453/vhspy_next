@@ -1,0 +1,8 @@
+[package]
+name = "jtes"
+description = "Japanese analog teletext (JTES / ITU-R BT.653 System D) data line, (272,190) code and waveform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
