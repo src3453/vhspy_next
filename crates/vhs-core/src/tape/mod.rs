@@ -43,12 +43,18 @@ pub struct TapeSim {
     switch_wander: f32,
     /// 垂直揺れの状態 [ライン]
     v_state: f32,
+    /// 次のヘッドの信号の遅れ [ライン] (ヘッド切替から先、次のフィールドの垂直同期を含む部分に掛ける)
+    v_next: Option<usize>,
     /// 進行中のしわ: (残りフィールド数, 中心ライン, 1 フィールドあたりの移動量, 帯の高さ)
     crease: Option<(f32, f32, f32, f32)>,
     /// ヘッド目詰まりの残りフィールド数
     clog_left: f32,
     /// ラインごとのドロップアウト区間 [開始, 終了) (Fm モデルで RF の欠落として使う)
     drops: Vec<Vec<(usize, usize)>>,
+    /// 直前のフィールドの再生信号 (垂直揺れでストリームの前のラインが入ってくるとき使う) と、その偶奇
+    prev_y: Vec<f32>,
+    prev_c: Vec<f32>,
+    prev_parity: Option<u8>,
 }
 
 /// 色の低域変換記録 → 再生 (複素包絡線で等価的に扱う)
@@ -131,18 +137,22 @@ impl Default for TapeSim {
 
 impl TapeSim {
     pub fn new(s: &Standard) -> Self {
-        let n = s.field_lines * s.line_samples;
+        let n = s.raster_lines * s.line_samples;
         Self {
             y_buf: vec![0.0; n],
             c_buf: vec![0.0; n],
-            rf_level: vec![1.0; s.field_lines],
-            offsets: vec![0.0; s.field_lines],
+            rf_level: vec![1.0; s.raster_lines],
+            offsets: vec![0.0; s.raster_lines],
             jitter_state: 0.0,
             switch_wander: 0.0,
             v_state: 0.0,
+            v_next: None,
             crease: None,
             clog_left: 0.0,
-            drops: vec![Vec::new(); s.field_lines],
+            drops: vec![Vec::new(); s.raster_lines],
+            prev_y: vec![0.0; n],
+            prev_c: vec![0.0; n],
+            prev_parity: None,
         }
     }
 }
@@ -170,7 +180,7 @@ impl TapeSim {
     fn compute_rf_level(&mut self, field: &Field, tp: &TapeParams, tr: &TransportParams, seed: u64) {
         let te = tr.tracking_error.clamp(0.0, 1.0);
         let band_h = 24.0;
-        let period = field.std.field_lines as f32 + 2.0 * band_h;
+        let period = field.std.raster_lines as f32 + 2.0 * band_h;
         let center = (field.index as f32 * tr.tracking_speed).rem_euclid(period) - band_h;
         for (l, rf) in self.rf_level.iter_mut().enumerate() {
             let d = (l as f32 - center) / band_h;
@@ -189,7 +199,7 @@ impl TapeSim {
 
         if self.crease.is_none() && rng.uniform() < per_field(tp.crease_rate) {
             let len = tp.crease_fields.max(1.0) * (0.5 + rng.uniform());
-            let center = rng.uniform() * s.field_lines as f32;
+            let center = rng.uniform() * s.raster_lines as f32;
             // しわはテープを斜めに横切るので、再生中は画面上をゆっくり上下に流れる
             let drift = (rng.uniform() - 0.5) * 3.0;
             let height = 4.0 + rng.uniform() * 14.0;
@@ -395,7 +405,7 @@ impl TapeSim {
     /// 補償しない場合は、FM 復調器が拾ったノイズ (白黒の砂嵐) がそのまま残る
     fn compensate_dropouts(&mut self, field: &Field, tp: &TapeParams) {
         let ls = field.std.line_samples;
-        for l in 0..field.std.field_lines {
+        for l in 0..field.std.raster_lines {
             for &(start, end) in &self.drops[l] {
                 for n in start..end {
                     let i = l * ls + n;
@@ -413,7 +423,7 @@ impl TapeSim {
             return;
         }
         let ls = field.std.line_samples;
-        for l in 0..field.std.field_lines {
+        for l in 0..field.std.raster_lines {
             let mut rng = Rng::derive(seed, field.index, l as u64, STREAM_DROPOUT);
             let rf = self.rf_level[l];
             let prob = (tp.dropout_rate * (1.0 + 30.0 * (1.0 - rf))).min(1.0);
@@ -440,24 +450,31 @@ impl TapeSim {
     fn transport(&mut self, field: &mut Field, tr: &TransportParams, seed: u64) {
         let mut rng = Rng::derive(seed, field.index, 0, STREAM_TRANSPORT);
         let s = field.std;
-        let (fl, ls, lv) = (s.field_lines, s.line_samples, s.ire);
+        let (rl, ls, lv) = (s.raster_lines, s.line_samples, s.ire);
         let rho = tr.jitter_correlation.clamp(0.0, 0.999);
         let innov = tr.jitter_samples * (1.0 - rho * rho).sqrt();
-        // ヘッド切替位置はフィールドごとに少しふらつく
+        // ヘッド切替は次のフィールドの垂直同期の少し前 (有効映像の下端) で起き、そこから先は次のヘッドの信号になる。
+        // 切替位置はフィールドごとに少しふらつく
         self.switch_wander = 0.8 * self.switch_wander + rng.normal() * 0.6;
-        let hs_lines = tr.head_switch_lines.min(fl) as f32 + self.switch_wander.max(-(tr.head_switch_lines as f32));
-        let hs_start = (fl as f32 - hs_lines.max(0.0)).round() as usize;
-        // 垂直揺れ: フィールド単位でライン全体が上下にずれる (整数ライン)
+        let hs_lines = (tr.head_switch_lines as f32 + self.switch_wander.max(-(tr.head_switch_lines as f32))).max(0.0);
+        let active_end = (field.active_index(0) + s.field_lines) as f32;
+        let hs_start = ((active_end - hs_lines).round().max(0.0) as usize).min(rl);
+        // 垂直揺れ: フィールド単位で同期ごと信号全体が遅れる (整数ライン)。受像機は垂直同期に追従するので
+        // 画面全体が上下に揺れる。進む側には動かせない (もう出力した前のフィールドに垂直同期が入ってしまう) ので
+        // 遅れだけにし、有効映像がバッファに収まる範囲に抑える
+        // 遅れが変わるのはヘッド切替のところ (次のヘッドの信号から)。ここで変えれば垂直同期のパルス列は切れない
         self.v_state = 0.7 * self.v_state + rng.normal() * tr.vertical_jitter * 0.714;
-        let v_shift = self.v_state.round() as isize;
+        let next = (self.v_state.abs().round() as usize).min(s.raster_slack(1 - field.parity));
+        let v_cur = self.v_next.replace(next).unwrap_or(next).min(s.raster_slack(field.parity)) as isize;
+        let v_next = next as isize;
 
-        for l in 0..fl {
+        for l in 0..rl {
             self.jitter_state = rho * self.jitter_state + innov * rng.normal();
             let t = (field.index as f32 / s.field_rate) + l as f32 * s.line_time();
             let mut off = self.jitter_state + tr.wow_samples * (2.0 * std::f32::consts::PI * tr.wow_hz * t).sin();
             off += tr.skew_samples * (-(l as f32) / 10.0).exp();
             if l >= hs_start {
-                let f = (l - hs_start + 1) as f32 / (fl - hs_start).max(1) as f32;
+                let f = ((l - hs_start + 1) as f32 / hs_lines.max(1.0)).min(1.5);
                 off += tr.head_switch_offset * f * f;
             }
             let rf = self.rf_level[l];
@@ -467,6 +484,8 @@ impl TapeSim {
 
         let offsets = &self.offsets;
         let (y_buf, c_buf) = (&self.y_buf, &self.c_buf);
+        // 前のフィールドの再生信号のうち、ストリームでこのフィールドの直前に来るライン
+        let prev = self.prev_parity.map(|pp| (s.stream_lines(pp), &self.prev_y, &self.prev_c));
         let hs_noise = tr.head_switch_noise;
         let index = field.index;
         let separate = field.separate;
@@ -476,30 +495,30 @@ impl TapeSim {
         let c_chunks: Vec<Option<&mut [f32]>> = if separate {
             c_out.chunks_mut(ls).map(Some).collect()
         } else {
-            (0..fl).map(|_| None).collect()
+            (0..rl).map(|_| None).collect()
         };
         field.data.par_chunks_mut(ls).zip(c_chunks.into_par_iter()).enumerate().for_each(|(l, (out, c_out))| {
             let mut comp_buf = [0f32; MAX_LINE_SAMPLES];
             let comp = &mut comp_buf[..ls];
-            let src = l as isize - v_shift;
-            let src_line = (0..fl as isize).contains(&src).then(|| src as usize * ls);
-            if let Some(base) = src_line {
-                for n in 0..ls {
-                    comp[n] = if separate { y_buf[base + n] } else { y_buf[base + n] + c_buf[base + n] };
+            let src = l as isize - if l >= hs_start { v_next } else { v_cur };
+            // (Y, C) のライン
+            let (ys, cs): (&[f32], &[f32]) = if src < 0 {
+                match prev {
+                    Some((pn, py, pc)) if pn as isize + src >= 0 => {
+                        let b = (pn as isize + src) as usize * ls;
+                        (&py[b..b + ls], &pc[b..b + ls])
+                    }
+                    _ => (&y_buf[..ls], &c_buf[..ls]),
                 }
             } else {
-                // 垂直帰線区間が見えている: 同期だけの黒いライン
-                for (n, v) in comp.iter_mut().enumerate() {
-                    *v = if n < s.sync_end {
-                        lv.sync
-                    } else if n >= s.active_start {
-                        lv.black
-                    } else {
-                        lv.blank
-                    };
-                }
+                // ストリームの先 (次のフィールド) はまだないので最後のラインを繰り返す
+                let b = (src as usize).min(rl - 1) * ls;
+                (&y_buf[b..b + ls], &c_buf[b..b + ls])
+            };
+            for n in 0..ls {
+                comp[n] = if separate { ys[n] } else { ys[n] + cs[n] };
             }
-            if l == hs_start && hs_noise > 0.0 && hs_start < fl {
+            if l == hs_start && hs_noise > 0.0 && hs_start < rl {
                 // ヘッド切替の瞬間: ライン途中から乱れる
                 let mut rng = Rng::derive(seed, index, l as u64, STREAM_TRANSPORT + 1);
                 let from = (rng.uniform() * ls as f32 * 0.6) as usize;
@@ -509,11 +528,12 @@ impl TapeSim {
             }
             fractional_shift(comp, out, offsets[l], lv.blank);
             if let Some(c_out) = c_out {
-                match src_line {
-                    Some(base) => fractional_shift(&c_buf[base..base + ls], c_out, offsets[l], 0.0),
-                    None => c_out.fill(0.0),
-                }
+                fractional_shift(cs, c_out, offsets[l], 0.0);
             }
         });
+        // 次のフィールドのために今の再生信号を取っておく (作業領域と入れ替えるだけ)
+        std::mem::swap(&mut self.y_buf, &mut self.prev_y);
+        std::mem::swap(&mut self.c_buf, &mut self.prev_c);
+        self.prev_parity = Some(field.parity);
     }
 }

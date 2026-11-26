@@ -11,6 +11,7 @@
 pub mod adjust;
 pub mod audio;
 pub mod camera;
+pub mod caption;
 pub mod capture;
 pub mod decoder;
 pub mod deinterlace;
@@ -23,11 +24,13 @@ pub mod params;
 pub mod pattern;
 pub mod pipeline;
 mod nr;
+pub mod raster;
 pub mod rf;
 pub mod rng;
 pub mod tape;
 pub mod tbc;
 pub mod timing;
+pub mod vbi;
 
 pub use frame::{LinearFrame, RgbFrame, RgbaFrame, VideoFrame};
 pub use params::Params;
@@ -504,7 +507,8 @@ mod tests {
             pl.process_field_linear(&hdr);
         }
         let s = pl.standard();
-        let line = pl.composite().line(s.field_lines / 2);
+        let c = pl.composite();
+        let line = c.line(c.active_index(s.field_lines / 2));
         let mid = (s.active_start + s.active_end()) / 2;
         let peak = line[mid - 50..mid + 50].iter().sum::<f32>() / 100.0;
         // 7.5 + 92.5 × 1.08^0.45 ≒ 103.3 IRE
@@ -521,5 +525,95 @@ mod tests {
     fn serde_json_like(p: &Params) -> String {
         // dev-dependency の serde_json で確認
         serde_json::to_string(p).unwrap()
+    }
+    /// 画面の中ほどに帰線区間の黒帯 (行全体がほぼ黒) が見えたフィールドがあるか
+    fn black_band_seen(p: Params, fields: usize) -> bool {
+        let s = p.standard.spec();
+        let input = flat_in(s, [180, 180, 180]);
+        let mut pl = Pipeline::new(p);
+        let (w, h) = pl.output_size();
+        let mut seen = false;
+        for f in 0..fields {
+            pl.process_field(&input);
+            if f < 4 {
+                continue;
+            }
+            let out = pl.output();
+            for row in h / 8..h * 7 / 8 {
+                let sum: u32 = (0..w).step_by(8).map(|x| out.data[(row * w + x) * 4] as u32).sum();
+                if sum / (w as u32 / 8) < 30 {
+                    seen = true;
+                }
+            }
+        }
+        seen
+    }
+
+    fn clean_ntsc() -> Params {
+        let mut p = Params::default();
+        p.tape.enabled = false;
+        p
+    }
+
+    #[test]
+    fn locked_picture_does_not_roll() {
+        assert!(!black_band_seen(clean_ntsc(), 40));
+        let mut p = pal_clean();
+        p.tape.enabled = false;
+        assert!(!black_band_seen(p, 40));
+    }
+
+    /// 垂直ホールドを速い側にずらすと同期で引き込めず、画面が流れて帰線区間が見える
+    #[test]
+    fn vertical_hold_off_rolls() {
+        let mut p = clean_ntsc();
+        p.decoder.v_hold_pct = 10.0;
+        assert!(black_band_seen(p, 40));
+    }
+
+    /// 垂直同期 (幅広パルス) が弱いと積分回路がトリガされず、自走して流れる
+    #[test]
+    fn weak_vertical_sync_rolls() {
+        let mut p = clean_ntsc();
+        p.signal.vertical_sync.attenuation_pct = 80.0;
+        assert!(black_band_seen(p, 40));
+    }
+
+    /// 画面を下げると、帰線区間の VITS (白バー) が画面の上に見えてくる
+    #[test]
+    fn vbi_shows_when_picture_is_lowered() {
+        let bright_top_rows = |vpos: f32| {
+            let mut p = clean_ntsc();
+            p.decoder.vertical_position = vpos;
+            let input = flat_in(&timing::NTSC, [0, 0, 0]);
+            let mut pl = Pipeline::new(p);
+            for _ in 0..4 {
+                pl.process_field(&input);
+            }
+            // VITS の白バーは同期から 12〜30 µs (有効映像の左寄り)
+            (0..16).filter(|&row| pixel(&pl, row, 150)[0] > 180).count()
+        };
+        assert_eq!(bright_top_rows(0.0), 0);
+        assert!(bright_top_rows(-8.0) >= 2);
+    }
+
+    /// 受像機の字幕デコーダがライン 21 から字幕を組み立てる
+    #[test]
+    fn caption_decoder_reads_line21() {
+        let s = &timing::NTSC;
+        let mut p = Params::default();
+        p.decoder.caption_display = true;
+        let (w, h) = s.image_size();
+        let video = VideoFrame::new(w, h);
+        let mut field = frame::Field::new(s);
+        let mut dec = decoder::Decoder::new(s);
+        let mut out = RgbaFrame::new(w, h);
+        for i in 0..160 {
+            field.set_index(i);
+            encoder::encode_field_full(&video, &mut field, &p.encoder, &p.signal, &p.vbi, 1);
+            dec.decode_field(&field, &p.decoder, false, &mut out);
+        }
+        let rows = dec.captions().rows();
+        assert!(rows.iter().any(|r| r.contains("VHS NEXT CLOSED CAPTION TEST")), "{rows:?}");
     }
 }

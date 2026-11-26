@@ -68,6 +68,49 @@ pub struct Shared {
     /// デッキのメニュー表示 (イマーシブモードの OSD)。再生出力の信号に重畳する
     menu: Mutex<Option<String>>,
     menu_version: AtomicU64,
+    /// オシロスコープが開いている (このときだけコンポジット信号を写す)
+    pub scope_active: AtomicBool,
+    /// 最新フィールドのコンポジット信号 (オシロスコープ用、[`composite_bytes`] の形式)
+    pub composite: Mutex<FrameSlot>,
+}
+
+/// コンポジット信号 (帰線区間込みの全ラスタ) をオシロスコープへ渡す形にする。リトルエンディアン:
+/// ```text
+///  0 id: u64            8 standard: u32 (0 = NTSC, 1 = PAL)   12 parity: u32
+/// 16 frame: u64        24 raster_lines: u32   28 line_samples: u32
+/// 32 first_line: u32 (バッファ先頭のライン番号)   36 frame_total_lines: u32
+/// 40 separate: u32 (S 映像なら 1)   44 fs: f32 [Hz]
+/// 48 sync_end  52 burst_start  56 burst_end  60 active_start  64 active_width: u32
+/// 68 以降: f32 × raster_lines × line_samples (コンポジット、S 映像なら Y)、S 映像なら続けて C
+/// ```
+pub fn composite_bytes(id: u64, field: &vhs_core::frame::Field, out: &mut Vec<u8>) {
+    let s = field.std;
+    out.clear();
+    out.extend_from_slice(&id.to_le_bytes());
+    let u = |out: &mut Vec<u8>, v: u32| out.extend_from_slice(&v.to_le_bytes());
+    u(out, s.is_pal() as u32);
+    u(out, field.parity as u32);
+    out.extend_from_slice(&field.frame.to_le_bytes());
+    u(out, s.raster_lines as u32);
+    u(out, s.line_samples as u32);
+    u(out, s.raster_first_line[field.parity as usize & 1] as u32);
+    u(out, s.frame_total_lines as u32);
+    u(out, field.separate as u32);
+    out.extend_from_slice(&s.fs.to_le_bytes());
+    for v in [s.sync_end, s.burst_start, s.burst_end, s.active_start, s.active_width] {
+        u(out, v as u32);
+    }
+    debug_assert_eq!(out.len(), 68);
+    let push = |out: &mut Vec<u8>, data: &[f32]| {
+        out.reserve(data.len() * 4);
+        for v in data {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    };
+    push(out, &field.data);
+    if field.separate {
+        push(out, &field.chroma);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -128,6 +171,8 @@ impl Engine {
             crt_reload: AtomicBool::new(false),
             menu: Mutex::new(None),
             menu_version: AtomicU64::new(0),
+            scope_active: AtomicBool::new(false),
+            composite: Mutex::new(FrameSlot { id: 0, bytes: Vec::new() }),
         });
         let (tx, rx) = channel();
         let sh = shared.clone();
@@ -455,6 +500,14 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
             }
         }
 
+        // オシロスコープ: 開いているときだけ最新フィールドの信号を写す
+        if shared.scope_active.load(Ordering::Relaxed) {
+            let mut slot = shared.composite.lock().unwrap();
+            slot.id = frame_id;
+            let id = slot.id;
+            composite_bytes(id, pipeline.composite(), &mut slot.bytes);
+        }
+
         if crt.info_version != crt_seen {
             crt_seen = crt.info_version;
             *shared.crt_info.lock().unwrap() = crt.info().clone();
@@ -564,6 +617,23 @@ mod tests {
         p.crt.enabled = false;
         engine.set_params(p);
         assert_eq!(wait_size(&engine, (754, 480)), (754, 480));
+    }
+
+    /// オシロスコープ用のコンポジット信号: ヘッダ 68 バイト + 全ラスタの f32
+    #[test]
+    fn composite_bytes_layout() {
+        let s = &vhs_core::timing::NTSC;
+        let mut f = vhs_core::frame::Field::new(s);
+        f.set_index(3);
+        f.data[s.line_samples + 5] = 42.5;
+        let mut out = Vec::new();
+        composite_bytes(7, &f, &mut out);
+        assert_eq!(out.len(), 68 + s.raster_lines * s.line_samples * 4);
+        let u32_at = |o: usize| u32::from_le_bytes(out[o..o + 4].try_into().unwrap());
+        assert_eq!(u64::from_le_bytes(out[0..8].try_into().unwrap()), 7);
+        assert_eq!((u32_at(12), u32_at(24), u32_at(28), u32_at(32)), (1, 263, 910, 272));
+        let o = 68 + (s.line_samples + 5) * 4;
+        assert_eq!(f32::from_le_bytes(out[o..o + 4].try_into().unwrap()), 42.5);
     }
 
     /// GUI から送られる JSON (snake_case) で PAL を受け取れる

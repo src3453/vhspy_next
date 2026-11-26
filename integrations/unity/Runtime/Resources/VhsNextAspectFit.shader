@@ -5,6 +5,7 @@ Shader "Hidden/VhsNext/AspectFit"
         _MainTex ("Source", 2D) = "black" {}
         _VhsTargetAspect ("Target Aspect", Float) = 1.3333333
         _VhsOutputAspect ("Output Aspect", Float) = 1.7777778
+        _VhsSourceAspect ("Source Aspect (0 = texture size)", Float) = 0
     }
 
     SubShader
@@ -24,6 +25,9 @@ Shader "Hidden/VhsNext/AspectFit"
             float4 _MainTex_TexelSize;
             float _VhsTargetAspect;
             float _VhsOutputAspect;
+            // The GPU path decodes into the 754×480 (PAL 922×576) raster, which stands for the
+            // whole camera frame; it passes the camera aspect here instead of the texture size.
+            float _VhsSourceAspect;
 
             float4 frag(v2f_img input) : SV_Target
             {
@@ -35,7 +39,9 @@ Shader "Hidden/VhsNext/AspectFit"
 
                 float targetAspect = max(_VhsTargetAspect, 0.01);
                 float outputAspect = max(_VhsOutputAspect, 0.01);
-                float sourceAspect = _MainTex_TexelSize.z / max(abs(_MainTex_TexelSize.w), 1.0);
+                float sourceAspect = _VhsSourceAspect > 0.0
+                    ? _VhsSourceAspect
+                    : _MainTex_TexelSize.z / max(abs(_MainTex_TexelSize.w), 1.0);
 
                 float2 apertureSize = float2(
                     min(1.0, targetAspect / outputAspect),

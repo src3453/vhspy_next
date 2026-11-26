@@ -46,23 +46,41 @@ impl Default for FieldRate {
 /// 真空管プリアンプの動作点 (白レベル比)
 const AMP_BIAS: f32 = 0.35;
 
-/// 撮像管 1 本ぶんの個体差
+/// 撮像管 1 本ぶんの個体差 (GPU 版のホストが同じ値を使えるよう公開している)
 #[derive(Clone, Copy, Debug)]
-struct Tube {
-    gamma: f32,
-    sens: f32,
-    cap_lag: f32,
-    photo_lag: f32,
-    dark: f32,
-    beam: f32,
-    burn: f32,
+pub struct Tube {
+    pub gamma: f32,
+    pub sens: f32,
+    pub cap_lag: f32,
+    pub photo_lag: f32,
+    pub dark: f32,
+    pub beam: f32,
+    pub burn: f32,
     /// オートブラックで取り切れない黒レベルのずれ
-    black: f32,
-    dx: f32,
-    dy: f32,
-    scale: f32,
-    shade_x: f32,
-    shade_y: f32,
+    pub black: f32,
+    pub dx: f32,
+    pub dy: f32,
+    pub scale: f32,
+    pub shade_x: f32,
+    pub shade_y: f32,
+}
+
+/// 3 本の撮像管の個体差と、感度・暗電流のマップ (w × h、各管 1 面)。
+/// `CameraSim` が内部で作るものと同じ値。GPU 版のホストがアップロードして使う
+pub struct TubeMaps {
+    pub tubes: [Tube; 3],
+    pub sens: [Vec<f32>; 3],
+    pub dark: [Vec<f32>; 3],
+}
+
+impl TubeMaps {
+    pub fn new(p: &CameraParams, seed: u64, w: usize, h: usize) -> Self {
+        let mut sim = CameraSim::default();
+        sim.allocate(w, h);
+        let tubes = Tube::generate(p, seed);
+        sim.build_maps(p, seed, &tubes);
+        Self { tubes, sens: sim.sens, dark: sim.dark }
+    }
 }
 
 impl Tube {

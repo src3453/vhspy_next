@@ -76,3 +76,12 @@ for the same color-space reason. Unity documents the [URP render-pass extension
 point](https://docs.unity3d.com/ja/6000.0/Manual/urp/renderer-features/write-a-scriptable-render-pass.html),
 [HDRP C# Custom Passes](https://docs.unity3d.com/Packages/com.unity.render-pipelines.high-definition@17.0/manual/Custom-Pass-Scripting.html),
 and [asynchronous GPU readback](https://docs.unity3d.com/cn/6000.0/ScriptReference/Rendering.AsyncGPUReadback.html).
+
+## GPU port (Slang, PoC)
+
+`crates/vhs-slang` ports the clean composite encode → decode path to Slang. It
+generates WGSL for wgpu and HLSL for Unity / Unreal from one source. Its tests
+compare the GPU output against `vhs-core` (0.5 LSB maximum difference). The
+Unity package can use these kernels through the **Gpu Composite** backend. The
+crate README lists what is ported, the performance status, and how to
+regenerate the shaders.

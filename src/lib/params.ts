@@ -68,6 +68,18 @@ export type Params = {
     color_burst: { jitter: number; attenuation_pct: number; noise_ire: number };
     chroma_subcarrier: { jitter: number; attenuation_pct: number; noise_ire: number };
   };
+  vbi: {
+    enabled: boolean;
+    closed_caption: boolean;
+    caption_text: string;
+    caption_mode: "pop_on" | "roll_up" | "paint_on";
+    caption_channel: number;
+    vitc: boolean;
+    vits: boolean;
+    teletext: boolean;
+    teletext_lines: number;
+    wss: boolean;
+  };
   tape: {
     enabled: boolean;
     format: TapeFormat;
@@ -167,6 +179,12 @@ export type Params = {
     brightness: number;
     saturation: number;
     hue_deg: number;
+    v_hold_pct: number;
+    v_sync_window: number;
+    v_integrator_us: number;
+    vertical_position: number;
+    caption_display: boolean;
+    caption_channel: number;
   };
   capture: {
     enabled: boolean;
@@ -584,9 +602,9 @@ export const groups: Group[] = [
   },
   {
     title: "信号劣化 (同期・色信号)",
-    note: "送出側の各信号要素に個別の揺れ・レベル減衰・雑音を加える。垂直同期のエミュレーションは未完成で、垂直帰線区間や同期パルス列は再現しない。垂直同期の減衰・雑音は簡易なロック外れモデルによる画像の上下ずれで表す。",
+    note: "送出側の各信号要素に個別の揺れ・レベル減衰・雑音を加える。信号は等化パルス・切り込み付き垂直同期・VBI を含む全ラスタで作り、垂直同期の減衰・雑音は幅広パルスそのものに掛かる。受像機の垂直同期分離が取り損ねると画面が流れる。",
     controls: [
-      r("signal.vertical_sync.jitter", "垂直同期ジッタ", 0, 5, 0.05, "field line"),
+      r("signal.vertical_sync.jitter", "垂直同期ジッタ", 0, 5, 0.05, "line"),
       r("signal.vertical_sync.attenuation_pct", "垂直同期レベル減衰", 0, 100, 1, "%"),
       r("signal.vertical_sync.noise_ire", "垂直同期雑音", 0, 40, 0.1, "IRE rms"),
       r("signal.horizontal_sync.jitter", "水平同期ジッタ", 0, 12, 0.1, "smp"),
@@ -598,6 +616,29 @@ export const groups: Group[] = [
       r("signal.chroma_subcarrier.jitter", "色副搬送波位相ジッタ", 0, 90, 0.5, "° rms"),
       r("signal.chroma_subcarrier.attenuation_pct", "色副搬送波レベル減衰", 0, 100, 1, "%"),
       r("signal.chroma_subcarrier.noise_ire", "色副搬送波雑音", 0, 20, 0.1, "IRE rms"),
+    ],
+  },
+  {
+    title: "VBI (帰線区間のデータ・試験信号)",
+    note: "画面外 (垂直帰線区間) に重畳する信号。受像機の垂直ホールドがずれて画面が流れたとき、画面位置を上げたとき、くし形フィルタやドロップアウト補償が隣のラインを使うときに見えてくる。テープにもそのまま記録される。",
+    controls: [
+      b("vbi.enabled", "VBI 信号を載せる"),
+      b("vbi.closed_caption", "字幕 (EIA-608、NTSC ライン 21 / 284)"),
+      { kind: "text", path: "vbi.caption_text", label: "字幕の文 (\\n で改行)", placeholder: "VHS NEXT CLOSED CAPTION TEST" },
+      {
+        kind: "select", path: "vbi.caption_mode", label: "字幕の送り方",
+        options: [
+          { value: "pop_on", label: "ポップオン (1 行ずつ表示)" },
+          { value: "roll_up", label: "ロールアップ (3 行で流す)" },
+          { value: "paint_on", label: "ペイントオン (届いた順に描く)" },
+        ],
+      },
+      r("vbi.caption_channel", "字幕の送出チャンネル (CC1〜CC4)", 1, 4, 1),
+      b("vbi.vits", "VITS (試験信号)"),
+      b("vbi.vitc", "VITC (タイムコード)"),
+      b("vbi.teletext", "文字多重 (PAL WST / NTSC NABTS)"),
+      r("vbi.teletext_lines", "文字多重のライン数", 1, 16, 1, "line"),
+      b("vbi.wss", "WSS / CGMS-A (画面サイズ識別)"),
     ],
   },
   {
@@ -634,6 +675,12 @@ export const groups: Group[] = [
       r("decoder.brightness", "明るさ", -0.5, 0.5, 0.01),
       r("decoder.saturation", "色の濃さ", 0, 3, 0.01),
       r("decoder.hue_deg", "色相", -180, 180, 1, "°"),
+      r("decoder.v_hold_pct", "垂直ホールド", -30, 30, 0.1, "%"),
+      r("decoder.v_sync_window", "垂直同期の引き込み範囲", 0.02, 0.9, 0.01),
+      r("decoder.v_integrator_us", "垂直同期分離の積分時定数", 2, 200, 1, "µs"),
+      r("decoder.vertical_position", "画面の上下位置", -30, 30, 0.5, "line"),
+      b("decoder.caption_display", "字幕デコーダ (ライン 21 / 284)"),
+      r("decoder.caption_channel", "字幕デコーダのチャンネル (CC1〜CC4)", 1, 4, 1),
     ],
   },
   {
@@ -890,9 +937,25 @@ export const help: Record<string, string> = {
   "encoder.i_bw_mhz": "I 信号 (橙〜青緑方向の色差) の帯域。NTSC 規格は 1.3 MHz。",
   "encoder.q_bw_mhz": "Q 信号 (紫〜黄緑方向の色差) の帯域。NTSC 規格は 0.6 MHz。",
   "encoder.chroma_gain": "送出時の色信号の振幅倍率。大きいとテープでの色飽和が起きやすい。",
-  "signal.vertical_sync.jitter": "フィールドごとの垂直位置の揺れ (rms)。1 field line は表示画像の 2 ライン分。",
-  "signal.vertical_sync.attenuation_pct": "垂直同期エミュレーションは簡易モデル。同期パルス列そのものはなく、振幅減衰でロックを失うと画像が上下にずれる。",
-  "signal.vertical_sync.noise_ire": "垂直同期エミュレーションは簡易モデル。同期パルス列そのものはなく、雑音でロックを失うと画像が上下にずれる。",
+  "signal.vertical_sync.jitter": "同期に対する映像のフィールドごとの上下の揺れ (rms)。1 ラインは表示画像の 2 行分。",
+  "signal.vertical_sync.attenuation_pct": "垂直同期 (幅広パルス) の振幅を下げる。受像機の積分回路がしきい値に届かなくなると垂直発振器が自走して画面が流れる。",
+  "signal.vertical_sync.noise_ire": "垂直同期 (幅広パルス) に乗る雑音。積分回路が取り損ねる・早くトリガすると画面が跳ねたり流れたりする。",
+  "vbi.enabled": "垂直帰線区間に字幕・試験信号などのデータを載せる。普段は画面外だが、画面が流れる・上下位置をずらすと見える。",
+  "vbi.closed_caption": "EIA-608 のクローズドキャプション。ライン 21 に 503 kHz のランインと 2 バイトのデータが載る (画面上端に白い点線として見える)。",
+  "vbi.caption_text": "字幕として送る文。行ごとに 1 つの字幕になる。*斜体* _下線_ {red} {yellow} などで属性を変えられる (EIA-608 の行中コード、1 桁の空白になる)。á é ñ ç ♪ ¿ ® なども送れる。",
+  "vbi.caption_mode": "ポップオンは画面外のメモリで組み立ててから一度に出す (映画)。ロールアップは下から 1 行ずつ押し上げる (生放送)。ペイントオンは届いた文字から順に描く。",
+  "vbi.caption_channel": "CC1/CC2 はライン 21 (第 1 フィールド)、CC3/CC4 はライン 284 (第 2 フィールド) で送る。デコーダのチャンネルと合わないと何も出ない。",
+  "vbi.vits": "白バー・2T パルス・変調パルス・変調階段波とマルチバースト (NTSC ライン 17/18、PAL 17/18)。",
+  "vbi.vitc": "SMPTE 12M の垂直間隔タイムコード (NTSC ライン 14/16、PAL 19/21)。90 ビットの白黒の縞。",
+  "vbi.teletext": "PAL は WST テレテキスト (6.9 Mbit/s)、NTSC は NABTS。VHS の輝度帯域では潰れて灰色の帯になる。",
+  "vbi.teletext_lines": "文字多重に使うライン数 (フィールドあたり)。",
+  "vbi.wss": "PAL はライン 23 前半の WSS、NTSC はライン 20 の CGMS-A (IEC 61880)。",
+  "decoder.v_hold_pct": "垂直発振器の自走周波数のずれ。少し負 (自走が遅い) なら垂直同期で引き込まれる。正や大きく負にすると同期が取れず、画面が上下に流れて帰線区間の黒帯が見える。",
+  "decoder.v_sync_window": "自走周期の終わりから、垂直同期を受け付ける範囲の割合。広いと引き込みやすいが、雑音で早めにトリガして画面が跳ねやすい。",
+  "decoder.v_integrator_us": "垂直同期分離の RC 積分の時定数。短いと水平同期・雑音でも誤トリガし、長いと弱い同期を取り損ねる。",
+  "decoder.vertical_position": "画面の上下位置。負にすると画面が下がり、上に帰線区間 (VITS・字幕のデータ) が見えてくる。",
+  "decoder.caption_display": "受像機の字幕デコーダ (EIA-608)。垂直同期から数えたライン 21 / 284 を読み、32 桁 × 15 行の字幕を画面に出す。パリティ誤りの文字は■、取れなかったバイトは抜ける。",
+  "decoder.caption_channel": "表示する字幕のチャンネル。CC1 が普通の字幕、CC3 は第 2 フィールドの字幕 (第 2 言語など)。",
   "signal.horizontal_sync.jitter": "ラインごとの水平同期後縁の揺れ (rms)。水平 AFC が追従しきれないと画像が左右に揺れる。",
   "signal.horizontal_sync.attenuation_pct": "水平同期パルスの振幅を下げる。弱すぎると水平 AFC が同期を見失う。",
   "signal.horizontal_sync.noise_ire": "水平同期パルスに加える雑音 (rms)。同期検出が不安定になり、水平位置が揺れる。",

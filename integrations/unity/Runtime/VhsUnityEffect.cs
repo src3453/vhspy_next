@@ -16,7 +16,46 @@ namespace VhsNext
     [RequireComponent(typeof(Camera))]
     public sealed class VhsUnityEffect : MonoBehaviour
     {
+        /// <summary>Where the simulation runs.</summary>
+        public enum ProcessingBackend
+        {
+            /// <summary>Full simulator in vhs_ffi.dll on a worker thread (AsyncGPUReadback, frames of latency).</summary>
+            NativeCpu,
+            /// <summary>Slang-generated compute shaders, same frame, clean composite path only (PoC).</summary>
+            GpuComposite
+        }
+
+        /// <summary>Where the simulation parameters come from.</summary>
+        public enum ParamsSource
+        {
+            /// <summary>The fields below (standard, seed, tube camera), editable in the Inspector.</summary>
+            Inspector,
+            /// <summary>A core Params JSON file (the same format as the desktop app's presets).</summary>
+            JsonAsset
+        }
+
+        public enum TvStandardOption
+        {
+            Ntsc,
+            Pal
+        }
+
+        [Serializable]
+        private sealed class InspectorParams
+        {
+            public string standard;
+            public ulong seed;
+            public VhsGpuCamera.Settings camera;
+        }
+
+        [SerializeField] private ProcessingBackend backend = ProcessingBackend.NativeCpu;
+        [SerializeField] private ParamsSource paramsSource = ParamsSource.Inspector;
         [SerializeField] private TextAsset paramsJson;
+        [SerializeField, Tooltip("TV standard (timing and colour encoding).")]
+        private TvStandardOption standard = TvStandardOption.Ntsc;
+        [SerializeField, Tooltip("Random seed: the same seed gives the same tube spread, blemishes and noise.")]
+        private ulong seed;
+        [SerializeField] private VhsGpuCamera.Settings tubeCamera = new VhsGpuCamera.Settings();
         [SerializeField] private uint frameRateNumerator = 60;
         [SerializeField] private uint frameRateDenominator = 1;
         [SerializeField] private bool premultipliedAlpha;
@@ -26,6 +65,7 @@ namespace VhsNext
 
         private static readonly int TargetAspectId = Shader.PropertyToID("_VhsTargetAspect");
         private static readonly int OutputAspectId = Shader.PropertyToID("_VhsOutputAspect");
+        private static readonly int SourceAspectId = Shader.PropertyToID("_VhsSourceAspect");
 
         private sealed class Frame
         {
@@ -37,6 +77,7 @@ namespace VhsNext
         private readonly ConcurrentDictionary<long, Frame> _readyFrames = new ConcurrentDictionary<long, Frame>();
         private readonly ConcurrentQueue<Frame> _outputFrames = new ConcurrentQueue<Frame>();
         private VhsNativeProcessor _processor;
+        private VhsGpuComposite _gpu;
         private Thread _worker;
         private RenderTexture _readbackTexture;
         private RenderTexture _presentationTexture;
@@ -51,8 +92,62 @@ namespace VhsNext
         private string _lastReportedError;
         private bool _readbackWarningLogged;
         private bool _textureErrorLogged;
+        private bool _settingsDirty;
+        private string _runningKey;
 
         public string Status { get; private set; }
+
+        public ProcessingBackend Backend => backend;
+
+        /// <summary>The core Params JSON the simulator is started with.</summary>
+        public string BuildParamsJson()
+        {
+            if (paramsSource == ParamsSource.JsonAsset)
+                return paramsJson != null ? paramsJson.text : "{}";
+            return JsonUtility.ToJson(new InspectorParams
+            {
+                standard = standard == TvStandardOption.Pal ? "pal" : "ntsc",
+                seed = seed,
+                camera = tubeCamera
+            }, true);
+        }
+
+        /// <summary>Settings whose change needs the simulator to be restarted (anything but the tube camera).</summary>
+        private string RestartKey()
+        {
+            return string.Join("|", backend, paramsSource, paramsJson != null ? paramsJson.GetHashCode() : 0, standard,
+                frameRateNumerator, frameRateDenominator, premultipliedAlpha, maxQueuedFrames);
+        }
+
+        private void OnValidate()
+        {
+            if (Application.isPlaying)
+                _settingsDirty = true;
+        }
+
+        /// <summary>
+        /// Applies Inspector edits made in Play mode. The GPU backend changes the tube camera in place (its lag
+        /// and burn-in carry on); anything else restarts the simulator.
+        /// </summary>
+        private void ApplySettings()
+        {
+            if (_gpu != null && RestartKey() == _runningKey && paramsSource == ParamsSource.Inspector)
+            {
+                try
+                {
+                    _gpu.ApplyCamera(tubeCamera, seed);
+                    Status = _gpu.Camera != null ? "Ready (GPU composite + tube camera)" : "Ready (GPU composite)";
+                }
+                catch (Exception error)
+                {
+                    Status = error.Message;
+                    Debug.LogError("VHS Next: " + error.Message, this);
+                }
+                return;
+            }
+            OnDisable();
+            OnEnable();
+        }
 
         private void OnEnable()
         {
@@ -72,8 +167,17 @@ namespace VhsNext
                     hideFlags = HideFlags.HideAndDontSave
                 };
 
+                _runningKey = RestartKey();
+                _settingsDirty = false;
+                if (backend == ProcessingBackend.GpuComposite)
+                {
+                    _gpu = new VhsGpuComposite(BuildParamsJson(), frameRateNumerator, frameRateDenominator);
+                    Status = _gpu.Camera != null ? "Ready (GPU composite + tube camera)" : "Ready (GPU composite)";
+                    return;
+                }
+
                 _processor = new VhsNativeProcessor(
-                    paramsJson != null ? paramsJson.text : "{}",
+                    BuildParamsJson(),
                     frameRateNumerator,
                     frameRateDenominator);
                 _closing = false;
@@ -93,6 +197,11 @@ namespace VhsNext
                     _processor.Dispose();
                     _processor = null;
                 }
+                if (_gpu != null)
+                {
+                    _gpu.Dispose();
+                    _gpu = null;
+                }
                 Status = error.Message;
                 Debug.LogError("VHS Next: " + error.Message, this);
             }
@@ -100,6 +209,12 @@ namespace VhsNext
 
         private void Update()
         {
+            if (_settingsDirty)
+            {
+                _settingsDirty = false;
+                ApplySettings();
+            }
+
             string workerError = Interlocked.Exchange(ref _workerError, null);
             if (!string.IsNullOrEmpty(workerError) && workerError != _lastReportedError)
             {
@@ -131,6 +246,11 @@ namespace VhsNext
                 _processor.Dispose();
                 _processor = null;
             }
+            if (_gpu != null)
+            {
+                _gpu.Dispose();
+                _gpu = null;
+            }
             ReleaseTextures();
             if (_aspectFitMaterial != null)
             {
@@ -161,6 +281,11 @@ namespace VhsNext
                     Debug.LogWarning("VHS Next currently supports 2D camera targets only; XR and texture-array targets are skipped.", this);
                     _readbackWarningLogged = true;
                 }
+                return;
+            }
+            if (_gpu != null)
+            {
+                RecordGpu(commandBuffer, cameraColorSource, cameraColorDestination);
                 return;
             }
             if (_processor == null || _closing)
@@ -225,6 +350,29 @@ namespace VhsNext
 
             Texture presentationSource = _outputTexture != null ? (Texture)_outputTexture : cameraColorSource;
             PresentAspectFit(commandBuffer, presentationSource, cameraColorDestination);
+        }
+
+        private void RecordGpu(CommandBuffer commandBuffer, Texture source, RenderTexture destination)
+        {
+            try
+            {
+                EnsurePresentationTexture(source.width, source.height);
+                _gpu.Record(commandBuffer, source);
+                // The decoded raster stands for the whole camera frame (as in the native path), so
+                // crop using the camera aspect rather than the raster's own width / height.
+                PresentAspectFit(commandBuffer, _gpu.Output, destination, (float)source.width / Mathf.Max(1, source.height));
+                Status = _gpu.Camera != null ? "Processing (GPU composite + tube camera)" : "Processing (GPU composite)";
+            }
+            catch (Exception error)
+            {
+                Status = error.Message;
+                if (!_textureErrorLogged)
+                {
+                    Debug.LogError("VHS Next: " + error.Message, this);
+                    _textureErrorLogged = true;
+                }
+                TryPresentPassthrough(commandBuffer, source, destination);
+            }
         }
 
         private void OnReadback(AsyncGPUReadbackRequest request, int width, int height, long sequence)
@@ -378,7 +526,7 @@ namespace VhsNext
                 throw new InvalidOperationException("Could not create the 4:3 presentation texture.");
         }
 
-        private void PresentAspectFit(CommandBuffer commandBuffer, Texture source, RenderTexture destination)
+        private void PresentAspectFit(CommandBuffer commandBuffer, Texture source, RenderTexture destination, float sourceAspect = 0f)
         {
             if (_aspectFitMaterial == null)
             {
@@ -392,6 +540,7 @@ namespace VhsNext
             float outputAspect = (float)destination.width / Mathf.Max(1, destination.height);
             _aspectFitMaterial.SetFloat(TargetAspectId, targetAspect);
             _aspectFitMaterial.SetFloat(OutputAspectId, outputAspect);
+            _aspectFitMaterial.SetFloat(SourceAspectId, sourceAspect);
 
             if (ReferenceEquals(source, destination))
             {

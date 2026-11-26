@@ -1,0 +1,15 @@
+[package]
+name = "vhs-slang"
+description = "Slang GPU port (PoC) of the composite encode/decode path, with a wgpu reference host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vhs-core = { path = "../vhs-core" }
+wgpu = "30"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json.workspace = true

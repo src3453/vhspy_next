@@ -9,7 +9,7 @@
 //!   文字自体はテープ処理を受けないが、後段の RF・復調処理を受け、同期に残るジッタで位置も揺れる。
 
 pub mod face;
-mod font;
+pub(crate) mod font;
 pub mod markup;
 
 use crate::decoder::{find_sync_edge, pal_ident};
@@ -272,6 +272,7 @@ impl Osd {
         let s0 = if pal {
             let mus: Vec<Option<f32>> = (0..s.field_lines)
                 .map(|l| {
+                    let l = field.active_index(l);
                     let line = field.line(l);
                     // S 映像ならバーストは C 側にある
                     Some(burst_phase(field.chroma_line(l).unwrap_or(line), sync_offset(line), s))
@@ -286,7 +287,7 @@ impl Osd {
             if row < y0 || row >= y1 {
                 continue;
             }
-            let (line, mut c_line) = field.lines_mut(l);
+            let (line, mut c_line) = field.lines_mut(field.active_index(l));
             let d = sync_offset(line);
             let sv = if !pal || l % 2 == 0 { s0 } else { -s0 };
             // バーストの位相 μ から副搬送波位相 φ へ (PAL は μ = φ - 45°·sV)

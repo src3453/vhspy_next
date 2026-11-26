@@ -1,50 +1,114 @@
 //! コンポジット (NTSC / PAL) → RGB の受像機モデル。
 //!
-//! - 水平 AFC: 同期の後縁を検出し、時定数付きで追従する (遅い時間軸変動は吸収、速い変動は残る)
+//! 入力はフィールドごとの全ラスタ (帰線区間込み) だが、受像機はそれを途切れのないライン列 (ストリーム) として受け、
+//! フィールドの区切りは自分で同期信号から見つける。
+//!
+//! - 水平 AFC: 同期の後縁を検出し、時定数付きで追従する (遅い時間軸変動は吸収、速い変動は残る)。
+//!   帰線区間の等化パルス (幅が半分) でも引っ張られるので、画面の上端がわずかに曲がる
+//! - 垂直同期分離: 同期分離した信号を RC 積分し、幅広パルス (垂直同期) が続いて積分値がしきい値を超えたら
+//!   垂直発振器をトリガする。発振器は自走周期 (垂直ホールド) を持ち、自走周期の終わり近くの窓の中でだけ
+//!   同期を受け付ける。同期が弱い・雑音が多い・ホールドがずれていると自走になり、画面が上下に流れて
+//!   帰線区間 (黒帯・VBI のデータ) が見えてくる。第 2 フィールドは半ライン遅れてトリガされるので、
+//!   インターレースの上下位置 (出力の偶数/奇数行) も信号から決まる
 //! - Y/C 分離: ノッチ (ドットクロール/クロスカラーが出る)、くし形 (NTSC 1H / PAL 2H)、
-//!   または 3 次元 (画面バッファとのフレームくし形。動く部分はラインくし形に切り替える動き適応型)
-//! - 色副搬送波 PLL: ラインごとのバースト位相に追従係数付きで同期する
+//!   または 3 次元 (フレームメモリとのフレームくし形。動く部分はラインくし形に切り替える動き適応型)。
+//!   くし形はストリームの直前のラインを使うので、有効映像の 1 行目には VBI のデータが漏れ込む
+//! - 色副搬送波 PLL: ラインごとのバースト位相に追従係数付きで同期する。バーストのない帰線区間は惰性で回る
 //! - NTSC は I/Q、PAL は U/V を同期検波。ACC とカラーキラー付き
 //! - PAL: スウィンギングバーストから PAL スイッチの向きを決め (アイデント)、
 //!   1H 遅延線で前のラインと色差を平均する (位相誤差 → 彩度低下)。遅延線なしならハノーバーバーが出る
+//! - 字幕デコーダ: 垂直同期から数えたライン 21 のクローズドキャプションを解読する ([`crate::vbi`])
 
 use crate::filter::{Biquad, Cascade, fractional_shift};
 use crate::frame::{Field, RgbaFrame};
 use crate::nr::NoiseReduction;
 use crate::params::{DecoderParams, YcSeparation};
+use crate::raster;
 use crate::timing::*;
+use crate::caption::CaptionDecoder;
+use crate::vbi;
 use rayon::prelude::*;
+use std::collections::VecDeque;
+
+/// ラインを通算ライン番号で引くリングバッファ
+struct Ring {
+    ls: usize,
+    cap: usize,
+    data: Vec<f32>,
+}
+
+impl Ring {
+    fn new(ls: usize, cap: usize) -> Self {
+        Self { ls, cap, data: vec![0.0; ls * cap] }
+    }
+
+    #[inline]
+    fn line(&self, sl: u64) -> &[f32] {
+        let i = (sl % self.cap as u64) as usize;
+        &self.data[i * self.ls..(i + 1) * self.ls]
+    }
+
+    #[inline]
+    fn line_mut(&mut self, sl: u64) -> &mut [f32] {
+        let i = (sl % self.cap as u64) as usize;
+        &mut self.data[i * self.ls..(i + 1) * self.ls]
+    }
+}
 
 pub struct Decoder {
-    /// AFC が推定している同期後縁位置 (フィールドをまたいで保持)
+    std: &'static Standard,
+    /// AFC が推定している同期後縁位置 (ストリームをまたいで保持)
     h_sync_pos: f32,
-    /// AFC 補正後のフィールド (S 映像なら Y)
-    aligned: Vec<f32>,
-    /// AFC 補正後の C (S 映像のときだけ使う)
-    aligned_c: Vec<f32>,
+    /// 次に来るはずの通算ライン (フィールドが連続しているかの確認)
+    next_stream: Option<u64>,
+    /// これより前のラインは (シーク・再初期化で) 途切れているので参照しない
+    valid_from: u64,
+    /// 今のフィールドのぶんの作業領域 (ストリームに足すライン数 × line_samples)
     corrections: Vec<f32>,
-    /// Y/C 分離後の輝度・色 (field_lines × line_samples)
-    luma: Vec<f32>,
-    chroma: Vec<f32>,
+    chunk_aligned: Vec<f32>,
+    chunk_aligned_c: Vec<f32>,
+    chunk_luma: Vec<f32>,
+    chunk_chroma: Vec<f32>,
+    chunk_bursts: Vec<Burst>,
+    /// AFC 補正後の直前の数ライン (くし形フィルタ用)
+    tail: Ring,
+    /// 3 次元 Y/C 分離のフレームメモリ (量子化した AFC 補正後のコンポジット信号)
+    frame_mem: Ring,
+    /// フレームメモリが途切れずに埋まっている最初の通算ライン
+    frame_mem_from: Option<u64>,
+    /// Y/C 分離後の輝度・色とラインごとの検波条件 (表示する窓を切り出すため数フィールドぶん持つ)
+    luma: Ring,
+    chroma: Ring,
+    line_refs: Vec<LineRef>,
+    /// 色副搬送波 PLL の直前のラインの位相
+    pll_prev: Option<f32>,
+    /// PAL アイデントの投票 (正なら sV = (-1)^通算ライン)
+    pal_vote: f32,
+    pal_prev_mu: Option<(u64, f32)>,
+    /// 垂直同期分離の積分回路の状態 (0..1)
+    v_int: f32,
+    /// 積分値が下がるまで次のトリガを受け付けない
+    v_armed: bool,
+    /// 直前の垂直発振器のトリガ (帰線開始) の時刻 [通算ライン]
+    v_last: f64,
+    /// これより前には自走でトリガしない (電源投入・シーク直後に最初の垂直同期を待つ)
+    v_free_hold: f64,
+    /// 帰線の位置 (積分回路の遅れを引いた、幅広パルスの始まりに相当する位置) [通算ライン]。新しいものが後ろ
+    retraces: VecDeque<f64>,
+    /// 積分回路の遅れ (時定数ごと) [ライン]
+    v_delay: Option<(f32, f64)>,
     /// 同期検波後の色差 (field_lines × active_width)。a = cos 側 (I / ±V)、b = sin 側 (Q / U)
     det_a: Vec<f32>,
     det_b: Vec<f32>,
-    /// ラインごとのバースト検出結果
-    bursts: Vec<Burst>,
-    /// ラインごとの検波条件
-    lines: Vec<LineRef>,
-    /// 3 次元 Y/C 分離の画面バッファ: 過去のフィールドの AFC 補正後のコンポジット信号
-    /// (新しい順、フィールド番号付き。最大 [`FIELD_STORE`] フィールド)
-    history: Vec<(u64, Vec<f32>)>,
-    /// 復調した輝度・色差信号 (active_width × field_lines)。NR と RGB 変換で共有する
+    /// 表示するラインの輝度・色差 (active_width × field_lines)。NR と RGB 変換で共有する
     nr_y: Vec<f32>,
     nr_u: Vec<f32>,
     nr_v: Vec<f32>,
     noise_reduction: NoiseReduction,
+    caption: CaptionDecoder,
+    /// 字幕を読んだ直前の帰線 (同じ画面を 2 回読まない)
+    caption_last: Option<i64>,
 }
-
-/// 画面バッファに持つフィールド数 (PAL の 2 フレーム = 4 フィールド前まで)
-const FIELD_STORE: usize = 4;
 
 #[derive(Clone, Copy, Default)]
 struct Burst {
@@ -71,27 +135,55 @@ impl Default for Decoder {
     }
 }
 
+/// 表示用に持つフィールド数 (画面が流れているとき、前のフィールドにまたがる窓を切り出す)
+const DISPLAY_FIELDS: usize = 3;
+
 impl Decoder {
-    pub fn new(s: &Standard) -> Self {
-        let n = s.field_lines * s.line_samples;
+    pub fn new(s: &'static Standard) -> Self {
+        let ls = s.line_samples;
+        let chunk = s.stream_lines(1);
+        let cap = DISPLAY_FIELDS * s.raster_lines;
         let na = s.field_lines * s.active_width;
         Self {
+            std: s,
             h_sync_pos: s.sync_end as f32,
-            aligned: vec![0.0; n],
-            aligned_c: Vec::new(),
-            corrections: vec![0.0; s.field_lines],
-            luma: vec![0.0; n],
-            chroma: vec![0.0; n],
+            next_stream: None,
+            valid_from: 0,
+            corrections: vec![0.0; chunk],
+            chunk_aligned: vec![0.0; chunk * ls],
+            chunk_aligned_c: Vec::new(),
+            chunk_luma: vec![0.0; chunk * ls],
+            chunk_chroma: vec![0.0; chunk * ls],
+            chunk_bursts: vec![Burst::default(); chunk],
+            tail: Ring::new(ls, 4),
+            frame_mem: Ring::new(ls, 0),
+            frame_mem_from: None,
+            luma: Ring::new(ls, cap),
+            chroma: Ring::new(ls, cap),
+            line_refs: vec![LineRef::default(); cap],
+            pll_prev: None,
+            pal_vote: 0.0,
+            pal_prev_mu: None,
+            v_int: 0.0,
+            v_armed: true,
+            v_last: f64::NEG_INFINITY,
+            v_free_hold: f64::NEG_INFINITY,
+            retraces: VecDeque::new(),
+            v_delay: None,
             det_a: vec![0.0; na],
             det_b: vec![0.0; na],
-            bursts: vec![Burst::default(); s.field_lines],
-            lines: vec![LineRef::default(); s.field_lines],
-            history: Vec::new(),
             nr_y: vec![0.0; na],
             nr_u: vec![0.0; na],
             nr_v: vec![0.0; na],
             noise_reduction: NoiseReduction::default(),
+            caption: CaptionDecoder::default(),
+            caption_last: None,
         }
+    }
+
+    /// 字幕デコーダ (表示中の字幕と、画面への描画)
+    pub fn captions(&self) -> &CaptionDecoder {
+        &self.caption
     }
 }
 
@@ -128,12 +220,12 @@ pub(crate) fn find_sync_edge(line: &[f32], s: &Standard) -> Option<f32> {
 /// PAL アイデント: ライン l の PAL スイッチを sV = s0·(-1)^l としたときの s0 (±1) を返す。
 ///
 /// `mus` はラインごとのバースト相関の位相 μ = φ - 45°·sV (バーストが弱いラインは None)。
-/// 隣り合うラインの μ の差は (ライン当たりの位相の進み) - 90°·sV になるので、フィールド全体で多数決を取る
+/// 隣り合うラインの μ の差は (ライン当たりの位相の進み) - 90°·sV になるので、全体で多数決を取る
 /// (実機の PAL スイッチのフリップフロップをアイデント信号で正しい向きに揃えるのに相当)。
 pub(crate) fn pal_ident(mus: &[Option<f32>], s: &Standard) -> f32 {
-    use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, TAU};
+    use std::f32::consts::{FRAC_PI_4, TAU};
     let wrap = |a: f32| a - TAU * (a / TAU).round();
-    let step = s.line_phase_step() as f32 * FRAC_PI_2;
+    let step = s.line_phase_step() as f32 * std::f32::consts::FRAC_PI_2;
     let mut vote = 0.0;
     for l in 1..mus.len() {
         if let (Some(a), Some(b)) = (mus[l - 1], mus[l]) {
@@ -148,147 +240,245 @@ pub(crate) fn pal_ident(mus: &[Option<f32>], s: &Standard) -> f32 {
     if vote < 0.0 { -1.0 } else { 1.0 }
 }
 
+/// 垂直同期分離の積分回路が、幅広パルスの始まりから何ライン遅れてしきい値を超えるか
+/// (理想的な信号で求めておき、帰線の位置から差し引く)
+fn vsync_delay(s: &'static Standard, alpha: f32) -> f64 {
+    let ls = s.line_samples;
+    let start = s.vsync_stream_pos(1, 0) as u64;
+    let mut line = vec![0f32; ls];
+    let mut v = 0f32;
+    let thr = s.ire.sync / 2.0;
+    for sl in start - 40..start + 12 {
+        raster::render_blanking(s, &raster::line_info(s, sl), &mut line);
+        for (n, &x) in line.iter().enumerate() {
+            v += alpha * ((x < thr) as u8 as f32 - v);
+            if sl >= start && v > V_TRIGGER {
+                return (sl - start) as f64 + n as f64 / ls as f64;
+            }
+        }
+    }
+    0.0
+}
+
+/// 積分回路のトリガ・再アームのしきい値
+const V_TRIGGER: f32 = 0.5;
+const V_REARM: f32 = 0.3;
+
 impl Decoder {
-    pub fn decode_field(
-        &mut self,
-        field: &Field,
-        p: &DecoderParams,
-        playback_nr: bool,
-        out: &mut RgbaFrame,
-    ) {
+    /// 1 フィールドぶんの信号を受けて画面を描く。戻り値は書いた行の偶奇 (0 = 偶数行、1 = 奇数行)。
+    /// 受像機は同期信号から帰線の位置を決めるので、画面が流れているときは入力のフィールドの偶奇と一致しない
+    pub fn decode_field(&mut self, field: &Field, p: &DecoderParams, playback_nr: bool, out: &mut RgbaFrame) -> u8 {
         let s = field.std;
-        let (aw, fl, ls) = (s.active_width, s.field_lines, s.line_samples);
         assert_eq!((out.width, out.height), s.image_size());
-        if self.aligned.len() != fl * ls || self.det_a.len() != fl * aw {
+        if !std::ptr::eq(s, self.std) {
             *self = Self::new(s);
         }
+        let ls = s.line_samples;
         let lv = s.ire;
         let pal = s.is_pal();
+        let start = field.stream_line(0);
+        let n_new = s.stream_lines(field.parity);
+        let end = start + n_new as u64;
+        if self.next_stream != Some(start) {
+            // 途切れた (最初のフィールド・シーク): 過去のラインは使わない。垂直発振器はすぐ引き込める状態にする
+            self.valid_from = start;
+            self.frame_mem_from = None;
+            self.pll_prev = None;
+            self.pal_prev_mu = None;
+            self.retraces.clear();
+            let period = self.free_period(p);
+            self.v_last = start as f64 - period * (1.0 - p.v_sync_window.clamp(0.02, 0.9) as f64);
+            self.v_free_hold = start as f64 + period;
+            self.caption.reset();
+        }
+        self.next_stream = Some(end);
 
         // --- 水平 AFC (逐次) ---
         let k = p.h_pll.clamp(0.0, 1.0);
-        for l in 0..fl {
-            if let Some(pos) = find_sync_edge(field.line(l), s) {
+        for i in 0..n_new {
+            if let Some(pos) = find_sync_edge(field.line(i), s) {
                 self.h_sync_pos += k * (pos - self.h_sync_pos);
             }
-            self.corrections[l] = self.h_sync_pos - s.sync_end as f32;
+            self.corrections[i] = self.h_sync_pos - s.sync_end as f32;
         }
         let corr = &self.corrections;
-        self.aligned.par_chunks_mut(ls).enumerate().for_each(|(l, dst)| {
-            fractional_shift(field.line(l), dst, -corr[l], lv.blank);
+        self.chunk_aligned[..n_new * ls].par_chunks_mut(ls).enumerate().for_each(|(i, dst)| {
+            fractional_shift(field.line(i), dst, -corr[i], lv.blank);
         });
         // S 映像: C も同じ補正で揃える
         let separate = field.separate;
         if separate {
-            self.aligned_c.resize(fl * ls, 0.0);
-            self.aligned_c.par_chunks_mut(ls).enumerate().for_each(|(l, dst)| {
-                fractional_shift(field.chroma_line(l).unwrap(), dst, -corr[l], 0.0);
+            self.chunk_aligned_c.resize(self.chunk_aligned.len(), 0.0);
+            self.chunk_aligned_c[..n_new * ls].par_chunks_mut(ls).enumerate().for_each(|(i, dst)| {
+                fractional_shift(field.chroma_line(i).unwrap(), dst, -corr[i], 0.0);
             });
         }
+
+        // --- 垂直同期分離と垂直発振器 (逐次) ---
+        self.vertical(field, n_new, p);
 
         // --- Y/C 分離とバースト検出 (ライン並列) ---
         let notch = Cascade::new(&[Biquad::notch_at(s.fsc, 1.0, s.fs)]);
         let c_bp = Cascade::new(&[Biquad::bandpass_at(s.fsc, 1.5, s.fs)]);
         // くし形の相手: 副搬送波が 180° ずれたライン (NTSC は 1H、PAL は V の符号も揃う 2H 前)
-        let comb_lag = if pal { 2 } else { 1 };
+        let comb_lag: u64 = if pal { 2 } else { 1 };
         let use_3d = p.yc_separation == YcSeparation::Comb3d && !separate;
         let use_comb = p.yc_separation == YcSeparation::Comb;
         // フレームくし形の相手: 副搬送波が 180° ずれた同じ位置のライン
-        // (NTSC は 1 フレーム = 2 フィールド前、PAL は 2 フレーム = 4 フィールド前で V の符号も揃う)。
-        // 早送りやシークでフィールドが飛んだときは使わない (ラインくし形のまま)
-        let frame_lag: u64 = if pal { 4 } else { 2 };
-        let frame_ref = if use_3d {
-            field.index.checked_sub(frame_lag).and_then(|want| {
-                self.history.iter().find(|(i, _)| *i == want).map(|(_, v)| v.as_slice())
-            })
+        // (NTSC は 1 フレーム = 525 ライン前、PAL は 2 フレーム = 1250 ライン前で V の符号も揃う)
+        let frame_lag = s.frame_total_lines as u64 * if pal { 2 } else { 1 };
+        if use_3d {
+            let cap = frame_lag as usize + s.raster_lines;
+            if self.frame_mem.cap != cap {
+                self.frame_mem = Ring::new(ls, cap);
+                self.frame_mem_from = None;
+            }
         } else {
-            None
-        };
+            self.frame_mem_from = None;
+        }
         // 動き適応なし (None) なら常にフレームくし形
         let motion_thr = p.motion_adaptive.then(|| p.motion_threshold_ire.max(1e-3));
-        let (aligned, aligned_c) = (&self.aligned, &self.aligned_c);
-        let burst_gate = s.burst_start..s.burst_end + 16;
-        self.luma
-            .par_chunks_mut(ls)
-            .zip(self.chroma.par_chunks_mut(ls))
-            .zip(self.bursts.par_iter_mut())
-            .enumerate()
-            .for_each(|(l, ((y, c), burst))| {
-                let x = &aligned[l * ls..(l + 1) * ls];
-                if separate {
-                    // S 映像: Y/C 分離は要らない (C は帯域外の雑音だけ落とす)
-                    let xc = &aligned_c[l * ls..(l + 1) * ls];
-                    let mut bp = c_bp;
-                    for n in 0..ls {
-                        y[n] = x[n];
-                        c[n] = bp.process(xc[n]);
-                    }
-                } else if let Some(fr) = frame_ref {
-                    let xf = &fr[l * ls..(l + 1) * ls];
-                    let prev = (l >= comb_lag).then(|| &aligned[(l - comb_lag) * ls..(l - comb_lag + 1) * ls]);
-                    separate_3d(x, xf, prev, y, c, c_bp, motion_thr);
-                } else if (use_comb || use_3d) && l >= comb_lag {
-                    let prev = &aligned[(l - comb_lag) * ls..(l - comb_lag + 1) * ls];
-                    let mut bp = c_bp;
-                    for n in 0..ls {
-                        c[n] = bp.process(0.5 * (x[n] - prev[n]));
-                        y[n] = x[n] - c[n];
-                    }
+        let valid_from = self.valid_from;
+        let frame_ok_from = self.frame_mem_from.map(|f| f.max(valid_from));
+        {
+            let (chunk_aligned, chunk_aligned_c, tail, frame_mem) =
+                (&self.chunk_aligned, &self.chunk_aligned_c, &self.tail, &self.frame_mem);
+            let aligned_line = |sl: u64| -> Option<&[f32]> {
+                if sl >= start {
+                    let i = (sl - start) as usize;
+                    Some(&chunk_aligned[i * ls..(i + 1) * ls])
+                } else if sl >= valid_from && start - sl <= tail.cap as u64 {
+                    Some(tail.line(sl))
                 } else {
-                    let (mut nf, mut bp) = (notch, c_bp);
-                    for n in 0..ls {
-                        y[n] = nf.process(x[n]);
-                        c[n] = bp.process(x[n]);
-                    }
+                    None
                 }
-
-                // バースト位相・振幅の検出
-                // バーストゲートはテープ再生時の包絡線の遅れも含むよう広めに取る。
-                // 位相は全体の和から、振幅 (ACC 用) は 1 周期ごとの包絡線のピークから求める。
-                let (mut zr, mut zi) = (0f32, 0f32);
-                let mut amp = 0f32;
-                for cyc in burst_gate.clone().step_by(4) {
-                    let (mut cr, mut ci) = (0f32, 0f32);
-                    for n in cyc..cyc + 4 {
-                        cr += c[n] * COS4[n & 3];
-                        ci -= c[n] * SIN4[n & 3];
+            };
+            let burst_gate = s.burst_start..s.burst_end + 16;
+            self.chunk_luma[..n_new * ls]
+                .par_chunks_mut(ls)
+                .zip(self.chunk_chroma[..n_new * ls].par_chunks_mut(ls))
+                .zip(self.chunk_bursts[..n_new].par_iter_mut())
+                .enumerate()
+                .for_each(|(i, ((y, c), burst))| {
+                    let sl = start + i as u64;
+                    let x = &chunk_aligned[i * ls..(i + 1) * ls];
+                    let frame_ref = frame_ok_from
+                        .filter(|&f| use_3d && sl >= f + frame_lag)
+                        .map(|_| frame_mem.line(sl - frame_lag));
+                    let prev = (sl >= comb_lag).then(|| aligned_line(sl - comb_lag)).flatten();
+                    if separate {
+                        // S 映像: Y/C 分離は要らない (C は帯域外の雑音だけ落とす)
+                        let xc = &chunk_aligned_c[i * ls..(i + 1) * ls];
+                        let mut bp = c_bp;
+                        for n in 0..ls {
+                            y[n] = x[n];
+                            c[n] = bp.process(xc[n]);
+                        }
+                    } else if let Some(xf) = frame_ref {
+                        separate_3d(x, xf, prev, y, c, c_bp, motion_thr);
+                    } else if let (true, Some(prev)) = (use_comb || use_3d, prev) {
+                        let mut bp = c_bp;
+                        for n in 0..ls {
+                            c[n] = bp.process(0.5 * (x[n] - prev[n]));
+                            y[n] = x[n] - c[n];
+                        }
+                    } else {
+                        let (mut nf, mut bp) = (notch, c_bp);
+                        for n in 0..ls {
+                            y[n] = nf.process(x[n]);
+                            c[n] = bp.process(x[n]);
+                        }
                     }
-                    zr += cr;
-                    zi += ci;
-                    amp = amp.max(0.5 * (cr * cr + ci * ci).sqrt());
-                }
-                *burst = Burst { zr, zi, amp };
-            });
 
-        // 画面バッファを更新する (3 次元 Y/C 分離のときだけ持つ)
-        if use_3d {
-            let mut buf = if self.history.len() >= FIELD_STORE { self.history.pop().unwrap().1 } else { Vec::new() };
-            buf.clear();
-            buf.extend_from_slice(&self.aligned);
-            quantize_buffer(&mut buf, p.frame_buffer_bits, &lv);
-            self.history.insert(0, (field.index, buf));
-        } else {
-            self.history.clear();
+                    // バースト位相・振幅の検出
+                    // バーストゲートはテープ再生時の包絡線の遅れも含むよう広めに取る。
+                    // 位相は全体の和から、振幅 (ACC 用) は 1 周期ごとの包絡線のピークから求める。
+                    let (mut zr, mut zi) = (0f32, 0f32);
+                    let mut amp = 0f32;
+                    for cyc in burst_gate.clone().step_by(4) {
+                        let (mut cr, mut ci) = (0f32, 0f32);
+                        for n in cyc..cyc + 4 {
+                            cr += c[n] * COS4[n & 3];
+                            ci -= c[n] * SIN4[n & 3];
+                        }
+                        zr += cr;
+                        zi += ci;
+                        amp = amp.max(0.5 * (cr * cr + ci * ci).sqrt());
+                    }
+                    *burst = Burst { zr, zi, amp };
+                });
+        }
+
+        // --- ストリームのバッファへ移す ---
+        for i in 0..n_new {
+            let sl = start + i as u64;
+            let src = i * ls..(i + 1) * ls;
+            self.luma.line_mut(sl).copy_from_slice(&self.chunk_luma[src.clone()]);
+            self.chroma.line_mut(sl).copy_from_slice(&self.chunk_chroma[src.clone()]);
+            if i + self.tail.cap >= n_new {
+                self.tail.line_mut(sl).copy_from_slice(&self.chunk_aligned[src.clone()]);
+            }
+            if use_3d {
+                let dst = self.frame_mem.line_mut(sl);
+                dst.copy_from_slice(&self.chunk_aligned[src]);
+                quantize_line(dst, p.frame_buffer_bits, &lv);
+            }
+        }
+        if use_3d && self.frame_mem_from.is_none() {
+            self.frame_mem_from = Some(start);
         }
 
         // --- 色副搬送波 PLL と PAL アイデント (逐次) ---
-        self.lock_subcarrier(s, p);
+        self.lock_subcarrier(start, n_new, p);
+
+        // --- 表示する窓 (垂直同期から決まる) ---
+        let fl = s.field_lines;
+        let aw = s.active_width;
+        // 幅広パルスの始まりから有効映像の 1 行目までのライン数
+        let top = s.vsync_to_active();
+        let oldest = end.saturating_sub(self.luma.cap as u64).max(self.valid_from);
+        let vpos = p.vertical_position as f64;
+        let window = |r: f64| {
+            let a = r + top + vpos;
+            let j0 = (a - 0.25).ceil();
+            let row0 = ((2.0 * (j0 - a) + 0.5).floor() as i64).clamp(0, 1) as u8;
+            (j0 as i64, row0)
+        };
+        let chosen = self
+            .retraces
+            .iter()
+            .rev()
+            .map(|&r| (r, window(r)))
+            .find(|&(_, (j0, _))| j0 + fl as i64 <= end as i64 && j0 >= oldest as i64)
+            .or_else(|| {
+                // まだ垂直同期を見ていない (電源投入直後): 信号どおりの位置に描く
+                let r = s.vsync_stream_pos(field.frame, field.parity);
+                Some((r, window(r)))
+            });
+        let (retrace, (j0, row0)) = chosen.unwrap();
+        let line_ok = |j: i64| j >= oldest as i64 && j < end as i64;
 
         // --- 同期検波 (ライン並列) ---
         let c_lp = Cascade::butter_lowpass_at(2, p.chroma_bw_mhz * 1e6, s.fs);
         // NTSC は I/Q 軸 (U/V から 33°) で検波する。PAL は U/V 軸のまま
         let hue = if pal { p.hue_deg.to_radians() } else { p.hue_deg.to_radians() + 33f32.to_radians() };
         let (active_start, active_end) = (s.active_start, s.active_end());
-        let (chroma, lines) = (&self.chroma, &self.lines);
-        self.det_a.par_chunks_mut(aw).zip(self.det_b.par_chunks_mut(aw)).enumerate().for_each(|(l, (da, db))| {
-            let c = &chroma[l * ls..(l + 1) * ls];
-            let psi = lines[l].phase;
+        let (chroma, line_refs) = (&self.chroma, &self.line_refs);
+        self.det_a.par_chunks_mut(aw).zip(self.det_b.par_chunks_mut(aw)).enumerate().for_each(|(k, (da, db))| {
+            let j = j0 + k as i64;
+            if !line_ok(j) {
+                da.fill(0.0);
+                db.fill(0.0);
+                return;
+            }
+            let c = chroma.line(j as u64);
+            let psi = line_refs[(j as u64 % line_refs.len() as u64) as usize].phase;
             let mut cos_t = [0f32; 4];
             let mut sin_t = [0f32; 4];
-            for k in 0..4 {
-                let a = k as f32 * std::f32::consts::FRAC_PI_2 + psi + hue;
-                cos_t[k] = a.cos();
-                sin_t[k] = a.sin();
+            for q in 0..4 {
+                let a = q as f32 * std::f32::consts::FRAC_PI_2 + psi + hue;
+                cos_t[q] = a.cos();
+                sin_t[q] = a.sin();
             }
             let (mut alp, mut blp) = (c_lp, c_lp);
             for n in 0..active_end {
@@ -301,17 +491,27 @@ impl Decoder {
             }
         });
 
-        // --- VCR playback NR in recovered baseband Y/C ---
-        for l in 0..fl {
-            let y_line = &self.luma[l * ls..(l + 1) * ls];
-            let (da, db) = (&self.det_a[l * aw..(l + 1) * aw], &self.det_b[l * aw..(l + 1) * aw]);
-            let LineRef { sv, gain, .. } = self.lines[l];
-            let prev = (pal && p.pal_delay_line && l > 0).then(|| {
-                let r = self.lines[l - 1];
-                (&self.det_a[(l - 1) * aw..l * aw], &self.det_b[(l - 1) * aw..l * aw], r.sv * r.gain, r.gain)
+        // --- 輝度・色差 (PAL は遅延線で前のラインと平均) ---
+        let line_ref = |j: i64| self.line_refs[(j as u64 % self.line_refs.len() as u64) as usize];
+        for k in 0..fl {
+            let j = j0 + k as i64;
+            if !line_ok(j) {
+                // ストリームの外 (まだ来ていない・もうない): 何も映らない
+                let r = k * aw..(k + 1) * aw;
+                self.nr_y[r.clone()].fill(-lv.black);
+                self.nr_u[r.clone()].fill(0.0);
+                self.nr_v[r].fill(0.0);
+                continue;
+            }
+            let y_line = self.luma.line(j as u64);
+            let (da, db) = (&self.det_a[k * aw..(k + 1) * aw], &self.det_b[k * aw..(k + 1) * aw]);
+            let LineRef { sv, gain, .. } = line_ref(j);
+            let prev = (pal && p.pal_delay_line && k > 0 && line_ok(j - 1)).then(|| {
+                let r = line_ref(j - 1);
+                (&self.det_a[(k - 1) * aw..k * aw], &self.det_b[(k - 1) * aw..k * aw], r.sv * r.gain, r.gain)
             });
             for x in 0..aw {
-                let i = l * aw + x;
+                let i = k * aw + x;
                 self.nr_y[i] = y_line[x + active_start] - lv.black;
                 if pal {
                     let (mut v, mut u) = (da[x] * sv * gain, db[x] * gain);
@@ -345,7 +545,7 @@ impl Decoder {
         }
 
         // --- RGB へ変換して書き込む ---
-        let parity = field.parity as usize;
+        let parity = row0 as usize;
         let row_bytes = aw * 4;
         let (nr_y, nr_u, nr_v) = (&self.nr_y, &self.nr_u, &self.nr_v);
         out.data.par_chunks_mut(row_bytes).enumerate().for_each(|(row, dst)| {
@@ -370,69 +570,152 @@ impl Decoder {
                 dst[o + 3] = 255;
             }
         });
+
+        // --- 字幕デコーダ: 垂直同期から数えたライン 21 (第 1 フィールド) / 284 (第 2 フィールド) を読む ---
+        if p.caption_display && !pal {
+            self.caption.set_channel(p.caption_channel);
+            let key = (2.0 * retrace).round() as i64;
+            if self.caption_last != Some(key) {
+                self.caption_last = Some(key);
+                let j = (retrace + 21.0 - s.vsync_line[0] as f64 + 0.5 * row0 as f64).round() as i64;
+                let pair = line_ok(j).then(|| vbi::slice_caption(s, self.luma.line(j as u64))).flatten();
+                self.caption.feed(row0, pair);
+            }
+        } else {
+            self.caption.reset();
+            self.caption_last = None;
+        }
+        row0
+    }
+
+    /// 垂直発振器の自走周期 [ライン]
+    fn free_period(&self, p: &DecoderParams) -> f64 {
+        self.std.total_lines_per_field / (1.0 + p.v_hold_pct.clamp(-50.0, 50.0) as f64 / 100.0)
+    }
+
+    /// 垂直同期分離 (同期分離 → RC 積分 → しきい値) と、窓付きでトリガされる垂直発振器
+    fn vertical(&mut self, field: &Field, n_new: usize, p: &DecoderParams) {
+        let s = self.std;
+        let ls = s.line_samples;
+        let alpha = 1.0 - (-1.0 / (p.v_integrator_us.max(1.0) * 1e-6 * s.fs)).exp();
+        let delay = match self.v_delay {
+            Some((a, d)) if a == alpha => d,
+            _ => {
+                let d = vsync_delay(s, alpha);
+                self.v_delay = Some((alpha, d));
+                d
+            }
+        };
+        let period = self.free_period(p);
+        let window = p.v_sync_window.clamp(0.02, 0.9) as f64;
+        let thr = s.ire.sync / 2.0;
+        let start = field.stream_line(0);
+        for i in 0..n_new {
+            let line = field.line(i);
+            let base = (start + i as u64) as f64;
+            // 自走のトリガがこのラインの中に来るか
+            let mut free_at = (self.v_last + period).max(self.v_free_hold);
+            for (n, &x) in line.iter().enumerate() {
+                self.v_int += alpha * ((x < thr) as u8 as f32 - self.v_int);
+                let t = base + n as f64 / ls as f64;
+                if self.v_int < V_REARM {
+                    self.v_armed = true;
+                }
+                if self.v_armed && self.v_int > V_TRIGGER && t - self.v_last >= period * (1.0 - window) {
+                    // 同期によるトリガ
+                    self.v_armed = false;
+                    self.v_last = t;
+                    self.push_retrace(t - delay);
+                    free_at = self.v_last + period;
+                } else if t >= free_at {
+                    // 自走 (同期が来ない・窓の外)
+                    self.v_last = free_at;
+                    self.push_retrace(free_at - delay);
+                    free_at = self.v_last + period;
+                }
+            }
+        }
+    }
+
+    fn push_retrace(&mut self, r: f64) {
+        self.retraces.push_back(r);
+        while self.retraces.len() > 8 {
+            self.retraces.pop_front();
+        }
     }
 
     /// バーストからラインごとの基準位相・PAL スイッチ・色のゲインを決める。
     ///
     /// バースト相関の位相 μ は NTSC では副搬送波位相 φ そのもの、PAL では φ - 45°·sV (スウィンギングバースト)。
     /// - PAL アイデント: 隣り合うラインの μ の差は (ライン当たりの位相の進み) - 90°·sV になるので、
-    ///   フィールド全体の多数決で PAL スイッチ (フリップフロップ) の向きを決める
+    ///   投票を積み重ねて PAL スイッチ (フリップフロップ) の向きを決める
     /// - PLL: 前のラインの基準位相 + ライン当たりの進みを予測とし、バーストとの差に `burst_pll` を掛けて追従する。
-    ///   バーストが弱いラインは予測のまま惰性で回る
-    fn lock_subcarrier(&mut self, s: &Standard, p: &DecoderParams) {
+    ///   バーストが弱い・ない (帰線区間) ラインは予測のまま惰性で回る
+    fn lock_subcarrier(&mut self, start: u64, n_new: usize, p: &DecoderParams) {
         use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, TAU};
+        let s = self.std;
         let wrap = |a: f32| a - TAU * (a / TAU).round();
         let step = s.line_phase_step() as f32 * FRAC_PI_2;
         let pal = s.is_pal();
-        let mu = |b: &Burst| b.zi.atan2(b.zr) - FRAC_PI_2;
-        let valid = |b: &Burst| b.amp >= 3.0;
-
-        let s0 = if pal {
-            let mus: Vec<Option<f32>> = self.bursts.iter().map(|b| valid(b).then(|| mu(b))).collect();
-            pal_ident(&mus, s)
-        } else {
-            1.0
-        };
-
         let k = p.burst_pll.clamp(0.0, 1.0);
-        let mut prev: Option<f32> = None;
-        for l in 0..self.bursts.len() {
-            let b = self.bursts[l];
-            let sv = if !pal {
-                1.0
-            } else if l % 2 == 0 {
-                s0
+        let cap = self.line_refs.len() as u64;
+        for i in 0..n_new {
+            let sl = start + i as u64;
+            let b = self.chunk_bursts[i];
+            let valid = b.amp >= 3.0;
+            let mu = b.zi.atan2(b.zr) - FRAC_PI_2;
+            let alt = if sl & 1 == 0 { 1.0 } else { -1.0 };
+            let sv = if pal {
+                if valid {
+                    if let Some((psl, pmu)) = self.pal_prev_mu {
+                        if psl + 1 == sl {
+                            let d = wrap(mu - pmu - step);
+                            // d ≒ -90°·sV。±45° 以内のずれなら判定に使う
+                            if d.abs() > FRAC_PI_4 && d.abs() < 3.0 * FRAC_PI_4 {
+                                self.pal_vote = 0.95 * self.pal_vote - d.signum() * alt;
+                            }
+                        }
+                    }
+                }
+                self.pal_prev_mu = valid.then_some((sl, mu));
+                let s0 = if self.pal_vote < 0.0 { -1.0 } else { 1.0 };
+                s0 * alt
             } else {
-                -s0
+                1.0
             };
             // バーストから測った副搬送波位相
-            let measured = if pal { mu(&b) + FRAC_PI_4 * sv } else { mu(&b) };
-            let phase = match prev {
-                // 即時同期 (ラインごとにバーストへ合わせる)
-                _ if k >= 1.0 => measured,
+            let measured = if pal { mu + FRAC_PI_4 * sv } else { mu };
+            let phase = match self.pll_prev {
                 None => measured,
                 Some(ph) => {
                     let pred = wrap(ph + step);
-                    if valid(&b) { pred + k * wrap(measured - pred) } else { pred }
+                    if !valid {
+                        pred
+                    } else if k >= 1.0 {
+                        // 即時同期 (ラインごとにバーストへ合わせる)
+                        measured
+                    } else {
+                        pred + k * wrap(measured - pred)
+                    }
                 }
             };
-            prev = Some(phase);
+            self.pll_prev = Some(phase);
 
             let mut gain = p.saturation / s.ire.span();
             if p.acc {
                 gain *= (s.ire.burst / b.amp.max(1e-3)).min(8.0);
             }
-            if p.color_killer && b.amp < 3.0 {
+            if p.color_killer && !valid {
                 gain = 0.0;
             }
-            self.lines[l] = LineRef { phase, sv, gain };
+            self.line_refs[(sl % cap) as usize] = LineRef { phase, sv, gain };
         }
     }
 }
 
 /// 画面バッファへ書き込むときの量子化 (フレームメモリの A/D 変換)。
 /// 範囲は同期先端から、白 + 色の振幅のぶんのピーク (NTSC なら約 -40〜150 IRE) まで。範囲外は張り付く
-fn quantize_buffer(buf: &mut [f32], bits: u32, lv: &Levels) {
+fn quantize_line(buf: &mut [f32], bits: u32, lv: &Levels) {
     if bits == 0 {
         return;
     }
@@ -441,10 +724,10 @@ fn quantize_buffer(buf: &mut [f32], bits: u32, lv: &Levels) {
     let hi = lv.white + 0.35 * (lv.white - lv.sync);
     let steps = ((1u32 << bits) - 1) as f32;
     let (scale, inv) = (steps / (hi - lo), (hi - lo) / steps);
-    buf.par_iter_mut().for_each(|v| {
+    for v in buf.iter_mut() {
         let q = ((*v - lo) * scale).round().clamp(0.0, steps);
         *v = lo + q * inv;
-    });
+    }
 }
 
 /// 動き適応型 3 次元 Y/C 分離 (1 ライン)。

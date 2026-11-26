@@ -74,6 +74,19 @@ async fn get_frame(engine: State<'_, Engine>, after: u64) -> Result<Response, St
     if slot.id > after { Ok(Response::new(slot.bytes.clone())) } else { Ok(Response::new(Vec::new())) }
 }
 
+/// オシロスコープを開いた・閉じた (開いている間だけエンジンがコンポジット信号を写す)
+#[tauri::command]
+fn set_scope_active(engine: State<'_, Engine>, active: bool) {
+    engine.shared.scope_active.store(active, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `after` より新しいフィールドのコンポジット信号があれば返す (なければ空)。形式は `engine::composite_bytes`
+#[tauri::command]
+async fn get_composite(engine: State<'_, Engine>, after: u64) -> Result<Response, String> {
+    let slot = engine.shared.composite.lock().unwrap();
+    if slot.id > after { Ok(Response::new(slot.bytes.clone())) } else { Ok(Response::new(Vec::new())) }
+}
+
 #[tauri::command]
 fn get_stats(engine: State<'_, Engine>) -> Stats {
     engine.shared.stats.lock().unwrap().clone()
@@ -149,6 +162,8 @@ pub fn run() {
             list_cameras,
             open_source,
             get_frame,
+            get_composite,
+            set_scope_active,
             get_stats,
             start_recording,
             stop_recording,

@@ -5,6 +5,7 @@
   import { onMount } from "svelte";
   import { groups, help, getPath, setPath, isActive, presets, applyDiff, retarget, type Params } from "#lib/params.ts";
   import Scopes from "#lib/Scopes.svelte";
+  import Oscilloscope from "#lib/Oscilloscope.svelte";
   import Immersive from "#lib/Immersive.svelte";
   import { getCurrentWindow } from "@tauri-apps/api/window";
 
@@ -387,6 +388,7 @@
     </div>
 
     <Scopes bind:this={scopes} standard={params?.standard ?? "ntsc"} />
+    <Oscilloscope standard={params?.standard ?? "ntsc"} />
 
     <div class="status">
       <span>{stats?.source ?? "…"}</span>
@@ -901,7 +903,8 @@
   main.immersive .toolbar,
   main.immersive .status,
   main.immersive .panel,
-  main.immersive :global(.scopes) {
+  main.immersive :global(.scopes),
+  main.immersive :global(.osc) {
     display: none;
   }
   main.immersive .screen {

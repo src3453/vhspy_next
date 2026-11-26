@@ -228,7 +228,10 @@ impl RgbaFrame {
     }
 }
 
-/// 1 フィールド分の映像信号 (field_lines × line_samples, 単位 IRE)。
+/// 1 フィールド分の映像信号 (raster_lines × line_samples, 単位 IRE)。
+///
+/// 有効映像だけでなく、等化パルス・垂直同期・VBI を含む全ラスタを持つ ([`crate::raster`])。
+/// バッファの先頭は垂直同期の始まるライン、有効映像の 1 行目は [`Field::active_index`] で求める。
 ///
 /// 通常はコンポジット信号 (`data`)。S 映像 (Y/C 分離) で送るときは `separate` が立ち、
 /// `data` が Y (同期付き)、`chroma` が C (バースト付き) になる。
@@ -259,7 +262,7 @@ impl Field {
     pub fn new(std: &'static Standard) -> Self {
         Self {
             std,
-            data: vec![0.0; std.field_lines * std.line_samples],
+            data: vec![0.0; std.raster_lines * std.line_samples],
             separate: false,
             chroma: Vec::new(),
             parity: 0,
@@ -274,6 +277,25 @@ impl Field {
         self.frame = index / 2;
     }
 
+    /// バッファのライン数 (帰線区間込み)
+    #[inline]
+    pub fn lines(&self) -> usize {
+        self.std.raster_lines
+    }
+
+    /// 有効映像の l 行目 (フレーム画像の行 2l + parity) がバッファの何ライン目か
+    #[inline]
+    pub fn active_index(&self, l: usize) -> usize {
+        self.std.active_raster_index(self.parity) + l
+    }
+
+    /// バッファの l ライン目の通算ライン番号
+    #[inline]
+    pub fn stream_line(&self, l: usize) -> u64 {
+        self.std.stream_line(l, self.frame, self.parity)
+    }
+
+    /// バッファの l ライン目 (帰線区間込み)
     pub fn line(&self, l: usize) -> &[f32] {
         &self.data[l * self.std.line_samples..(l + 1) * self.std.line_samples]
     }

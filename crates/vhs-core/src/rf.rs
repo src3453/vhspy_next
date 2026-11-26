@@ -28,8 +28,6 @@ impl RfSim {
         let src = &self.src;
         let s = field.std;
         let (fs, ls) = (s.fs, s.line_samples);
-        // 位相をフィールド・ラインをまたいで連続させるのに総ライン数 (帰線区間込み) を使う
-        let lines_per_field = s.total_lines_per_field;
         let sound_beat_hz = s.sound_carrier_hz - s.fsc as f64;
 
         let delay = (p.ghost_delay_us.max(0.0) * 1e-6 * fs).max(0.0);
@@ -37,7 +35,7 @@ impl RfSim {
         let gain = p.ghost_gain;
         let snow_lp = Cascade::butter_lowpass_at(2, s.video_bw_hz, fs);
         let snow_norm = (0.5 * fs / s.video_bw_hz).sqrt() * p.snow_ire;
-        let index = field.index;
+        let (index, frame, parity) = (field.index, field.frame, field.parity);
 
         // 擬似音声: フィールドごとに変わる (声や音楽の抑揚の代わり)
         let mut frng = Rng::derive(seed, index, 0, STREAM_RF + 1);
@@ -51,7 +49,7 @@ impl RfSim {
             let mut rng = Rng::derive(seed, index, l as u64, STREAM_RF);
             let mut lp = snow_lp;
             // 通算サンプル位置 (位相をフィールド・ラインをまたいで連続させる)
-            let t0 = ((index as f64 * lines_per_field) + l as f64) * ls as f64;
+            let t0 = s.stream_line(l, frame, parity) as f64 * ls as f64;
             // 音声ビートの位相は音声で FM 変調されるので、ラインごとに揺れる
             let beat_phase = 2.5 * audio as f64 + 0.3 * rng.normal() as f64;
             let base = l * ls;

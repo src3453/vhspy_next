@@ -1,4 +1,7 @@
-//! RGB 画像 → コンポジット信号 (1 フィールド分)。
+//! RGB 画像 → コンポジット信号 (1 フィールド分、帰線区間込みの全ラスタ)。
+//!
+//! ライン構造 (等化パルス・切り込み付き垂直同期・バーストの有無) は [`crate::raster`]、
+//! VBI に重畳するデータ・試験信号は [`crate::vbi`] で決める。
 //!
 //! 色は副搬送波の直交変調で載せる。どちらの方式も `U sin(ωt) + V cos(ωt)` の形になる。
 //! - NTSC: U/V 軸から 33° 回した I/Q で帯域を変えて (I 広め・Q 狭め) 載せる。バーストは -U 軸 (180°)
@@ -7,9 +10,11 @@
 
 use crate::filter::Cascade;
 use crate::frame::{Field, VideoFrame};
-use crate::params::{EncoderParams, SignalParams};
+use crate::params::{EncoderParams, SignalParams, VbiParams};
+use crate::raster;
 use crate::rng::Rng;
 use crate::timing::*;
+use crate::vbi;
 use rayon::prelude::*;
 
 /// I/Q 軸は U/V 軸から 33° 回転している
@@ -27,12 +32,16 @@ fn field_row(frame: &VideoFrame, line: isize, parity: u8) -> Option<&[f32]> {
     Some(&frame.data[start..start + frame.width * 3])
 }
 
-/// `frame` は `field.std.image_size()` の大きさであること。コンポジット信号を `field.data` に書く。
+static NO_VBI: std::sync::LazyLock<VbiParams> =
+    std::sync::LazyLock::new(|| VbiParams { enabled: false, ..VbiParams::default() });
+
+/// `frame` は `field.std.image_size()` の大きさであること。コンポジット信号 (全ラスタ) を `field.data` に書く。
+/// VBI のデータ信号は載せない
 pub fn encode_field(frame: &VideoFrame, field: &mut Field, p: &EncoderParams) {
     encode_field_with_signal(frame, field, p, &SignalParams::default(), 0);
 }
 
-/// 信号要素ごとの劣化を加えてコンポジット信号を作る。
+/// 信号要素ごとの劣化を加えてコンポジット信号を作る (VBI のデータ信号なし)。
 pub fn encode_field_with_signal(
     frame: &VideoFrame,
     field: &mut Field,
@@ -40,7 +49,21 @@ pub fn encode_field_with_signal(
     signal: &SignalParams,
     seed: u64,
 ) {
-    encode(frame, field, p, signal, seed, false);
+    encode(frame, field, p, signal, &NO_VBI, seed, false);
+}
+
+/// 信号要素ごとの劣化と VBI のデータ・試験信号を加えて書く。
+/// `field.separate` なら Y/C を分けたまま (S 映像) 書く: `data` = Y (同期付き)、`chroma` = C (バースト付き)
+pub fn encode_field_full(
+    frame: &VideoFrame,
+    field: &mut Field,
+    p: &EncoderParams,
+    signal: &SignalParams,
+    vbi: &VbiParams,
+    seed: u64,
+) {
+    let split = field.separate;
+    encode(frame, field, p, signal, vbi, seed, split);
 }
 
 /// `field.separate` なら Y/C を分けたまま (S 映像) 書く: `data` = Y (同期付き)、`chroma` = C (バースト付き)。
@@ -58,10 +81,18 @@ pub fn encode_field_yc_with_signal(
     seed: u64,
 ) {
     let split = field.separate;
-    encode(frame, field, p, signal, seed, split);
+    encode(frame, field, p, signal, &NO_VBI, seed, split);
 }
 
-fn encode(frame: &VideoFrame, field: &mut Field, p: &EncoderParams, signal: &SignalParams, seed: u64, split: bool) {
+fn encode(
+    frame: &VideoFrame,
+    field: &mut Field,
+    p: &EncoderParams,
+    signal: &SignalParams,
+    vbi_p: &VbiParams,
+    seed: u64,
+    split: bool,
+) {
     let s = field.std;
     let (aw, fl) = s.image_size();
     assert_eq!((frame.width, frame.height), (aw, fl));
@@ -75,27 +106,14 @@ fn encode(frame: &VideoFrame, field: &mut Field, p: &EncoderParams, signal: &Sig
     let (parity, frame_no, field_index) = (field.parity, field.frame, field.index);
     let lv = s.ire;
     let span = lv.span();
-    let (sync_end, active, burst) = (s.sync_end, s.active_start..s.active_end(), s.burst_start..s.burst_end);
+    let burst = s.burst_start..s.burst_end;
 
-    // 垂直帰線波形は Field に含めないため、8 回平均する簡易同期検出モデルで減衰・雑音を評価し、
-    // ロックを失ったフィールドは上下へ数ラインずれる。垂直ジッタ自体もフィールド単位。
+    // 垂直同期: 幅広パルスの振幅減衰・雑音は信号そのものに掛ける (受像機の垂直同期分離が取り損ねると
+    // 垂直発振器が自走して画面が流れる)。ジッタは同期に対して映像だけを上下にずらす (フィールド単位)
     let vertical = &signal.vertical_sync;
     let mut vertical_rng = Rng::derive(seed, field.index, 0, STREAM_VSYNC);
-    let mut vertical_offset = vertical_rng.normal() * vertical.jitter.max(0.0);
+    let vertical_offset = vertical_rng.normal() * vertical.jitter.max(0.0);
     let vertical_attenuation = (vertical.attenuation_pct / 100.0).clamp(0.0, 1.0);
-    if vertical_attenuation > 0.0 || vertical.noise_ire > 0.0 {
-        let mut integrated_noise = 0.0;
-        for _ in 0..8 {
-            integrated_noise += vertical_rng.normal();
-        }
-        integrated_noise *= vertical.noise_ire.max(0.0) / 8.0;
-        let pulse_ire = (lv.blank - lv.sync).abs() * (1.0 - vertical_attenuation);
-        let threshold_ire = (lv.blank - lv.sync).abs() * 0.5;
-        if pulse_ire + integrated_noise < threshold_ire {
-            let slip = 1.0 + vertical_rng.uniform() * 7.0;
-            vertical_offset += if vertical_rng.uniform() < 0.5 { -slip } else { slip };
-        }
-    }
 
     // cos(φ+θ0), sin(φ+θ0) の 4 象限テーブル (NTSC は θ0 = 33°、PAL は 0°)
     let rot = if pal { 0.0 } else { IQ_ROT };
@@ -126,60 +144,92 @@ fn encode(frame: &VideoFrame, field: &mut Field, p: &EncoderParams, signal: &Sig
         no_chroma
     };
     field.data.par_chunks_mut(ls).zip(chroma_out).enumerate().for_each(|(l, (out, mut c_out))| {
-        let row = 2 * l + parity as usize;
-        let src = &frame.data[row * aw * 3..(row + 1) * aw * 3];
+        let sl = s.stream_line(l, frame_no, parity);
+        let info = raster::line_info(s, sl);
+        let base = s.line_phase_base_at(sl);
+        let sv = s.v_switch_at(sl);
+        // 映像の入るラインなら、このフィールドの何行目の画像か
+        let image_line = info.image_row.filter(|r| r % 2 == parity as usize).map(|r| r / 2);
+        let video = info.video_span(s);
         // V-sync のずれは同期波形・バーストを保ったまま有効映像だけを上下させる。
-        let source = l as f32 - vertical_offset;
+        let shifted = vertical_offset.abs() > 1e-5;
+        let source = image_line.map_or(0.0, |a| a as f32 - vertical_offset);
         let source_lo = source.floor() as isize;
         let source_frac = source - source_lo as f32;
         let source_a = field_row(frame, source_lo, parity);
         let source_b = field_row(frame, source_lo + 1, parity);
-        let vertical_shifted = vertical_offset.abs() > 1e-5;
-        let base = s.line_phase_base(l, frame_no, parity);
-        let sv = s.v_switch(l, frame_no, parity);
         let (mut y_lp, mut i_lp, mut q_lp) = (y_lp, i_lp, q_lp);
 
         let mut hs_rng = Rng::derive(seed, field_index, l as u64, STREAM_HSYNC);
+        let mut vs_rng = Rng::derive(seed, field_index, l as u64, STREAM_VSYNC);
         let mut burst_rng = Rng::derive(seed, field_index, l as u64, STREAM_BURST);
         let mut chroma_rng = Rng::derive(seed, field_index, l as u64, STREAM_CHROMA);
-        let sync_end_pos = (sync_end as f32 + hs_rng.normal() * hs.jitter.max(0.0)).clamp(1.0, s.burst_start as f32);
+        let sync_end_pos =
+            (s.sync_end as f32 + hs_rng.normal() * hs.jitter.max(0.0)).clamp(1.0, s.burst_start as f32);
+        let pulses = raster::sync_pulses(s, info.halves, sync_end_pos);
         let burst_phase = burst_rng.normal() * burst_signal.jitter.max(0.0).to_radians();
         let (burst_sin, burst_cos) = burst_phase.sin_cos();
         let chroma_phase = chroma_rng.normal() * chroma_signal.jitter.max(0.0).to_radians();
         let (chroma_sin, chroma_cos) = chroma_phase.sin_cos();
 
+        // VBI のデータ・試験信号 (映像のないラインと、半ラインの映像のない側)
+        let mut vbi_y = [0f32; MAX_LINE_SAMPLES];
+        let mut vbi_c = [0f32; MAX_LINE_SAMPLES];
+        let has_vbi = info.video != raster::Video::Full
+            && vbi::render_line(s, &info, vbi_p, base, &mut vbi_y[..ls], &mut vbi_c[..ls]);
+
         for (n, o) in out.iter_mut().enumerate() {
             // NTSC: (i, q) = (I, Q)、PAL: (i, q) = (±V, U)。どちらも i は cos 側、q は sin 側に載る
             let (mut y, mut i, mut q) = (lv.blank, 0.0, 0.0);
-            if (n as f32) < sync_end_pos {
-                y = lv.blank + (lv.sync - lv.blank) * (1.0 - hs_attenuation);
-            } else if active.contains(&n) {
-                let px = (n - active.start) * 3;
-                let (r, g, b) = if vertical_shifted {
-                    let sample = |c: usize| {
-                        let a = source_a.map_or(0.0, |line| line[px + c]);
-                        let b = source_b.map_or(0.0, |line| line[px + c]);
-                        a + (b - a) * source_frac
-                    };
-                    (sample(0), sample(1), sample(2))
+            let (mut h_cov, mut v_cov) = (0f32, 0f32);
+            for &(a, b, vert) in &pulses {
+                let cv = raster::coverage(n, a, b);
+                if vert {
+                    v_cov += cv;
                 } else {
-                    (src[px], src[px + 1], src[px + 2])
-                };
-                y = lv.black + span * (0.299 * r + 0.587 * g + 0.114 * b);
-                if pal {
-                    i = sv * span * (0.615 * r - 0.515 * g - 0.100 * b);
-                    q = span * (-0.147 * r - 0.289 * g + 0.436 * b);
-                } else {
-                    i = span * (0.5959 * r - 0.2746 * g - 0.3213 * b);
-                    q = span * (0.2115 * r - 0.5227 * g + 0.3112 * b);
+                    h_cov += cv;
                 }
+            }
+            let in_video = video.is_some_and(|(a, b)| (a..b).contains(&n));
+            if h_cov > 0.0 || v_cov > 0.0 {
+                y += (lv.sync - lv.blank) * (h_cov * (1.0 - hs_attenuation) + v_cov * (1.0 - vertical_attenuation));
+            } else if in_video {
+                y = lv.black;
+                if let Some(a) = image_line {
+                    let px = (n - s.active_start) * 3;
+                    let (r, g, b) = if shifted {
+                        let sample = |c: usize| {
+                            let a = source_a.map_or(0.0, |line| line[px + c]);
+                            let b = source_b.map_or(0.0, |line| line[px + c]);
+                            a + (b - a) * source_frac
+                        };
+                        (sample(0), sample(1), sample(2))
+                    } else {
+                        let row = &frame.data[(2 * a + parity as usize) * aw * 3..];
+                        (row[px], row[px + 1], row[px + 2])
+                    };
+                    y = lv.black + span * (0.299 * r + 0.587 * g + 0.114 * b);
+                    if pal {
+                        i = sv * span * (0.615 * r - 0.515 * g - 0.100 * b);
+                        q = span * (-0.147 * r - 0.289 * g + 0.436 * b);
+                    } else {
+                        i = span * (0.5959 * r - 0.2746 * g - 0.3213 * b);
+                        q = span * (0.2115 * r - 0.5227 * g + 0.3112 * b);
+                    }
+                }
+            }
+            if has_vbi && !in_video {
+                y += vbi_y[n];
             }
             let mut y = y_lp.process(y);
             let i = i_lp.process(i);
             let q = q_lp.process(q);
 
-            if (n as f32) < sync_end_pos && hs.noise_ire > 0.0 {
+            if h_cov > 0.0 && hs.noise_ire > 0.0 {
                 y += hs_rng.normal() * hs.noise_ire;
+            }
+            if v_cov > 0.0 && vertical.noise_ire > 0.0 {
+                y += vs_rng.normal() * vertical.noise_ire;
             }
 
             let k = (n + base) & 3;
@@ -190,7 +240,7 @@ fn encode(frame: &VideoFrame, field: &mut Field, p: &EncoderParams, signal: &Sig
                 let q_rot = q * chroma_cos - i * chroma_sin;
                 cg * (1.0 - chroma_attenuation) * (q_rot * sin_iq[k] + i_rot * cos_iq[k])
             };
-            if burst.contains(&n) {
+            if info.burst && burst.contains(&n) {
                 if clean_burst {
                     if pal {
                         // -U 軸から V 側へ ±45°
@@ -213,7 +263,10 @@ fn encode(frame: &VideoFrame, field: &mut Field, p: &EncoderParams, signal: &Sig
                     c += burst_rng.normal() * burst_signal.noise_ire;
                 }
             }
-            if active.contains(&n) && chroma_signal.noise_ire > 0.0 {
+            if has_vbi && !in_video {
+                c += vbi_c[n];
+            }
+            if in_video && chroma_signal.noise_ire > 0.0 {
                 c += chroma_rng.normal() * chroma_signal.noise_ire;
             }
             match c_out.as_deref_mut() {

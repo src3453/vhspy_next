@@ -5514,6 +5514,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vhs-slang"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "pollster",
+ "serde_json",
+ "vhs-core",
+ "wgpu",
+]
+
+[[package]]
 name = "virtue"
 version = "0.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -6,7 +6,7 @@ use crate::capture::{CaptureSim, CodecStats};
 use crate::decoder::Decoder;
 use crate::deinterlace::Deinterlacer;
 use crate::dv::{DvSim, DvStats};
-use crate::encoder::{encode_field_with_signal, encode_field_yc_with_signal};
+use crate::encoder::{encode_field_full, encode_field_yc_with_signal};
 use crate::frame::{Field, LinearFrame, RgbFrame, RgbaFrame, VideoFrame};
 use crate::osd::Osd;
 use crate::params::{Connection, OsdMode, OsdParams, Params};
@@ -247,6 +247,8 @@ impl Pipeline {
         };
         let t_dv = Instant::now();
         let (mut t1, mut t1r, mut t2, mut t3) = (t_dv, t_dv, t_dv, t_dv);
+        // 画面に描いた行の偶奇 (受像機が垂直同期から決める。画面が流れているとフィールドの偶奇と一致しない)
+        let mut shown_parity = self.field.parity;
         if p.encoder.enabled {
             // S 映像はテープの再生出力を受像機へ直接つなぐときだけ (テープなし・テープ後の RF 接続はコンポジット)
             let svideo = p.output.connection == Connection::SVideo
@@ -257,7 +259,9 @@ impl Pipeline {
                 self.field.set_separate(svideo);
                 encode_field_yc_with_signal(input, &mut self.field, &p.encoder, &p.signal, p.seed);
             } else {
-                encode_field_with_signal(input, &mut self.field, &p.encoder, &p.signal, p.seed);
+                // 帰線区間の VBI データ・試験信号も送出側で載せる
+                self.field.set_separate(false);
+                encode_field_full(input, &mut self.field, &p.encoder, &p.signal, &p.vbi, p.seed);
             }
             t1 = Instant::now();
             // 放送受信: 受信時の劣化ごとテープに記録される (デッキ→テレビの RF とは独立した雑音)。
@@ -287,7 +291,7 @@ impl Pipeline {
                 self.rf.process(&mut self.field, &p.rf, p.seed);
             }
             t3 = Instant::now();
-            self.decoder.decode_field(
+            shown_parity = self.decoder.decode_field(
                 &self.field,
                 &p.decoder,
                 p.tape.enabled && !digital,
@@ -300,11 +304,15 @@ impl Pipeline {
         self.deinterlacer.process_field(
             &mut self.output,
             self.field_index,
-            self.field.parity,
+            shown_parity,
             p.output.deinterlace,
             &p.output.deinterlace_params,
         );
         let t4 = Instant::now();
+        // 受像機の字幕デコーダ (画面に重ねる文字なので、インターレース解除の後に描く)
+        if p.encoder.enabled && p.decoder.caption_display {
+            self.decoder.captions().render(&mut self.output, self.field_index);
+        }
         // コンポジット経路がない場合だけ、OSD をデジタル映像へ直接重ねる。
         if !p.encoder.enabled {
             if osd == Some(OsdMode::Composite) {

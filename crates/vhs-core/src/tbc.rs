@@ -18,6 +18,7 @@ use crate::decoder::find_sync_edge;
 use crate::filter::fractional_shift;
 use crate::frame::Field;
 use crate::params::TbcParams;
+use crate::raster;
 use crate::rng::Rng;
 use crate::timing::*;
 use rayon::prelude::*;
@@ -47,8 +48,8 @@ impl Tbc {
             sync_pos: s.sync_end as f32,
             lost: 0,
             held: 0.0,
-            corrections: vec![0.0; s.field_lines],
-            tmp: vec![0.0; s.field_lines * s.line_samples],
+            corrections: vec![0.0; s.raster_lines],
+            tmp: vec![0.0; s.raster_lines * s.line_samples],
         }
     }
 
@@ -59,7 +60,7 @@ impl Tbc {
 
     pub fn process(&mut self, field: &mut Field, p: &TbcParams, seed: u64) {
         let s = field.std;
-        let (fl, ls) = (s.field_lines, s.line_samples);
+        let (fl, ls) = (s.raster_lines, s.line_samples);
         if self.tmp.len() != fl * ls {
             *self = Self::new(s);
         }
@@ -107,6 +108,11 @@ impl Tbc {
         });
         let regen = p.regenerate_sync;
         let separate = field.separate;
+        // 同期を作り直すのは水平同期で始まるライン (垂直同期の区間の等化・幅広パルスと VBI のデータはそのまま通す)
+        let (frame, parity) = (field.frame, field.parity);
+        let hline: Vec<bool> =
+            (0..fl).map(|l| raster::line_info(s, s.stream_line(l, frame, parity)).has_hsync()).collect();
+        let hline = &hline;
         self.tmp.copy_from_slice(&field.data);
         let src = &self.tmp;
         field.data.par_chunks_mut(ls).enumerate().for_each(|(l, out)| {
@@ -118,7 +124,7 @@ impl Tbc {
                     *v = ((*v - lo) * k).round().clamp(0.0, steps) / k + lo;
                 }
             }
-            if regen {
+            if regen && hline[l] {
                 out[..s.sync_end].fill(lv.sync);
                 out[s.sync_end..s.burst_start].fill(lv.blank);
                 out[s.burst_end..s.active_start].fill(lv.blank);
@@ -130,7 +136,7 @@ impl Tbc {
             let src = &self.tmp;
             field.chroma.par_chunks_mut(ls).enumerate().for_each(|(l, out)| {
                 fractional_shift(&src[l * ls..(l + 1) * ls], out, -corr[l], 0.0);
-                if regen {
+                if regen && hline[l] {
                     out[..s.burst_start].fill(0.0);
                     out[s.burst_end..s.active_start].fill(0.0);
                     out[s.active_end().min(ls)..].fill(0.0);
@@ -158,7 +164,7 @@ mod tests {
                 s.ire.black
             };
         }
-        for l in 0..s.field_lines {
+        for l in 0..s.raster_lines {
             let off = offsets[l % offsets.len()];
             fractional_shift(&clean, &mut f.data[l * ls..(l + 1) * ls], off, s.ire.blank);
         }
@@ -186,7 +192,7 @@ mod tests {
         // 同期のスライスの偏り (全ラインで同じ) を差し引くため、ずれのない 0 ライン目と比べる
         let e0 = edge(&f.data[..ls]);
         assert!((e0 - 400.0).abs() < 1.0, "line 0: edge {e0}");
-        for l in 1..NTSC.field_lines {
+        for l in 1..NTSC.raster_lines {
             let e = edge(&f.data[l * ls..(l + 1) * ls]);
             assert!((e - e0).abs() < 0.2, "line {l}: edge {e} (line 0: {e0})");
         }

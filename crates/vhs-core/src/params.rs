@@ -17,6 +17,8 @@ pub struct Params {
     pub encoder: EncoderParams,
     /// 送出側コンポジット信号の同期・色信号の劣化
     pub signal: SignalParams,
+    /// 垂直帰線区間 (VBI) に重畳するデータ・試験信号
+    pub vbi: VbiParams,
     pub tape: TapeParams,
     /// DV の記録・再生 (tape.format が DV / Digital8 のとき)
     pub dv: DvParams,
@@ -54,19 +56,63 @@ pub struct SignalElementParams {
 
 /// コンポジット信号内の同期・色信号ごとの劣化。
 ///
-/// Field は有効映像ラインのみを保持する。垂直帰線波形は省略されているため、垂直同期の
-/// 減衰・雑音は受像機の同期ロックを失わせ、フィールドの上下位置ずれとして表現する。
+/// 信号は垂直帰線区間を含む全ラスタで作る。垂直同期の減衰・雑音は幅広パルス (垂直同期) そのものに掛かり、
+/// 受像機の垂直同期分離 (積分回路) が同期を取り損ねると、垂直発振器が自走して画面が流れる。
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct SignalParams {
-    /// 垂直同期: ジッタ [フィールドライン]、同期レベル減衰、同期雑音
+    /// 垂直同期: ジッタ (同期に対する映像の上下ずれ) [ライン]、幅広パルスの振幅減衰、幅広パルスの雑音
     pub vertical_sync: SignalElementParams,
-    /// 水平同期: ジッタ [サンプル]、パルス振幅減衰、雑音
+    /// 水平同期: ジッタ [サンプル]、パルス振幅減衰 (等化パルスも)、雑音
     pub horizontal_sync: SignalElementParams,
     /// カラーバースト: 位相ジッタ [度]、バースト振幅減衰、雑音
     pub color_burst: SignalElementParams,
     /// 色副搬送波 (有効映像中): 位相ジッタ [度]、色信号減衰、雑音
     pub chroma_subcarrier: SignalElementParams,
+}
+
+/// 垂直帰線区間 (VBI) に重畳する信号 (送出側)。画面の外にあるが、受像機の垂直同期が外れて画面が流れたとき、
+/// 画面の上下位置をずらしたとき、くし形フィルタやドロップアウト補償が隣のラインを使うときに見えてくる。
+/// テープにもそのまま記録される (ただし帯域の狭い VHS ではテレテキストは潰れる)
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct VbiParams {
+    pub enabled: bool,
+    /// クローズドキャプション (EIA-608、ライン 21 / 284)。NTSC のみ
+    pub closed_caption: bool,
+    /// 字幕として送る文 (改行か `\n` の 2 文字で行を分ける)。`*斜体*` `_下線_` `{red}` などで属性を変えられる
+    pub caption_text: String,
+    /// 字幕の送り方 (ポップオン・ロールアップ・ペイントオン)
+    pub caption_mode: crate::caption::CaptionMode,
+    /// 字幕を送るチャンネル (1〜4 = CC1〜CC4。CC3/CC4 はライン 284)
+    pub caption_channel: u8,
+    /// VITC (垂直間隔タイムコード、SMPTE 12M)。NTSC ライン 14/16、PAL ライン 19/21
+    pub vitc: bool,
+    /// VITS (挿入試験信号: 白バー・2T パルス・変調階段波・マルチバースト)
+    pub vits: bool,
+    /// 文字多重 (PAL: WST テレテキスト、NTSC: NABTS)
+    pub teletext: bool,
+    /// 文字多重に使うライン数 (フィールドあたり)
+    pub teletext_lines: u32,
+    /// 画面サイズ・複製制御の識別信号 (PAL: WSS ライン 23、NTSC: IEC 61880 ライン 20)
+    pub wss: bool,
+}
+
+impl Default for VbiParams {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            closed_caption: true,
+            caption_text: r"VHS NEXT CLOSED CAPTION TEST\nTHE QUICK BROWN FOX\nJUMPS OVER THE LAZY DOG".into(),
+            caption_mode: crate::caption::CaptionMode::PopOn,
+            caption_channel: 1,
+            vitc: false,
+            vits: true,
+            teletext: false,
+            teletext_lines: 8,
+            wss: false,
+        }
+    }
 }
 
 /// 入力映像の画質調整。昔のビデオカメラの甘いレンズ・強い輪郭強調・色の癖などを作る。
@@ -628,6 +674,19 @@ pub struct DecoderParams {
     pub brightness: f32,
     pub saturation: f32,
     pub hue_deg: f32,
+    /// 垂直ホールド: 垂直発振器の自走周波数のずれ [%]。負 (自走が遅い) なら垂直同期で引き込まれる。
+    /// 正や大きく負にずらすと同期を取れず、画面が上下に流れる (帰線区間の黒帯が見える)
+    pub v_hold_pct: f32,
+    /// 垂直同期を受け付ける範囲 (自走周期の終わりからの割合)。広いほど引き込みやすいが雑音で誤トリガしやすい
+    pub v_sync_window: f32,
+    /// 垂直同期分離の積分回路の時定数 [µs]
+    pub v_integrator_us: f32,
+    /// 画面の上下位置 [ライン]。負にすると帰線区間 (VBI のデータ・試験信号) が画面の上に見えてくる
+    pub vertical_position: f32,
+    /// 字幕デコーダ: ライン 21 / 284 のクローズドキャプションを解読して画面に出す (NTSC)
+    pub caption_display: bool,
+    /// 字幕デコーダで表示するチャンネル (1〜4 = CC1〜CC4)
+    pub caption_channel: u8,
 }
 
 impl Default for DecoderParams {
@@ -651,6 +710,12 @@ impl Default for DecoderParams {
             brightness: 0.0,
             saturation: 1.0,
             hue_deg: 0.0,
+            v_hold_pct: -4.0,
+            v_sync_window: 0.2,
+            v_integrator_us: 30.0,
+            vertical_position: 0.0,
+            caption_display: false,
+            caption_channel: 1,
         }
     }
 }
