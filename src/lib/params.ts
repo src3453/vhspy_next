@@ -81,6 +81,10 @@ export type Params = {
     teletext: boolean;
     teletext_system: "nabts" | "jtes";
     teletext_lines: number;
+    jtes_program: number;
+    jtes_header: string;
+    jtes_pages: string;
+    jtes_superimpose: boolean;
     wss: boolean;
   };
   tape: {
@@ -195,6 +199,9 @@ export type Params = {
     vertical_position: number;
     caption_display: boolean;
     caption_channel: number;
+    teletext_display: boolean;
+    teletext_program: number;
+    teletext_page: number;
   };
   capture: {
     enabled: boolean;
@@ -682,6 +689,10 @@ export const groups: Group[] = [
         ],
       },
       r("vbi.teletext_lines", "文字多重のライン数", 1, 16, 1, "line"),
+      r("vbi.jtes_program", "JTES: 送る番組番号", 0, 999, 1),
+      { kind: "text", path: "vbi.jtes_header", label: "JTES: ヘッダ文", placeholder: "VHS NEXT 文字放送" },
+      { kind: "markup", path: "vbi.jtes_pages", label: "JTES: ページ (--- の行で区切る)" },
+      b("vbi.jtes_superimpose", "JTES: スーパー (映像に重ねる)"),
       b("vbi.wss", "WSS / CGMS-A (画面サイズ識別)"),
     ],
   },
@@ -726,6 +737,9 @@ export const groups: Group[] = [
       r("decoder.vertical_position", "画面の上下位置", -30, 30, 0.5, "line"),
       b("decoder.caption_display", "字幕デコーダ (ライン 21 / 284)"),
       r("decoder.caption_channel", "字幕デコーダのチャンネル (CC1〜CC4)", 1, 4, 1),
+      b("decoder.teletext_display", "文字放送受信機 (JTES)"),
+      r("decoder.teletext_program", "文字放送: 番組番号", 0, 999, 1),
+      r("decoder.teletext_page", "文字放送: ページ", 1, 99, 1),
     ],
   },
   {
@@ -1020,12 +1034,19 @@ export const help: Record<string, string> = {
   "vbi.teletext": "PAL は WST テレテキスト (6.9 Mbit/s)、NTSC は NABTS。VHS の輝度帯域では潰れて灰色の帯になる。",
   "vbi.teletext_system": "NTSC の文字多重の方式。JTES は日本の文字放送 (ITU-R System D) で、14〜16・21 H / 277〜279・284 H のうち字幕・VITC が使っていないラインに、(272,190) 符号付きの 296 ビットのデータラインを送る。PAL は常に WST。",
   "vbi.teletext_lines": "文字多重に使うライン数 (フィールドあたり)。",
+  "vbi.jtes_program": "JTES で送る番組の番号 (マガジン 1)。受像機の文字放送受信機で同じ番号を選ぶと見える。番組は最初のライン対 (例: 14 H / 277 H) で 1 フィールドに 1 パケットずつ送る。",
+  "vbi.jtes_header": "各ページの上端 (ヘッダ文表示領域、小形文字) に出す文。後ろに番組・ページ番号が付く。{red} などの色指定が使える。",
+  "vbi.jtes_pages": "ページの本文。--- だけの行でページを分け、上から 1, 2, 3… ページになる。標準の文字で 1 行 15 字 × 8 行。\n{red} {green} {yellow} {blue} {magenta} {cyan} {white} {black} で文字色、{dim-red} などで半輝度、{bg:blue} で背景色 ({bg:none} で透明)、{small} {medium} {normal} {wide} {tall} {double} で大きさ、{flash}…{/flash} でフラッシング、{reverse}…{/reverse} で反転。漢字は JIS 第 1・第 2 水準 (1983 年版) の字だけ送れる (ない字は〓)。",
+  "vbi.jtes_superimpose": "ページデータヘッダのスーパーを立てる。受信機はラスタ (青い背景) を塗らず、テレビ映像に文字を重ねる。",
   "vbi.wss": "PAL はライン 23 前半の WSS、NTSC はライン 20 の CGMS-A (IEC 61880)。",
   "decoder.v_hold_pct": "垂直発振器の自走周波数のずれ。少し負 (自走が遅い) なら垂直同期で引き込まれる。正や大きく負にすると同期が取れず、画面が上下に流れて帰線区間の黒帯が見える。",
   "decoder.v_sync_window": "自走周期の終わりから、垂直同期を受け付ける範囲の割合。広いと引き込みやすいが、雑音で早めにトリガして画面が跳ねやすい。",
   "decoder.v_integrator_us": "垂直同期分離の RC 積分の時定数。短いと水平同期・雑音でも誤トリガし、長いと弱い同期を取り損ねる。",
   "decoder.vertical_position": "画面の上下位置。負にすると画面が下がり、上に帰線区間 (VITS・字幕のデータ) が見えてくる。",
   "decoder.caption_display": "受像機の字幕デコーダ (EIA-608)。垂直同期から数えたライン 21 / 284 を読み、32 桁 × 15 行の字幕を画面に出す。パリティ誤りの文字は■、取れなかったバイトは抜ける。",
+  "decoder.teletext_display": "受像機の文字放送受信機 (JTES)。14〜16・21 H / 277〜279・284 H のデータラインをスライスし、(272,190) 符号で誤り訂正、CRC で検査したデータグループからページを蓄えて、選んだページを 16 ドット漢字 ROM の字形で画面に出す。ページが届くまでは「さがしています」と出る。VHS の輝度帯域ではデータが潰れるので、テープを通すと受からない。",
+  "decoder.teletext_program": "受信する番組番号。送出側の番組番号と合わないと何も受からない。",
+  "decoder.teletext_page": "表示するページ。ページは数秒ごとに巡回して送られるので、切り替えてから表示まで少し待つ。",
   "decoder.caption_channel": "表示する字幕のチャンネル。CC1 が普通の字幕、CC3 は第 2 フィールドの字幕 (第 2 言語など)。",
   "signal.horizontal_sync.jitter": "ラインごとの水平同期後縁の揺れ (rms)。水平 AFC が追従しきれないと画像が左右に揺れる。",
   "signal.horizontal_sync.attenuation_pct": "水平同期パルスの振幅を下げる。弱すぎると水平 AFC が同期を見失う。",

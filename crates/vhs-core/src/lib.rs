@@ -28,6 +28,7 @@ pub mod raster;
 pub mod rf;
 pub mod rng;
 pub mod tape;
+pub mod teletext;
 pub mod tbc;
 pub mod timing;
 pub mod vbi;
@@ -672,6 +673,35 @@ mod tests {
         }
         let rows = dec.captions().rows();
         assert!(rows.iter().any(|r| r.contains("VHS NEXT CLOSED CAPTION TEST")), "{rows:?}");
+    }
+
+    /// 文字放送 (JTES) を送り、受像機の文字放送受信機で選んだページを組み立てる
+    #[test]
+    fn teletext_receiver_reads_jtes_page() {
+        let s = &timing::NTSC;
+        let mut p = Params::default();
+        p.vbi.teletext = true;
+        p.vbi.teletext_system = params::TeletextSystem::Jtes;
+        p.vbi.jtes_pages = "{red}一ページ目\n---\n二ページ目の本文".into();
+        p.decoder.teletext_display = true;
+        p.decoder.teletext_page = 2;
+        let (w, h) = s.image_size();
+        let video = VideoFrame::new(w, h);
+        let mut field = frame::Field::new(s);
+        let mut dec = decoder::Decoder::new(s);
+        let mut out = RgbaFrame::new(w, h);
+        // 1 ページ目の送出単位 + 間隔 (3 倍 + 1 秒) の後に 2 ページ目が来る
+        for i in 0..160 {
+            field.set_index(i);
+            encoder::encode_field_full(&video, &mut field, &p.encoder, &p.signal, &p.vbi, 1);
+            dec.decode_field(&field, &p.decoder, false, &mut out);
+        }
+        let rx = &dec.teletext().receiver;
+        assert_eq!(rx.stats.crc_errors, 0, "{:?}", rx.stats);
+        assert_eq!(rx.page_numbers(), vec![1, 2]);
+        let text = dec.teletext().screen().unwrap().text();
+        assert!(text.contains("VHS NEXT 文字放送") || text.contains("ＶＨＳ"), "{text}");
+        assert!(text.ends_with("二ページ目の本文"), "{text}");
     }
 }
 

@@ -108,6 +108,7 @@ pub struct Decoder {
     caption: CaptionDecoder,
     /// 字幕を読んだ直前の帰線 (同じ画面を 2 回読まない)
     caption_last: Option<i64>,
+    teletext: crate::teletext::TeletextDecoder,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -178,12 +179,18 @@ impl Decoder {
             noise_reduction: NoiseReduction::default(),
             caption: CaptionDecoder::default(),
             caption_last: None,
+            teletext: Default::default(),
         }
     }
 
     /// 字幕デコーダ (表示中の字幕と、画面への描画)
     pub fn captions(&self) -> &CaptionDecoder {
         &self.caption
+    }
+
+    /// 文字放送受信機 (選んだページの画面と、画面への描画)
+    pub fn teletext(&self) -> &crate::teletext::TeletextDecoder {
+        &self.teletext
     }
 }
 
@@ -290,6 +297,7 @@ impl Decoder {
             self.v_last = start as f64 - period * (1.0 - p.v_sync_window.clamp(0.02, 0.9) as f64);
             self.v_free_hold = start as f64 + period;
             self.caption.reset();
+            self.teletext.reset();
         }
         self.next_stream = Some(end);
 
@@ -593,6 +601,26 @@ impl Decoder {
         } else {
             self.caption.reset();
             self.caption_last = None;
+        }
+
+        // --- 文字放送受信機: 14〜16・21 H (第 2 フィールドは 277〜279・284 H) を読む ---
+        if p.teletext_display && !pal {
+            let page = p.teletext_page.clamp(1, 99);
+            self.teletext.receiver.select(1, p.teletext_program.min(999), page);
+            let key = (2.0 * retrace).round() as i64;
+            if self.teletext.last != Some(key) {
+                self.teletext.last = Some(key);
+                let packets: Vec<_> = vbi::JTES_LINES[0]
+                    .iter()
+                    .filter_map(|&n| {
+                        let j = (retrace + n as f64 - s.vsync_line[0] as f64 + 0.5 * row0 as f64).round() as i64;
+                        line_ok(j).then(|| vbi::slice_jtes(s, self.luma.line(j as u64))).flatten()
+                    })
+                    .collect();
+                self.teletext.feed(packets);
+            }
+        } else if self.teletext.last.is_some() {
+            self.teletext.reset();
         }
         row0
     }

@@ -325,6 +325,9 @@ impl Pipeline {
         if p.encoder.enabled && p.decoder.caption_display {
             self.decoder.captions().render(&mut self.output, self.field_index);
         }
+        if p.encoder.enabled && p.decoder.teletext_display {
+            self.decoder.teletext().render(&mut self.output, self.field_index);
+        }
         // コンポジット経路がない場合だけ、OSD をデジタル映像へ直接重ねる。
         if !p.encoder.enabled {
             if osd == Some(OsdMode::Composite) {

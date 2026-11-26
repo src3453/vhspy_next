@@ -106,6 +106,14 @@ pub struct VbiParams {
     pub teletext_system: TeletextSystem,
     /// 文字多重に使うライン数 (フィールドあたり)
     pub teletext_lines: u32,
+    /// JTES で送る番組の番号 (マガジン 1、0〜999)。最初のライン対で送出第1モードで送る
+    pub jtes_program: u16,
+    /// JTES のヘッダ文 (各ページの上端の 1 行。番組・ページ番号を後ろに付ける)
+    pub jtes_header: String,
+    /// JTES のページの本文 (簡易マークアップ)。`---` だけの行でページを分ける (1 ページ目から順に番号を振る)
+    pub jtes_pages: String,
+    /// JTES のページをスーパー (ラスタ透明) で送る
+    pub jtes_superimpose: bool,
     /// 画面サイズ・複製制御の識別信号 (PAL: WSS ライン 23、NTSC: IEC 61880 ライン 20)
     pub wss: bool,
 }
@@ -123,10 +131,35 @@ impl Default for VbiParams {
             teletext: false,
             teletext_system: TeletextSystem::Nabts,
             teletext_lines: 8,
+            jtes_program: 100,
+            jtes_header: "{cyan}VHS NEXT 文字放送".into(),
+            jtes_pages: DEFAULT_JTES_PAGES.into(),
+            jtes_superimpose: false,
             wss: false,
         }
     }
 }
+
+/// JTES の既定のページ
+pub const DEFAULT_JTES_PAGES: &str = "{yellow}{double}文字放送
+{white}{normal}これは試験放送です。
+{green}ＢＴ.６５３ Ｄ方式
+{white}２９６ビットのデータラインで
+送っています。
+{cyan}つぎのページへ →
+---
+{bg:red}{white} 天気予報 {bg:none}
+
+{white}東京　{yellow}晴れ{white}のち{dim-white}くもり
+{white}大阪　{cyan}雨
+{white}札幌　{white}雪
+
+{flash}{red}大雨注意報{/flash}
+---
+{magenta}{wide}ニュース{normal}
+
+{white}ビデオテープの{yellow}VHS{white}は
+１９７６年に発売されました。";
 
 /// NTSC の文字多重の方式
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -757,6 +790,12 @@ pub struct DecoderParams {
     pub caption_display: bool,
     /// 字幕デコーダで表示するチャンネル (1〜4 = CC1〜CC4)
     pub caption_channel: u8,
+    /// 文字放送受信機 (JTES): 14〜16・21 H / 277〜279・284 H を読み、選んだ番組・ページを画面に出す (NTSC)
+    pub teletext_display: bool,
+    /// 文字放送受信機で選ぶ番組番号 (マガジン 1、0〜999)
+    pub teletext_program: u16,
+    /// 文字放送受信機で選ぶページ番号 (1〜99)
+    pub teletext_page: u8,
 }
 
 impl Default for DecoderParams {
@@ -787,6 +826,9 @@ impl Default for DecoderParams {
             vertical_position: 0.0,
             caption_display: false,
             caption_channel: 1,
+            teletext_display: false,
+            teletext_program: 100,
+            teletext_page: 1,
         }
     }
 }

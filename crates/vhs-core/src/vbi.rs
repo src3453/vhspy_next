@@ -424,7 +424,7 @@ fn render_teletext(s: &Standard, info: &LineInfo, p: &VbiParams, y: &mut [f32]) 
         let period = s.line_samples as f32 / 444.0;
         nrz(y, &bits, us(s, 10.3), period, period, 462.0 / 7.0);
     } else if p.teletext_system == TeletextSystem::Jtes {
-        let packet = jtes_packet(s, info);
+        let packet = jtes_packet(s, info, p);
         jtes::wave::render(y, &packet, &jtes_format(s));
     } else {
         // NABTS: ランイン、フレーミングコード 0xE7、33 バイトのパケット (内容は擬似乱数)
@@ -442,15 +442,76 @@ pub fn jtes_format(s: &Standard) -> jtes::LineFormat {
     jtes::LineFormat::for_line(s.line_samples as f32, 100.0)
 }
 
+/// 送る番組の内容 (GUI のパラメタから)
+pub fn jtes_program(p: &VbiParams) -> jtes::program::ProgramSpec {
+    let mut pages = Vec::new();
+    let mut cur = String::new();
+    // 1 行の入力欄で書いた `\n` の 2 文字も改行とみなす
+    let src = p.jtes_pages.replace("\r\n", "\n").replace("\\n", "\n");
+    for line in src.lines().chain(std::iter::once("---")) {
+        if line.trim() == "---" {
+            let body = cur.trim_end().to_string();
+            if !body.is_empty() {
+                pages.push(body);
+            }
+            cur.clear();
+        } else {
+            cur.push_str(line);
+            cur.push('\n');
+        }
+    }
+    let number = p.jtes_program.min(999);
+    let pages = pages
+        .into_iter()
+        .take(99)
+        .enumerate()
+        .map(|(i, body)| {
+            let page = i as u8 + 1;
+            // ヘッダ文は小形 (8 × 12) で 31 字。後ろに番組・ページ番号を付ける
+            let header = format!("{} {{white}}{number:03}-{page:02}", p.jtes_header);
+            jtes::program::PageSpec { number: page, header, body }
+        })
+        .collect();
+    jtes::program::ProgramSpec { magazine: 1, number, superimpose: p.jtes_superimpose, pages }
+}
+
+/// 番組の送出 1 周ぶんのパケット (パラメタが変わるまで使い回す)
+fn jtes_cycle(s: &Standard, p: &VbiParams) -> std::sync::Arc<Vec<jtes::Packet>> {
+    use std::sync::{Arc, Mutex};
+    type Cache = Option<(jtes::program::ProgramSpec, usize, Arc<Vec<jtes::Packet>>)>;
+    static CACHE: Mutex<Cache> = Mutex::new(None);
+    let spec = jtes_program(p);
+    // 1 ライン対で 1 フィールドに 1 パケット
+    let rate = (s.fs / s.line_samples as f32 / s.total_lines_per_field as f32).round() as usize;
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((k, r, c)) = cache.as_ref()
+        && *k == spec
+        && *r == rate
+    {
+        return c.clone();
+    }
+    let c = Arc::new(jtes::program::cycle(&spec, rate.max(1)));
+    *cache = Some((spec, rate, c.clone()));
+    c
+}
+
 /// このラインで送る JTES のパケット。
-/// TODO: データグループ・番組データの層ができるまでは、送出第1モードの空パケット (全 NUL) を送る。
-/// 連続性指標はラインごとに、フィールドが進むたびに 1 ずつ巡回させる
-fn jtes_packet(s: &Standard, info: &LineInfo) -> jtes::Packet {
+/// 番組は最初のライン対 (n H と n + 263 H) で送出第1モードで送り、フィールドごとに 1 パケット進める
+/// (省令: 1 番組は 1 本の H と次のフィールドの対応する H を使う)。ほかのライン対は送出第2モードの空パケット。
+/// 連続性指標はフィールドが進むたびに 1 ずつ巡回させる
+fn jtes_packet(s: &Standard, info: &LineInfo, p: &VbiParams) -> jtes::Packet {
     let second_field = info.number > s.frame_total_lines / 2 + 1;
     let field = info.frame * 2 + second_field as u64;
-    let mut p = jtes::Packet::empty(jtes::Service::Mode1, (field % 16) as u8);
-    p.transmission_start = field == 0;
-    p
+    let ci = (field % 16) as u8;
+    let first_pair = JTES_LINES
+        .iter()
+        .find_map(|f| f.iter().position(|&m| m == info.number))
+        .is_some_and(|i| (0..i).all(|k| !JTES_LINES.iter().all(|f| service_fixed_free(s, f[k], p))));
+    if !first_pair {
+        return jtes::Packet::empty(jtes::Service::Mode2, ci);
+    }
+    let cyc = jtes_cycle(s, p);
+    jtes::Packet { continuity: ci, ..cyc[(field % cyc.len() as u64) as usize].clone() }
 }
 
 /// AFC 後の輝度ライン (IRE) から JTES のパケットを取り出して誤り訂正する。(パケット, 訂正したビット数)
@@ -582,7 +643,7 @@ mod tests {
                 let mut lp = crate::filter::Cascade::butter_lowpass_at(4, 4.2e6, s.fs);
                 lp.process_slice(&mut y);
                 let (packet, corrected) = slice_jtes(s, &y).unwrap_or_else(|| panic!("{:?} line {n}", s.kind));
-                assert_eq!(packet, jtes_packet(s, &info));
+                assert_eq!(packet, jtes_packet(s, &info, &p));
                 assert!(corrected <= 2, "{corrected}");
             }
         }
