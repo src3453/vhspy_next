@@ -22,7 +22,7 @@
 use crate::filter::{Biquad, Cascade, fractional_shift};
 use crate::frame::{Field, RgbaFrame};
 use crate::nr::NoiseReduction;
-use crate::params::{DecoderParams, YcSeparation};
+use crate::params::{ChromaDemod, DecoderParams, YcSeparation};
 use crate::raster;
 use crate::timing::*;
 use crate::caption::CaptionDecoder;
@@ -281,7 +281,7 @@ impl Decoder {
             *self = Self::new(s);
         }
         let ls = s.line_samples;
-        let lv = s.ire;
+        let lv = s.ire.with_setup(p.setup);
         let pal = s.is_pal();
         let start = field.stream_line(0);
         let n_new = s.stream_lines(field.parity);
@@ -467,15 +467,26 @@ impl Decoder {
         let line_ok = |j: i64| j >= oldest as i64 && j < end as i64;
 
         // --- 同期検波 (ライン並列) ---
-        let c_lp = Cascade::butter_lowpass_at(2, p.chroma_bw_mhz * 1e6, s.fs);
+        // 色差のローパス。det_a (NTSC: I / PAL: V) と det_b (NTSC: Q / PAL: U) で帯域を変えられる
+        let demod = if pal { ChromaDemod::Iq } else { p.chroma_demod };
+        let (bw_a, bw_b) = match demod {
+            ChromaDemod::Iq => (p.chroma_bw_mhz, p.chroma_bw_mhz),
+            ChromaDemod::IqWide => (p.chroma_bw_mhz, p.narrow_bw_mhz),
+            ChromaDemod::RyBy | ChromaDemod::Xz => (p.narrow_bw_mhz, p.narrow_bw_mhz),
+        };
+        let c_lp_a = Cascade::butter_lowpass_at(2, bw_a.max(0.01) * 1e6, s.fs);
+        let c_lp_b = if bw_b == bw_a { c_lp_a } else { Cascade::butter_lowpass_at(2, bw_b.max(0.01) * 1e6, s.fs) };
+        let matrix = chroma_matrix(demod, p);
         // NTSC は I/Q 軸 (U/V から 33°) で検波する。PAL は U/V 軸のまま
         let hue = if pal { p.hue_deg.to_radians() } else { p.hue_deg.to_radians() + 33f32.to_radians() };
         let (active_start, active_end) = (s.active_start, s.active_end());
         // 輝度遅延線: 実機は色の経路 (バンドパス + 復調後のローパス) の遅れに合わせて輝度を遅らせる。
         // ここでは同じだけ色を前へ出す
         let luma_delay = if separate || use_comb || use_3d { 0.0 } else { notch.group_delay(1e3, s.fs) };
-        let chroma_lead =
-            (c_bp.group_delay(s.fsc, s.fs) + c_lp.group_delay(1e3, s.fs) - luma_delay).round().max(0.0) as usize;
+        // I/Q 復調では帯域の広い (遅れの小さい) I を遅延線で Q に揃える。ここではそれぞれの遅れだけ前へ出す
+        let lead = |lp: &Cascade| (c_bp.group_delay(s.fsc, s.fs) + lp.group_delay(1e3, s.fs) - luma_delay).round().max(0.0) as usize;
+        let (lead_a, lead_b) = (lead(&c_lp_a), lead(&c_lp_b));
+        let lead_max = lead_a.max(lead_b);
         let (chroma, line_refs) = (&self.chroma, &self.line_refs);
         self.det_a.par_chunks_mut(aw).zip(self.det_b.par_chunks_mut(aw)).enumerate().for_each(|(k, (da, db))| {
             let j = j0 + k as i64;
@@ -493,17 +504,19 @@ impl Decoder {
                 cos_t[q] = a.cos();
                 sin_t[q] = a.sin();
             }
-            let (mut alp, mut blp) = (c_lp, c_lp);
+            let (mut alp, mut blp) = (c_lp_a, c_lp_b);
             let (mut a, mut b) = (0.0, 0.0);
-            for n in 0..active_end + chroma_lead {
+            for n in 0..active_end + lead_max {
                 if n < ls {
                     a = alp.process(2.0 * c[n] * cos_t[n & 3]);
                     b = blp.process(2.0 * c[n] * sin_t[n & 3]);
                 }
                 // ラインの終わりを越えたぶんは最後の値を保つ
-                if n >= active_start + chroma_lead {
-                    da[n - active_start - chroma_lead] = a;
-                    db[n - active_start - chroma_lead] = b;
+                if n >= active_start + lead_a && n < active_end + lead_a {
+                    da[n - active_start - lead_a] = a;
+                }
+                if n >= active_start + lead_b && n < active_end + lead_b {
+                    db[n - active_start - lead_b] = b;
                 }
             }
         });
@@ -578,7 +591,8 @@ impl Decoder {
                 let (r, g, b) = if pal {
                     (yy + 1.140 * v[x], yy - 0.395 * u[x] - 0.581 * v[x], yy + 2.032 * u[x])
                 } else {
-                    (yy + 0.956 * u[x] + 0.619 * v[x], yy - 0.272 * u[x] - 0.647 * v[x], yy - 1.106 * u[x] + 1.703 * v[x])
+                    let [mr, mg, mb] = matrix;
+                    (yy + mr[0] * u[x] + mr[1] * v[x], yy + mg[0] * u[x] + mg[1] * v[x], yy + mb[0] * u[x] + mb[1] * v[x])
                 };
                 let o = x * 4;
                 dst[o] = to_u8(r);
@@ -741,7 +755,7 @@ impl Decoder {
             };
             self.pll_prev = Some(phase);
 
-            let mut gain = p.saturation / s.ire.span();
+            let mut gain = p.saturation / s.ire.with_setup(p.setup).span();
             if p.acc {
                 gain *= (s.ire.burst / b.amp.max(1e-3)).min(8.0);
             }
@@ -749,6 +763,38 @@ impl Decoder {
                 gain = 0.0;
             }
             self.line_refs[(sl % cap) as usize] = LineRef { phase, sv, gain };
+        }
+    }
+}
+
+/// NTSC: I/Q 検波出力 (I, Q) から色差 (R-Y, G-Y, B-Y) への係数。
+///
+/// R-Y/B-Y・X/Z 復調は「その軸で検波する」方式だが、検波後のローパスが同じなら
+/// I/Q で検波してから軸へ射影したものと同じなので、ここでは係数の違いとして持つ
+fn chroma_matrix(demod: ChromaDemod, p: &DecoderParams) -> [[f32; 2]; 3] {
+    // B-Y 軸を 0° としたときの角度 θ の軸で検波した出力 (I 軸 = 123°、Q 軸 = 33°)
+    let axis = |deg: f32| {
+        let t = (deg - 33.0).to_radians();
+        [t.sin(), t.cos()]
+    };
+    let comb = |a: [f32; 2], ka: f32, b: [f32; 2], kb: f32| [ka * a[0] + kb * b[0], ka * a[1] + kb * b[1]];
+    match demod {
+        ChromaDemod::Iq | ChromaDemod::IqWide => [[0.956, 0.619], [-0.272, -0.647], [-1.106, 1.703]],
+        ChromaDemod::RyBy => {
+            // V = 0.877(R-Y)、U = 0.493(B-Y)
+            let ry = comb(axis(90.0), 1.0 / 0.877, [0.0; 2], 0.0);
+            let by = comb(axis(0.0), 1.0 / 0.493, [0.0; 2], 0.0);
+            // G-Y 増幅トランジスタのベースへ R-Y・B-Y を足し込むマトリクス
+            [ry, comb(ry, -0.51, by, -0.19), by]
+        }
+        ChromaDemod::Xz => {
+            // 色差増幅管 (増幅率 −A、ここでは反転込みで X・Z の利得に含める) のカソードは 3 本共通で、
+            // E_K = k(E_X + E_Z)。グリッドから見ると −E_K が加わる:
+            //   R-Y = −A(E_X − E_K)、B-Y = −A(E_Z − E_K)、G-Y = −A(−E_K) (G-Y 管のグリッドは無入力)
+            let k = p.xz_cathode_k.clamp(0.0, 1.0 / 3.0);
+            let x = comb(axis(p.xz_x_axis_deg), p.xz_x_gain, [0.0; 2], 0.0);
+            let z = comb(axis(p.xz_z_axis_deg), p.xz_z_gain, [0.0; 2], 0.0);
+            [comb(x, 1.0 - k, z, -k), comb(x, -k, z, -k), comb(x, -k, z, 1.0 - k)]
         }
     }
 }

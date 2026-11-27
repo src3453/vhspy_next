@@ -63,7 +63,7 @@ export type Params = {
     white_clip: number;
     camera_gamma: number;
   };
-  encoder: { enabled: boolean; luma_bw_mhz: number; i_bw_mhz: number; q_bw_mhz: number; uv_bw_mhz: number; chroma_gain: number; burst_level_pct: number };
+  encoder: { enabled: boolean; luma_bw_mhz: number; i_bw_mhz: number; q_bw_mhz: number; uv_bw_mhz: number; chroma_gain: number; burst_level_pct: number; setup: Setup; white_point: WhitePoint };
   signal: {
     vertical_sync: { jitter: number; attenuation_pct: number; noise_ire: number };
     horizontal_sync: { jitter: number; attenuation_pct: number; noise_ire: number };
@@ -188,6 +188,15 @@ export type Params = {
     motion_adaptive: boolean;
     frame_buffer_bits: number;
     chroma_bw_mhz: number;
+    setup: Setup;
+    white_point: WhitePoint;
+    chroma_demod: "iq" | "iq_wide" | "ry_by" | "xz";
+    narrow_bw_mhz: number;
+    xz_x_axis_deg: number;
+    xz_x_gain: number;
+    xz_z_axis_deg: number;
+    xz_z_gain: number;
+    xz_cathode_k: number;
     acc: boolean;
     color_killer: boolean;
     h_pll: number;
@@ -668,6 +677,21 @@ export const groups: Group[] = [
       r("encoder.uv_bw_mhz", "U/V 帯域 (PAL)", 0.2, 3, 0.05, "MHz"),
       r("encoder.chroma_gain", "色ゲイン", 0, 3, 0.01),
       r("encoder.burst_level_pct", "バースト振幅", 0, 300, 1, "%"),
+      {
+        kind: "select", path: "encoder.setup", label: "セットアップ (黒レベル)",
+        options: [
+          { value: "auto", label: "方式の標準 (NTSC 7.5 / PAL 0 IRE)" },
+          { value: "ire7_5", label: "7.5 IRE (RS-170A / SMPTE 170M)" },
+          { value: "ire0", label: "0 IRE (旧 NTSC-J)" },
+        ],
+      },
+      {
+        kind: "select", path: "encoder.white_point", label: "番組の基準白",
+        options: [
+          { value: "d65", label: "D65 (SMPTE 170M)" },
+          { value: "d93", label: "D93 (9300 K + 27 MPCD・日本)" },
+        ],
+      },
     ],
   },
   {
@@ -747,6 +771,36 @@ export const groups: Group[] = [
       r("decoder.motion_threshold_ire", "3D: 動き検出しきい値", 0.5, 20, 0.5, "IRE"),
       r("decoder.frame_buffer_bits", "3D: バッファのビット数 (0 = なし)", 0, 12, 1, "bit"),
       r("decoder.chroma_bw_mhz", "色差帯域", 0.2, 3, 0.05, "MHz"),
+      {
+        kind: "select", path: "decoder.setup", label: "受像機のセットアップ",
+        options: [
+          { value: "auto", label: "方式の標準 (NTSC 7.5 / PAL 0 IRE)" },
+          { value: "ire7_5", label: "7.5 IRE (RS-170A / SMPTE 170M)" },
+          { value: "ire0", label: "0 IRE (旧 NTSC-J)" },
+        ],
+      },
+      {
+        kind: "select", path: "decoder.white_point", label: "受像機の色温度",
+        options: [
+          { value: "d65", label: "D65 (SMPTE 170M)" },
+          { value: "d93", label: "D93 (9300 K + 27 MPCD・日本)" },
+        ],
+      },
+      {
+        kind: "select", path: "decoder.chroma_demod", label: "色復調方式",
+        options: [
+          { value: "iq", label: "I/Q (同帯域・理想)" },
+          { value: "iq_wide", label: "I/Q (I 広帯域・Q 狭帯域)" },
+          { value: "ry_by", label: "R-Y・B-Y 2 軸 (IC 時代)" },
+          { value: "xz", label: "X・Z 2 軸 (真空管時代)" },
+        ],
+      },
+      r("decoder.narrow_bw_mhz", "狭帯域側の色差帯域", 0.1, 1.5, 0.05, "MHz"),
+      r("decoder.xz_x_axis_deg", "X 復調軸", 0, 180, 0.1, "°"),
+      r("decoder.xz_x_gain", "X 復調利得", 0, 4, 0.01),
+      r("decoder.xz_z_axis_deg", "Z 復調軸", -90, 90, 0.1, "°"),
+      r("decoder.xz_z_gain", "Z 復調利得", 0, 4, 0.01),
+      r("decoder.xz_cathode_k", "共通カソード結合 k", 0, 0.333, 0.001),
       b("decoder.acc", "ACC"),
       b("decoder.color_killer", "カラーキラー"),
       r("decoder.h_pll", "水平 AFC 追従", 0, 1, 0.01),
@@ -1120,7 +1174,30 @@ export const help: Record<string, string> = {
     "DNR の動き判定しきい値。大きくすると動きを静止とみなしてノイズは減るが残像が増え、小さくすると残像は減るが動き部での NR が弱くなる。",
   "decoder.nr_bits":
     "再生 NR 回路の ADC と DAC のビット数。JVC の資料に沿った初期値は 6 bit。少ないほど量子化段差が見え、0 は量子化なし。NR を両方 0 にすると量子化も通らない。",
-  "decoder.chroma_bw_mhz": "受像機で復調した後の色差の帯域。小さいほど色がにじむ。",
+  "decoder.chroma_bw_mhz": "受像機で復調した後の色差の帯域。小さいほど色がにじむ。I/Q (I 広帯域) 方式では I の帯域。",
+  "encoder.setup":
+    "送り側の黒レベル。北米の NTSC (RS-170A / SMPTE 170M) は 7.5 IRE、法令改正前の日本の NTSC-J は 0 IRE (セットアップなし)。" +
+    "白は 100 IRE のままなので、黒〜白の振幅と色信号の振幅も変わる。",
+  "encoder.white_point":
+    "番組を作ったモニタの基準白 (視聴者が順応している白)。北米は D65、日本は 9300 K + 27 MPCD。受像機の色温度と同じなら色かぶりは出ない。",
+  "decoder.setup":
+    "受像機が黒とみなすレベル。送り側と食い違うと、7.5 IRE の信号を 0 IRE の受像機で見れば黒が浮いて全体が白っぽく、" +
+    "0 IRE の信号を 7.5 IRE の受像機で見れば暗部がつぶれて黒に沈む。",
+  "decoder.white_point":
+    "受像機 (ブラウン管) の色温度。D65 の番組を D93 の受像機で見ると青白く、D93 の番組を D65 の受像機で見ると黄ばんで見える。",
+  "decoder.chroma_demod":
+    "NTSC 受像機の色復調方式。I/Q (I 広帯域) は I を約 1.3 MHz、Q を約 0.5 MHz で通し、I を遅延線で Q に揃える本来の方式。" +
+    "R-Y・B-Y 2 軸は ±0.5 MHz で色差 2 つを検波し、G-Y = −0.51(R-Y) − 0.19(B-Y) のマトリクスで作る、市販機の大半の方式。" +
+    "X・Z 2 軸は真空管時代の方式で、X・Z 復調出力を R-Y・B-Y 増幅管に入れ、3 本の色差増幅管の共通カソード電圧だけで G-Y 管を動かす。" +
+    "増幅率がそろった 3 管ではどこかに誤差が残り、初期値では G-Y が約 −23° ずれる (緑〜マゼンタの色相・濃さが変わる)。",
+  "decoder.narrow_bw_mhz": "Q・R-Y/B-Y・X/Z を通す狭帯域側の色差帯域。実機は約 0.5 MHz。",
+  "decoder.xz_x_axis_deg": "X 復調軸の位相。B-Y 軸を 0°、R-Y 軸を 90°、I 軸を 123° として、色差増幅管で反転した後の向きで表す。",
+  "decoder.xz_x_gain": "X 復調出力の利得。I/Q を検波した出力に対する倍率。",
+  "decoder.xz_z_axis_deg": "Z 復調軸の位相 (Q 軸が 33°)。",
+  "decoder.xz_z_gain": "Z 復調出力の利得。",
+  "decoder.xz_cathode_k":
+    "3 本の色差増幅管の共通カソード抵抗による結合。E_K = k(E_X + E_Z) で、k = gm·Rk / (1 + 3·gm·Rk)。" +
+    "1/3 に近づく (Rk が大きい) ほど G-Y 管の出力は大きくなり、R-Y・B-Y から引かれる分も増える。",
   "decoder.burst_pll":
     "色副搬送波の PLL がバーストに追従する速さ (ライン単位)。1 = ラインごとに即時同期。" +
     "小さくするとテープのライン単位の位相ゆらぎを取り切れず、NTSC では色相の横縞、PAL では彩度のむらになる。" +
@@ -1281,6 +1358,7 @@ const sVideo = (p: Params) =>
   p.tape.enabled &&
   !(p.rf.enabled && (p.rf.placement === "after_tape" || p.rf.placement === "both"));
 const ycSeparated = (p: Params) => composite(p) && !sVideo(p);
+const xzDemod = (p: Params) => p.standard === "ntsc" && p.decoder.chroma_demod === "xz";
 const comb3d = (p: Params) => ycSeparated(p) && p.decoder.yc_separation === "comb3d";
 
 /** path → 効く条件。ここにない path は常に有効。
@@ -1364,6 +1442,8 @@ const activeWhen: Record<string, (p: Params) => boolean> = {
   "encoder.luma_bw_mhz": composite,
   "encoder.chroma_gain": composite,
   "encoder.burst_level_pct": composite,
+  "encoder.setup": composite,
+  "encoder.white_point": composite,
   "encoder.i_bw_mhz": (p) => composite(p) && p.standard === "ntsc",
   "encoder.q_bw_mhz": (p) => composite(p) && p.standard === "ntsc",
   "encoder.uv_bw_mhz": (p) => composite(p) && p.standard === "pal",
@@ -1379,6 +1459,13 @@ const activeWhen: Record<string, (p: Params) => boolean> = {
   "decoder.dnr_motion_threshold_ire": (p) => analogTape(p) && p.decoder.dnr_strength > 0,
   "decoder.nr_bits": analogTape,
   "decoder.pal_delay_line": (p) => p.standard === "pal",
+  "decoder.chroma_demod": (p) => p.standard === "ntsc",
+  "decoder.narrow_bw_mhz": (p) => p.standard === "ntsc" && p.decoder.chroma_demod !== "iq",
+  "decoder.xz_x_axis_deg": xzDemod,
+  "decoder.xz_x_gain": xzDemod,
+  "decoder.xz_z_axis_deg": xzDemod,
+  "decoder.xz_z_gain": xzDemod,
+  "decoder.xz_cathode_k": xzDemod,
   ntsc_228: (p) => p.standard === "ntsc",
   "image.pixel_phase": (p) => p.image.fit === "pixel",
   "output.deinterlace_params.weave_temporal_weight_pct": (p) => p.output.deinterlace === "weave",
@@ -1445,6 +1532,8 @@ export function setPath(obj: any, path: string, value: any) {
   target[last] = value;
 }
 
+export type Setup = "auto" | "ire7_5" | "ire0";
+export type WhitePoint = "d65" | "d93";
 export type MagneticMedia = "cobalt" | "high_cobalt" | "metal_particle" | "ferric_audio";
 type DeepPartial<T> = { [K in keyof T]?: T[K] extends object ? DeepPartial<T[K]> : T[K] };
 

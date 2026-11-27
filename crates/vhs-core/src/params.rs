@@ -369,11 +369,25 @@ pub struct EncoderParams {
     /// 受像機の ACC はバーストで色の濃さを正規化するので、大きくすると ACC ありで色が薄く、小さくすると濃くなる。
     /// CGA などのコンピュータは色信号と同じ回路でバーストを作るので、規格より大きいことがある
     pub burst_level_pct: f32,
+    /// 送り側の黒レベル (セットアップ)。白は 100 IRE のままで、黒〜白の振幅 (と色信号の振幅) が変わる
+    pub setup: Setup,
+    /// 番組を作ったモニタの基準白 (視聴者が順応している白)。受像機の `white_point` と違うと色かぶりになる
+    pub white_point: WhitePoint,
 }
 
 impl Default for EncoderParams {
     fn default() -> Self {
-        Self { enabled: true, luma_bw_mhz: 4.2, i_bw_mhz: 1.3, q_bw_mhz: 0.6, uv_bw_mhz: 1.3, chroma_gain: 1.0, burst_level_pct: 100.0 }
+        Self {
+            enabled: true,
+            luma_bw_mhz: 4.2,
+            i_bw_mhz: 1.3,
+            q_bw_mhz: 0.6,
+            uv_bw_mhz: 1.3,
+            chroma_gain: 1.0,
+            burst_level_pct: 100.0,
+            setup: Setup::Auto,
+            white_point: WhitePoint::D65,
+        }
     }
 }
 
@@ -732,6 +746,60 @@ pub enum YcSeparation {
     Comb3d,
 }
 
+/// 黒レベル (セットアップ)。NTSC は国で違い、送り側と受像機で食い違うと黒が浮く・沈む
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Setup {
+    /// 方式の標準どおり (NTSC = 7.5 IRE、PAL = 0)
+    #[default]
+    Auto,
+    /// 7.5 IRE (RS-170A / SMPTE 170M、北米の NTSC)
+    Ire7_5,
+    /// 0 IRE (法令改正前の旧 NTSC-J。日本の NTSC はセットアップなし)
+    Ire0,
+}
+
+impl Setup {
+    /// 黒レベル [IRE]。`Auto` は `None`
+    pub fn ire(self) -> Option<f32> {
+        match self {
+            Setup::Auto => None,
+            Setup::Ire7_5 => Some(7.5),
+            Setup::Ire0 => Some(0.0),
+        }
+    }
+}
+
+/// 基準白 (色温度)。SMPTE 170M は D65、日本の NTSC は 9300 K + 27 MPCD
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WhitePoint {
+    #[default]
+    #[serde(rename = "d65")]
+    D65,
+    /// 9300 K + 27 MPCD
+    #[serde(rename = "d93")]
+    D93,
+}
+
+/// NTSC 受像機の色復調方式 (どの軸で同期検波し、どう色差 3 つに組み直すか)
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChromaDemod {
+    /// I/Q 軸で検波し、両方を `chroma_bw_mhz` の帯域で通す (理想化した復調)
+    #[default]
+    Iq,
+    /// 本来の I/Q 復調: I は `chroma_bw_mhz` (約 1.3 MHz)、Q は `narrow_bw_mhz` (約 0.5 MHz) で通し、
+    /// 遅れの小さい I を遅延線で Q に揃える。送られてきた色を全部使う
+    IqWide,
+    /// R-Y・B-Y の 2 軸で検波 (±`narrow_bw_mhz`)。G-Y は
+    /// G-Y = −0.51(R-Y) − 0.19(B-Y) のマトリクスで作る。IC 化以降の大半の受像機
+    RyBy,
+    /// X・Z の 2 軸で検波し (±`narrow_bw_mhz`)、カソードを共通にした 3 本の色差増幅管で
+    /// R-Y・G-Y・B-Y を作る真空管時代の方式。G-Y 管はカソード電圧だけで動くので、
+    /// 増幅率がそろっている限り色差のどれかに色相・振幅の誤差が残る
+    Xz,
+}
+
 /// 受像機 (NTSC / PAL デコーダ)
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -748,6 +816,26 @@ pub struct DecoderParams {
     pub frame_buffer_bits: u32,
     /// 復調後の色差帯域 [MHz]
     pub chroma_bw_mhz: f32,
+    /// 受像機が黒とみなすレベル (セットアップ)。送り側と違うと、7.5 IRE の信号を 0 IRE の受像機で見れば
+    /// 黒が浮いて白っぽく、逆なら暗部がつぶれる
+    pub setup: Setup,
+    /// 受像機 (ブラウン管) の白色点。RGB = 1 をどの色で光らせるか
+    pub white_point: WhitePoint,
+    /// NTSC の色復調方式
+    pub chroma_demod: ChromaDemod,
+    /// 狭帯域側 (Q・R-Y/B-Y・X/Z) の色差帯域 [MHz]。`chroma_demod` が `Iq` 以外のとき使う
+    pub narrow_bw_mhz: f32,
+    /// X/Z 復調: X 復調軸 [°] (B-Y 軸を 0°、R-Y 軸を 90° とした、色差増幅管で反転したあとの位相)
+    pub xz_x_axis_deg: f32,
+    /// X/Z 復調: X 復調出力の利得 (I/Q 検波出力に対する倍率)
+    pub xz_x_gain: f32,
+    /// X/Z 復調: Z 復調軸 [°]
+    pub xz_z_axis_deg: f32,
+    /// X/Z 復調: Z 復調出力の利得
+    pub xz_z_gain: f32,
+    /// X/Z 復調: 共通カソード抵抗による結合 E_K = k(E_X + E_Z)。
+    /// 増幅管の相互コンダクタンス gm とカソード抵抗 Rk で k = gm·Rk / (1 + 3·gm·Rk) (0〜1/3)
+    pub xz_cathode_k: f32,
     /// 自動色レベル調整 (バースト振幅で正規化)
     pub acc: bool,
     /// バーストが弱いときに色を消す
@@ -806,6 +894,17 @@ impl Default for DecoderParams {
             motion_adaptive: true,
             frame_buffer_bits: 8,
             chroma_bw_mhz: 1.3,
+            setup: Setup::Auto,
+            white_point: WhitePoint::D65,
+            chroma_demod: ChromaDemod::Iq,
+            narrow_bw_mhz: 0.5,
+            // 増幅率がそろった 3 管で R-Y・G-Y・B-Y の誤差が最小になるよう合わせた値。
+            // R-Y・B-Y はほぼ正しく、G-Y が約 −23° ずれる
+            xz_x_axis_deg: 72.1,
+            xz_x_gain: 1.637,
+            xz_z_axis_deg: 9.4,
+            xz_z_gain: 2.569,
+            xz_cathode_k: 0.18,
             acc: true,
             color_killer: true,
             h_pll: 0.25,

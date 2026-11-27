@@ -126,7 +126,7 @@ fn encode(
     };
     let (i_lead, q_lead) = (iq_lead(&i_lp), iq_lead(&q_lp));
     let (parity, frame_no, field_index) = (field.parity, field.frame, field.index);
-    let lv = s.ire;
+    let lv = s.ire.with_setup(p.setup);
     let span = lv.span();
     let burst = s.burst_start..s.burst_end;
 

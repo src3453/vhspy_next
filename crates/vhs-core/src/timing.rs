@@ -57,6 +57,11 @@ impl Levels {
     pub const fn span(&self) -> f32 {
         self.white - self.black
     }
+
+    /// 黒レベル (セットアップ) を差し替えたもの
+    pub fn with_setup(self, setup: crate::params::Setup) -> Self {
+        Self { black: setup.ire().unwrap_or(self.black), ..self }
+    }
 }
 
 /// 1 つのテレビ方式のタイミングとレベル

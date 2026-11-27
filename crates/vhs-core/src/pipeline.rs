@@ -309,6 +309,9 @@ impl Pipeline {
                 p.tape.enabled && !digital,
                 &mut self.output,
             );
+            if let Some(m) = crate::whitepoint::display_matrix(p.encoder.white_point, p.decoder.white_point) {
+                crate::whitepoint::apply_rows(&mut self.output, shown_parity, &m);
+            }
         } else {
             // コンポジットを通さない: 映像をデジタルのまま出す (DV なら FireWire 取り込み)
             write_field(input, self.field.parity, &mut self.output);

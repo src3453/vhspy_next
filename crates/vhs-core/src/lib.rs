@@ -33,6 +33,7 @@ pub mod teletext;
 pub mod tbc;
 pub mod timing;
 pub mod vbi;
+pub mod whitepoint;
 
 pub use frame::{LinearFrame, RgbFrame, RgbaFrame, VideoFrame};
 pub use params::Params;
