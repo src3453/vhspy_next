@@ -185,6 +185,7 @@ export const controlLabels: Record<string, string> = {
   "tape.color_under_khz": "ﾃｲｲｷﾍﾝｶﾝ",
   "tape.color_under_level": "ﾃｲｲｷ ﾚﾍﾞﾙ",
   "output.connection": "ｾﾂｿﾞｸ",
+  "output.direct_sampling": "ﾀﾞｲﾚｸﾄ ｼｷｻ",
 
   "dv.bitrate_scale": "ﾌｺﾞｳﾘｮｳ",
   "dv.dct_248": "2-4-8 DCT",
@@ -419,7 +420,8 @@ export const optionLabels: Record<string, Record<string, string>> = {
   "osd.mode": { direct: "ﾀﾞｲﾚｸﾄ", capture: "ｷｬﾌﾟﾁｬ", composite: "ﾃﾞｯｷ ｼｭﾂﾘｮｸ", tape: "ﾃｰﾌﾟ ﾔｷｺﾐ" },
   "tape.format": { beta: "BETA", custom: "ｶｽﾀﾑ", dv: "DV", digital8: "Digital8" },
   "tape.luma_model": { fm: "FM ｹｲｻﾝ", simple: "ｶﾝｲ" },
-  "output.connection": { composite: "ｺﾝﾎﾟｼﾞｯﾄ", s_video: "S ｴｲｿﾞｳ" },
+  "output.connection": { composite: "ｺﾝﾎﾟｼﾞｯﾄ", s_video: "S ｴｲｿﾞｳ", component: "ｺﾝﾎﾟｰﾈﾝﾄ", direct: "ﾀﾞｲﾚｸﾄ" },
+  "output.direct_sampling": { "444": "4:4:4", "422": "4:2:2" },
   "tape.magnetic_model": { tanh: "tanh ﾎｳﾜ", jiles_atherton: "J-A ﾋｽﾃﾘｼｽ", linear: "ｾﾝｹｲ" },
   "tape.ja_solver": { table: "ﾋｮｳ (ｺｳｿｸ)", exact: "ｹﾞﾝﾐﾂ" },
   "tape.ja_oversample": { x4: "4 ﾊﾞｲ", x8: "8 ﾊﾞｲ", x16: "16 ﾊﾞｲ" },

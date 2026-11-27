@@ -28,6 +28,7 @@ use crate::params::{ChromaDemod, DecoderParams, YcSeparation};
 use crate::raster;
 use crate::timing::*;
 use crate::caption::CaptionDecoder;
+use crate::component::{PB_PER_U, PR_PER_V};
 use crate::clock::{CLOCK_CHROMA, CLOCK_HORIZONTAL, CLOCK_VERTICAL, ClockSim};
 use crate::simd::{self, F32x8, LANES, x8_kernel};
 use crate::vbi;
@@ -71,6 +72,8 @@ pub struct Decoder {
     corrections: Vec<f32>,
     chunk_aligned: Vec<f32>,
     chunk_aligned_c: Vec<f32>,
+    /// コンポーネントの Pr (Pb は `chunk_aligned_c`)
+    chunk_aligned_r: Vec<f32>,
     chunk_luma: Vec<f32>,
     chunk_chroma: Vec<f32>,
     chunk_bursts: Vec<Burst>,
@@ -83,6 +86,8 @@ pub struct Decoder {
     /// Y/C 分離後の輝度・色とラインごとの検波条件 (表示する窓を切り出すため数フィールドぶん持つ)
     luma: Ring,
     chroma: Ring,
+    /// コンポーネントの Pr (Pb は `chroma`)。コンポーネントを受けるまでは空
+    chroma_r: Ring,
     line_refs: Vec<LineRef>,
     /// 色副搬送波 PLL の直前のラインの位相
     pll_prev: Option<f32>,
@@ -161,6 +166,7 @@ impl Decoder {
             corrections: vec![0.0; chunk],
             chunk_aligned: vec![0.0; chunk * ls],
             chunk_aligned_c: Vec::new(),
+            chunk_aligned_r: Vec::new(),
             chunk_luma: vec![0.0; chunk * ls],
             chunk_chroma: vec![0.0; chunk * ls],
             chunk_bursts: vec![Burst::default(); chunk],
@@ -169,6 +175,7 @@ impl Decoder {
             frame_mem_from: None,
             luma: Ring::new(ls, cap),
             chroma: Ring::new(ls, cap),
+            chroma_r: Ring::new(ls, 0),
             line_refs: vec![LineRef::default(); cap],
             pll_prev: None,
             pal_vote: 0.0,
@@ -352,16 +359,26 @@ impl Decoder {
             let next = (i + 1 < n_new).then(|| field.line(i + 1));
             shift_across_lines(prev, field.line(i), next, dst, -corr[i], lv.blank);
         });
-        // S 映像: C も同じ補正で揃える
+        // S 映像: C も同じ補正で揃える (コンポーネントなら Pb と Pr)
         let separate = field.separate;
-        if separate {
-            self.chunk_aligned_c.resize(self.chunk_aligned.len(), 0.0);
-            self.chunk_aligned_c[..n_new * ls].par_chunks_mut(ls).enumerate().for_each(|(i, dst)| {
-                let c = |j: usize| field.chroma_line(j).unwrap();
+        let component = field.component;
+        let align = |src: &[f32], out: &mut Vec<f32>| {
+            out.resize(n_new.max(1) * ls, 0.0);
+            out[..n_new * ls].par_chunks_mut(ls).enumerate().for_each(|(i, dst)| {
+                let c = |j: usize| &src[j * ls..(j + 1) * ls];
                 let prev = (i > 0).then(|| c(i - 1));
                 let next = (i + 1 < n_new).then(|| c(i + 1));
                 shift_across_lines(prev, c(i), next, dst, -corr[i], 0.0);
             });
+        };
+        if separate {
+            align(&field.chroma, &mut self.chunk_aligned_c);
+        }
+        if component {
+            align(&field.chroma_r, &mut self.chunk_aligned_r);
+            if self.chroma_r.cap != self.chroma.cap {
+                self.chroma_r = Ring::new(ls, self.chroma.cap);
+            }
         }
 
         // --- 垂直同期分離と垂直発振器 (逐次) ---
@@ -481,7 +498,13 @@ impl Decoder {
             let sl = start + i as u64;
             let src = i * ls..(i + 1) * ls;
             self.luma.line_mut(sl).copy_from_slice(&self.chunk_luma[src.clone()]);
-            self.chroma.line_mut(sl).copy_from_slice(&self.chunk_chroma[src.clone()]);
+            if component {
+                // コンポーネント: 色差は Y/C 分離を通さずそのまま
+                self.chroma.line_mut(sl).copy_from_slice(&self.chunk_aligned_c[src.clone()]);
+                self.chroma_r.line_mut(sl).copy_from_slice(&self.chunk_aligned_r[src.clone()]);
+            } else {
+                self.chroma.line_mut(sl).copy_from_slice(&self.chunk_chroma[src.clone()]);
+            }
             if i + self.tail.cap >= n_new {
                 self.tail.line_mut(sl).copy_from_slice(&self.chunk_aligned[src.clone()]);
             }
@@ -496,7 +519,19 @@ impl Decoder {
         }
 
         // --- 色副搬送波 PLL と PAL アイデント (逐次) ---
-        self.lock_subcarrier(start, n_new, p);
+        if component {
+            // 色差がベースバンドで来るので副搬送波の同期は要らない (色相調整・ACC・カラーキラーも効かない)
+            let cap = self.line_refs.len() as u64;
+            let gain = p.saturation / lv.span();
+            for i in 0..n_new {
+                let sl = start + i as u64;
+                self.line_refs[(sl % cap) as usize] = LineRef { phase: 0.0, sv: 1.0, gain };
+            }
+            self.pll_prev = None;
+            self.pal_prev_mu = None;
+        } else {
+            self.lock_subcarrier(start, n_new, p);
+        }
 
         // --- 表示する窓 (垂直同期から決まる) ---
         let fl = s.field_lines;
@@ -554,6 +589,20 @@ impl Decoder {
         let (chroma, line_refs) = (&self.chroma, &self.line_refs);
         let geom = DetGeom { ls, active_start, active_end, lead_a, lead_b };
         let det_x8 = crate::simd::x8();
+        if component {
+            // コンポーネント: a = Pr、b = Pb の有効映像の部分をそのまま取る
+            let chroma_r = &self.chroma_r;
+            self.det_a.par_chunks_mut(aw).zip(self.det_b.par_chunks_mut(aw)).enumerate().for_each(|(k, (da, db))| {
+                let j = j0 + k as i64;
+                if !line_ok(j) {
+                    da.fill(0.0);
+                    db.fill(0.0);
+                    return;
+                }
+                da.copy_from_slice(&chroma_r.line(j as u64)[active_start..active_start + aw]);
+                db.copy_from_slice(&chroma.line(j as u64)[active_start..active_start + aw]);
+            });
+        } else {
         self.det_a.par_chunks_mut(LANES * aw).zip(self.det_b.par_chunks_mut(LANES * aw)).enumerate().for_each(|(g, (das, dbs))| {
             let k0 = g * LANES;
             let nl = das.len() / aw;
@@ -589,6 +638,7 @@ impl Decoder {
                 detect_line(chroma.line(j as u64), &cos_t, &sin_t, c_lp_a, c_lp_b, &geom, da, db);
             }
         });
+        }
 
         // --- 輝度・色差 (PAL は遅延線で前のラインと平均) ---
         let line_ref = |j: i64| self.line_refs[(j as u64 % self.line_refs.len() as u64) as usize];
@@ -605,14 +655,18 @@ impl Decoder {
             let y_line = self.luma.line(j as u64);
             let (da, db) = (&self.det_a[k * aw..(k + 1) * aw], &self.det_b[k * aw..(k + 1) * aw]);
             let LineRef { sv, gain, .. } = line_ref(j);
-            let prev = (pal && p.pal_delay_line && k > 0 && line_ok(j - 1)).then(|| {
+            let prev = (pal && !component && p.pal_delay_line && k > 0 && line_ok(j - 1)).then(|| {
                 let r = line_ref(j - 1);
                 (&self.det_a[(k - 1) * aw..k * aw], &self.det_b[(k - 1) * aw..k * aw], r.sv * r.gain, r.gain)
             });
             for x in 0..aw {
                 let i = k * aw + x;
                 self.nr_y[i] = y_line[x + active_start] - lv.black;
-                if pal {
+                if component {
+                    // Pb/Pr → U/V (RGB 変換は PAL と同じ U/V のマトリクス)
+                    self.nr_u[i] = db[x] * gain / PB_PER_U;
+                    self.nr_v[i] = da[x] * gain / PR_PER_V;
+                } else if pal {
                     let (mut v, mut u) = (da[x] * sv * gain, db[x] * gain);
                     if let Some((pa, pb, pvg, pug)) = prev {
                         v = 0.5 * (v + pa[x] * pvg);
@@ -654,7 +708,7 @@ impl Decoder {
             span: lv.span(),
             contrast: p.contrast,
             brightness: p.brightness,
-            pal,
+            pal: pal || component,
             matrix,
             exp: rx_gamma.then_some(rx_exp),
         };

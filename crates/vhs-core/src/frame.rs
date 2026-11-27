@@ -249,6 +249,8 @@ impl RgbaFrame {
 ///
 /// 通常はコンポジット信号 (`data`)。S 映像 (Y/C 分離) で送るときは `separate` が立ち、
 /// `data` が Y (同期付き)、`chroma` が C (バースト付き) になる。
+/// コンポーネントで送るときは `component` も立ち、`chroma` が Pb、`chroma_r` が Pr (どちらもベースバンド、
+/// 単位は IRE で ±span/2 が色差の最大振幅) になる。
 #[derive(Clone, Debug)]
 pub struct Field {
     /// この信号のテレビ方式
@@ -256,8 +258,12 @@ pub struct Field {
     pub data: Vec<f32>,
     /// S 映像のとき true (`data` = Y, `chroma` = C)
     pub separate: bool,
-    /// S 映像の C 信号 (`separate` のときだけ使う)
+    /// S 映像の C 信号 (`separate` のときだけ使う)。コンポーネントなら Pb
     pub chroma: Vec<f32>,
+    /// コンポーネント (Y, Pb, Pr) のとき true (`separate` も立つ)
+    pub component: bool,
+    /// コンポーネントの Pr (`component` のときだけ使う)
+    pub chroma_r: Vec<f32>,
     /// 0 = 第 1 (偶数ライン) フィールド, 1 = 第 2 (奇数ライン) フィールド
     pub parity: u8,
     /// フレーム番号
@@ -279,6 +285,8 @@ impl Field {
             data: vec![0.0; std.raster_lines * std.line_samples],
             separate: false,
             chroma: Vec::new(),
+            component: false,
+            chroma_r: Vec::new(),
             parity: 0,
             frame: 0,
             index: 0,
@@ -321,22 +329,38 @@ impl Field {
     /// S 映像に切り替え、C 信号の領域を用意する
     pub fn set_separate(&mut self, separate: bool) {
         self.separate = separate;
+        self.component = false;
         if separate && self.chroma.len() != self.data.len() {
             self.chroma = vec![0.0; self.data.len()];
         }
     }
 
-    /// S 映像の C 信号のライン (コンポジットなら None)
+    /// コンポーネント (Y, Pb, Pr) に切り替え、色差の領域を用意する
+    pub fn set_component(&mut self) {
+        self.set_separate(true);
+        self.component = true;
+        if self.chroma_r.len() != self.data.len() {
+            self.chroma_r = vec![0.0; self.data.len()];
+        }
+    }
+
+    /// S 映像の C 信号のライン (コンポジット・コンポーネントなら None)
     pub fn chroma_line(&self, l: usize) -> Option<&[f32]> {
         let ls = self.std.line_samples;
-        self.separate.then(|| &self.chroma[l * ls..(l + 1) * ls])
+        (self.separate && !self.component).then(|| &self.chroma[l * ls..(l + 1) * ls])
+    }
+
+    /// コンポーネントの (Pb, Pr) のライン (コンポーネントでなければ None)
+    pub fn component_lines(&self, l: usize) -> Option<(&[f32], &[f32])> {
+        let ls = self.std.line_samples;
+        self.component.then(|| (&self.chroma[l * ls..(l + 1) * ls], &self.chroma_r[l * ls..(l + 1) * ls]))
     }
 
     /// Y (またはコンポジット) と C (S 映像のときだけ) のラインを同時に借りる
     pub fn lines_mut(&mut self, l: usize) -> (&mut [f32], Option<&mut [f32]>) {
         let ls = self.std.line_samples;
         let y = &mut self.data[l * ls..(l + 1) * ls];
-        let c = if self.separate { Some(&mut self.chroma[l * ls..(l + 1) * ls]) } else { None };
+        let c = if self.separate && !self.component { Some(&mut self.chroma[l * ls..(l + 1) * ls]) } else { None };
         (y, c)
     }
 }

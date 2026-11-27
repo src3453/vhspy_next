@@ -18,6 +18,9 @@ export type ClockParams = {
   jitter_ns: number;
 };
 
+/** 再生機 → 受像機の接続 */
+export type Connection = "composite" | "s_video" | "component" | "direct";
+
 export type Params = {
   /** テレビ方式 */
   standard: Standard;
@@ -290,7 +293,8 @@ export type Params = {
       qtgmc_temporal_weight_pct: number;
       qtgmc_sharpness_pct: number;
     };
-    connection: "composite" | "s_video";
+    connection: Connection;
+    direct_sampling: "444" | "422";
   };
   osd: {
     enabled: boolean;
@@ -521,6 +525,15 @@ export const groups: Group[] = [
         options: [
           { value: "composite", label: "コンポジット (映像端子)" },
           { value: "s_video", label: "S 映像 (Y/C 分離)" },
+          { value: "component", label: "コンポーネント (Y, Pb, Pr)" },
+          { value: "direct", label: "ダイレクト (デジタル / HDMI)" },
+        ],
+      },
+      {
+        kind: "select", path: "output.direct_sampling", label: "ダイレクト: 色差の標本化",
+        options: [
+          { value: "444", label: "4:4:4" },
+          { value: "422", label: "4:2:2" },
         ],
       },
     ],
@@ -1340,7 +1353,13 @@ export const help: Record<string, string> = {
   "tape.color_under_level": "低域変換クロマの記録レベル (FM 搬送波に対する比)。大きいと鮮やかな色の部分の輝度にモアレが乗る。",
   "output.connection":
     "再生機と受像機の接続。S 映像は Y と C を分けたまま送るので、受像機の Y/C 分離によるドットクロール・クロスカラーが出ない。" +
+    "コンポーネントはデッキの中で色を復調し、Y と色差 (Pb = B-Y, Pr = R-Y) で送る。受像機の色副搬送波の同期を通らないので、" +
+    "色相の揺れ・ACC・カラーキラー・色相調整は効かない。" +
+    "ダイレクト (デジタル / HDMI) はデッキの中で標本化してデジタルのまま送り、受像機の輪郭補正・ガンマ・発振器の揺れも通らない " +
+    "(字幕・文字放送は運ばない)。DV はデジタルの映像をそのまま出す。" +
     "テープを通さないとき・テープの後に RF でつなぐときはコンポジットになる。",
+  "output.direct_sampling":
+    "ダイレクト接続の色差の標本化。4:2:2 は色差を水平に 2 画素で 1 つに間引くので、色の細かい縦縞がにじむ。",
   "decoder.color_killer": "カラーバーストが弱いとき色を消して白黒表示にする。",
   "decoder.h_pll": "水平同期 (AFC) の追従の速さ。0 = 追従しない、1 = 即時追従。小さいと時間軸の揺れがそのまま見える。",
   "decoder.contrast": "受像機のコントラスト (映像の振幅倍率)。",
@@ -1457,14 +1476,21 @@ const analogTape = (p: Params) => composite(p) && p.tape.enabled && !isDigitalFo
 const dvTape = (p: Params) => p.tape.enabled && isDigitalFormat(p.tape.format);
 const fmModel = (p: Params) => p.tape.luma_model === "fm";
 const nonlinearMag = (p: Params) => p.tape.magnetic_model !== "linear";
-/** S 映像が実際に使われるか (テープの再生出力を受像機へ直接つなぐときだけ) */
-const sVideo = (p: Params) =>
-  composite(p) &&
-  p.output.connection === "s_video" &&
-  p.tape.enabled &&
-  !(p.rf.enabled && (p.rf.placement === "after_tape" || p.rf.placement === "both"));
-const ycSeparated = (p: Params) => composite(p) && !sVideo(p);
-const xzDemod = (p: Params) => p.standard === "ntsc" && p.decoder.chroma_demod === "xz";
+/** 実際に使われる接続 (コンポジット以外はテープの再生出力を受像機へ直接つなぐときだけ) */
+const connection = (p: Params): Connection =>
+  p.tape.enabled && !(p.rf.enabled && (p.rf.placement === "after_tape" || p.rf.placement === "both"))
+    ? p.output.connection
+    : "composite";
+const ycSeparated = (p: Params) => composite(p) && connection(p) === "composite";
+/** 色差のまま受ける (コンポーネント・ダイレクト): 受像機の色復調は通らない */
+const componentIn = (p: Params) => composite(p) && (connection(p) === "component" || connection(p) === "direct");
+/** ダイレクト: 受像機のアナログ処理は通らない */
+const directIn = (p: Params) => composite(p) && connection(p) === "direct";
+/** 受像機の色復調 (副搬送波の同期・色差の検波) を使うか */
+const chromaDemod = (p: Params) => composite(p) && !componentIn(p);
+/** 受像機のアナログ処理 (輪郭補正・ガンマ・発振器・同期分離) を使うか */
+const analogRx = (p: Params) => composite(p) && !directIn(p);
+const xzDemod = (p: Params) => chromaDemod(p) && p.standard === "ntsc" && p.decoder.chroma_demod === "xz";
 const comb3d = (p: Params) => ycSeparated(p) && p.decoder.yc_separation === "comb3d";
 
 /** path → 効く条件。ここにない path は常に有効。
@@ -1508,6 +1534,7 @@ const activeWhen: Record<string, (p: Params) => boolean> = {
   "tape.ja_oversample": (p) => p.tape.magnetic_model === "jiles_atherton" && p.tape.luma_model === "fm",
   "audio.bias_level": (p) => p.audio.mode === "linear" && p.tape.magnetic_model === "jiles_atherton",
   "output.connection": (p) => composite(p) && p.tape.enabled && !(p.rf.enabled && p.rf.placement !== "before_tape"),
+  "output.direct_sampling": directIn,
 
   // DV
   "dv.": dvTape,
@@ -1558,8 +1585,36 @@ const activeWhen: Record<string, (p: Params) => boolean> = {
   "encoder.uv_bw_mhz": (p) => composite(p) && p.standard === "pal",
 
   // 受像機
-  "decoder.": composite,
+  // DV のダイレクト出力は受像機の処理を一切通らない
+  "decoder.": (p) => composite(p) && !(dvTape(p) && directIn(p)),
   "decoder.yc_separation": ycSeparated,
+  "decoder.chroma_bw_mhz": chromaDemod,
+  "decoder.acc": chromaDemod,
+  "decoder.color_killer": chromaDemod,
+  "decoder.burst_pll": chromaDemod,
+  "decoder.hue_deg": chromaDemod,
+  "decoder.luma_shelf_db": analogRx,
+  "decoder.chroma_shelf_db": analogRx,
+  "decoder.setup": analogRx,
+  "decoder.gamma": analogRx,
+  "decoder.h_pll": analogRx,
+  // 発振器: 色副搬送波 VCXO は色復調を使うときだけ、水平・垂直はアナログの受像機のときだけ
+  ...Object.fromEntries(
+    (["chroma", "horizontal", "vertical"] as const).flatMap((osc) =>
+      ["offset_ppm", "drift_ppm", "drift_time_s", "wow_ppm", "wow_hz", "flutter_ppm", "flutter_hz", "jitter_ns"].map(
+        (k) => [`decoder.clocks.${osc}.${k}`, osc === "chroma" ? chromaDemod : analogRx] as const,
+      ),
+    ),
+  ),
+  "decoder.v_hold_pct": analogRx,
+  "decoder.v_sync_window": analogRx,
+  "decoder.v_integrator_us": analogRx,
+  "decoder.vertical_position": analogRx,
+  "decoder.caption_display": analogRx,
+  "decoder.caption_channel": analogRx,
+  "decoder.teletext_display": analogRx,
+  "decoder.teletext_program": analogRx,
+  "decoder.teletext_page": analogRx,
   "decoder.motion_adaptive": comb3d,
   "decoder.motion_threshold_ire": (p) => comb3d(p) && p.decoder.motion_adaptive,
   "decoder.frame_buffer_bits": comb3d,
@@ -1567,11 +1622,11 @@ const activeWhen: Record<string, (p: Params) => boolean> = {
   "decoder.dnr_strength": analogTape,
   "decoder.dnr_motion_threshold_ire": (p) => analogTape(p) && p.decoder.dnr_strength > 0,
   "decoder.nr_bits": analogTape,
-  "decoder.pal_delay_line": (p) => p.standard === "pal",
-  "decoder.luma_shelf_mhz": (p) => p.decoder.luma_shelf_db !== 0,
-  "decoder.chroma_shelf_mhz": (p) => p.decoder.chroma_shelf_db !== 0,
-  "decoder.chroma_demod": (p) => p.standard === "ntsc",
-  "decoder.narrow_bw_mhz": (p) => p.standard === "ntsc" && p.decoder.chroma_demod !== "iq",
+  "decoder.pal_delay_line": (p) => chromaDemod(p) && p.standard === "pal",
+  "decoder.luma_shelf_mhz": (p) => analogRx(p) && p.decoder.luma_shelf_db !== 0,
+  "decoder.chroma_shelf_mhz": (p) => analogRx(p) && p.decoder.chroma_shelf_db !== 0,
+  "decoder.chroma_demod": (p) => chromaDemod(p) && p.standard === "ntsc",
+  "decoder.narrow_bw_mhz": (p) => chromaDemod(p) && p.standard === "ntsc" && p.decoder.chroma_demod !== "iq",
   "decoder.xz_x_axis_deg": xzDemod,
   "decoder.xz_x_gain": xzDemod,
   "decoder.xz_z_axis_deg": xzDemod,
@@ -1660,7 +1715,7 @@ type FormatSpec = {
   /// 標準のテープの磁性体
   media: MagneticMedia;
   noise: number;
-  connection: "composite" | "s_video";
+  connection: Connection;
   extra?: DeepPartial<Params>;
 };
 // DV 方式のフォーマットの値。デッキのアナログ出力は S 映像が普通

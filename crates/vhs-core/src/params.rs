@@ -1094,6 +1094,32 @@ pub enum Connection {
     Composite,
     /// S 映像 (Y/C 分離のまま)。テープを通すときだけ有効 (放送受信・RF 接続はコンポジット)
     SVideo,
+    /// コンポーネント (Y, Pb, Pr = B-Y, R-Y)。デッキの中で色を復調して色差のまま送る。
+    /// 受像機は Y/C 分離も色副搬送波の同期もしないので、ドットクロール・クロスカラー・色相の揺れが出ない
+    Component,
+    /// ダイレクト (デジタル / HDMI)。デッキの中で Y・色差を標本化してデジタルのまま送る。
+    /// 受像機のアナログ処理 (輪郭補正・ガンマ・画質調整) を通らず、色差は [`OutputParams::direct_sampling`] で間引かれる。
+    /// DV はデジタルの映像をそのまま出す
+    Direct,
+}
+
+impl Connection {
+    /// Y/C を分けたまま (S 映像以上) 送るか
+    pub fn separates_yc(self) -> bool {
+        self != Connection::Composite
+    }
+}
+
+/// ダイレクト接続 (HDMI) の色差の標本化
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ChromaSampling {
+    /// 4:4:4 (色差も画素ごと)
+    #[serde(rename = "444")]
+    Yuv444,
+    /// 4:2:2 (色差は水平に 2 画素で 1 つ)
+    #[default]
+    #[serde(rename = "422")]
+    Yuv422,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -1103,6 +1129,8 @@ pub struct OutputParams {
     pub deinterlace_params: DeinterlaceParams,
     /// 再生機 → 受像機の接続
     pub connection: Connection,
+    /// ダイレクト接続の色差の標本化
+    pub direct_sampling: ChromaSampling,
 }
 
 /// 方式別のインターレース解除調整値。

@@ -50,8 +50,12 @@ pub enum RawChannel {
     Composite,
     /// S 映像の Y (コンポジットのフィールドならコンポジットそのもの)
     Luma,
-    /// S 映像の C。0 IRE が `ire_lo`〜`ire_hi` の中央のコードになる (コンポジットのフィールドなら無信号)
+    /// S 映像の C。0 IRE が `ire_lo`〜`ire_hi` の中央のコードになる (コンポジット・コンポーネントのフィールドなら無信号)
     Chroma,
+    /// コンポーネントの Pb。0 が中央のコードになる (コンポーネント以外のフィールドなら無信号)
+    Pb,
+    /// コンポーネントの Pr
+    Pr,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -222,11 +226,20 @@ impl<W: Write> RawWriter<W> {
         self.line.clear();
         for l in 0..n_lines {
             let y = field.line(l);
+            let comp = field.component_lines(l);
+            let diff = match self.channel {
+                RawChannel::Chroma => field.chroma_line(l),
+                RawChannel::Pb => comp.map(|c| c.0),
+                RawChannel::Pr => comp.map(|c| c.1),
+                _ => None,
+            };
             match (self.channel, field.chroma_line(l)) {
                 (RawChannel::Composite, Some(c)) => self.line.extend(y.iter().zip(c).map(|(y, c)| y + c)),
                 (RawChannel::Composite | RawChannel::Luma, _) => self.line.extend_from_slice(y),
-                (RawChannel::Chroma, Some(c)) => self.line.extend(c.iter().map(|c| c + center)),
-                (RawChannel::Chroma, None) => self.line.extend(std::iter::repeat_n(center, ls)),
+                _ => match diff {
+                    Some(c) => self.line.extend(c.iter().map(|c| c + center)),
+                    None => self.line.extend(std::iter::repeat_n(center, ls)),
+                },
             }
         }
         self.up.process(&self.line, &mut self.upsampled);

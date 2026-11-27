@@ -13,6 +13,7 @@ pub mod audio;
 pub mod camera;
 pub mod caption;
 pub mod capture;
+pub mod component;
 mod clock;
 pub mod decoder;
 pub mod deinterlace;
@@ -523,6 +524,80 @@ mod tests {
             let (sv, cv) = (contrast(&p), contrast(&composite));
             assert!(sv > cv * 1.1, "pal={pal}: S-video contrast {sv} vs composite {cv}");
         }
+    }
+
+    /// コンポーネント・ダイレクト: テープを通しても色が保たれ、PAL の垂直揺れでも PAL スイッチを取り違えない。
+    /// 受像機の色相調整はコンポーネント以上では効かない
+    #[test]
+    fn component_and_direct_keep_color() {
+        for pal in [false, true] {
+            for conn in [params::Connection::Component, params::Connection::Direct] {
+                let mut p = if pal { pal_clean() } else { Params::default() };
+                p.decoder.clocks.chroma.offset_ppm = 0.0;
+                p.tape.enabled = true;
+                p.tape.luma_noise_ire = 0.0;
+                p.tape.chroma_noise_ire = 0.0;
+                p.tape.chroma_phase_noise_deg = 0.0;
+                p.tape.dropout_rate = 0.0;
+                p.transport.jitter_samples = 0.0;
+                p.transport.wow_samples = 0.0;
+                p.transport.vertical_jitter = if pal { 4.0 } else { 0.0 };
+                p.output.connection = conn;
+                p.decoder.hue_deg = 40.0;
+                for rgb in COLORS {
+                    let pl = run_flat(&p, rgb, 8);
+                    let (w, h) = pl.output_size();
+                    for row in [h / 2, h / 2 + 1] {
+                        let got = pixel(&pl, row, w / 2);
+                        for c in 0..3 {
+                            assert!((got[c] - rgb[c] as i32).abs() <= 28, "pal={pal} {conn:?} input {rgb:?} got {got:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// DV のダイレクト出力はアナログの信号を作らずに色を保つ (FireWire と同じ精度)
+    #[test]
+    fn dv_direct_keeps_color() {
+        for sampling in [params::ChromaSampling::Yuv444, params::ChromaSampling::Yuv422] {
+            let mut p = Params::default();
+            p.tape.enabled = true;
+            p.tape.format = params::TapeFormat::Dv;
+            p.output.connection = params::Connection::Direct;
+            p.output.direct_sampling = sampling;
+            for rgb in COLORS {
+                let pl = run_flat(&p, rgb, 4);
+                let (w, h) = pl.output_size();
+                let got = pixel(&pl, h / 2, w / 2);
+                for c in 0..3 {
+                    assert!((got[c] - rgb[c] as i32).abs() <= 4, "{sampling:?} input {rgb:?} got {got:?}");
+                }
+            }
+        }
+    }
+
+    /// 4:2:2 の間引き: 今のフィールドの行だけ、色の 1 画素おきの縞がにじみ、輝度は保たれる
+    #[test]
+    fn chroma_422_blurs_only_current_field_rows() {
+        let (w, h) = (16, 4);
+        let mut f = RgbaFrame::new(w, h);
+        for (i, px) in f.data.chunks_exact_mut(4).enumerate() {
+            px.copy_from_slice(if i % 2 == 0 { &[220, 40, 40, 255] } else { &[40, 40, 220, 255] });
+        }
+        let orig = f.data.clone();
+        component::subsample_rows(&mut f, 0, params::ChromaSampling::Yuv444);
+        assert_eq!(f.data, orig);
+        component::subsample_rows(&mut f, 0, params::ChromaSampling::Yuv422);
+        let px = |f: &RgbaFrame, r: usize, x: usize| -> [u8; 3] { let i = (r * w + x) * 4; [f.data[i], f.data[i + 1], f.data[i + 2]] };
+        let luma = |p: [u8; 3]| 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32;
+        // 奇数行 (別のフィールド) は触らない
+        assert_eq!(px(&f, 1, 6), px(&RgbaFrame { width: w, height: h, data: orig.clone() }, 1, 6));
+        let (a, b) = (px(&f, 0, 6), px(&f, 0, 7));
+        assert!((a[0] as i32 - b[0] as i32).abs() < 60, "{a:?} {b:?}");
+        let o = RgbaFrame { width: w, height: h, data: orig };
+        assert!((luma(a) - luma(px(&o, 0, 6))).abs() < 2.0);
     }
 
     /// PAL をテープに通しても色が保たれる。垂直揺れでライン順がずれても PAL スイッチの向きを取り違えない

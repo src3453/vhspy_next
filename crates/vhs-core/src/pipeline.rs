@@ -3,13 +3,14 @@
 use crate::adjust::InputAdjust;
 use crate::camera::{CameraInput, CameraSim};
 use crate::capture::{CaptureSim, CodecStats};
+use crate::component::ComponentOut;
 use crate::decoder::Decoder;
 use crate::deinterlace::Deinterlacer;
 use crate::dv::{DvSim, DvStats};
 use crate::encoder::{encode_field_full, encode_field_full_yiq, encode_field_yc_with_signal};
 use crate::frame::{Field, LinearFrame, RgbFrame, RgbaFrame, VideoFrame, YiqFrame};
 use crate::osd::Osd;
-use crate::params::{Connection, OsdMode, OsdParams, Params};
+use crate::params::{Connection, DecoderParams, OsdMode, OsdParams, Params};
 use crate::rf::RfSim;
 use crate::tape::TapeSim;
 use crate::tbc::Tbc;
@@ -48,6 +49,8 @@ pub struct Pipeline {
     /// DV の記録・再生 (デジタルのフォーマットのとき、アナログのテープの代わり)
     dv: DvSim,
     tbc: Tbc,
+    /// デッキの色復調器 (コンポーネント・ダイレクト出力)
+    component: ComponentOut,
     /// 放送受信 (テープの前) の RF
     rf_broadcast: RfSim,
     /// デッキ → テレビ (テープの後) の RF
@@ -81,6 +84,7 @@ impl Pipeline {
             tape: TapeSim::new(std),
             dv: DvSim::new(std),
             tbc: Tbc::new(std),
+            component: ComponentOut::default(),
             rf_broadcast: RfSim::default(),
             rf: RfSim::default(),
             decoder: Decoder::new(std),
@@ -257,11 +261,17 @@ impl Pipeline {
         let (mut t1, mut t1r, mut t2, mut t3) = (t_dv, t_dv, t_dv, t_dv);
         // 画面に描いた行の偶奇 (受像機が垂直同期から決める。画面が流れているとフィールドの偶奇と一致しない)
         let mut shown_parity = self.field.parity;
-        if p.encoder.enabled {
-            // S 映像はテープの再生出力を受像機へ直接つなぐときだけ (テープなし・テープ後の RF 接続はコンポジット)
-            let svideo = p.output.connection == Connection::SVideo
-                && p.tape.enabled
-                && !(p.rf.enabled && p.rf.placement.after_tape());
+        // デッキ → 受像機の接続。コンポジット以外はテープの再生出力を受像機へ直接つなぐときだけ
+        // (テープなし・テープ後の RF 接続はコンポジット)
+        let connection = if p.tape.enabled && !(p.rf.enabled && p.rf.placement.after_tape()) {
+            p.output.connection
+        } else {
+            Connection::Composite
+        };
+        // DV のダイレクト出力はデジタルの映像をそのまま出す (アナログの信号を作らない)
+        let encoded = p.encoder.enabled && !(digital && connection == Connection::Direct);
+        if encoded {
+            let svideo = connection.separates_yc();
             if digital {
                 // DV デッキはデジタルの映像から直接 Y/C (またはコンポジット) を作る
                 self.field.set_separate(svideo);
@@ -302,19 +312,36 @@ impl Pipeline {
             if p.rf.enabled && p.rf.placement.after_tape() {
                 self.rf.process(&mut self.field, &p.rf, p.seed);
             }
+            if matches!(connection, Connection::Component | Connection::Direct) {
+                // デッキの色復調器で Y, Pb, Pr にする
+                self.component.process(&mut self.field);
+            }
             t3 = Instant::now();
+            let direct_params;
+            let decoder_params = if connection == Connection::Direct {
+                direct_params = direct_decoder_params(p);
+                &direct_params
+            } else {
+                &p.decoder
+            };
             shown_parity = self.decoder.decode_field(
                 &self.field,
-                &p.decoder,
+                decoder_params,
                 p.tape.enabled && !digital,
                 &mut self.output,
             );
+            if connection == Connection::Direct {
+                crate::component::subsample_rows(&mut self.output, shown_parity, p.output.direct_sampling);
+            }
             if let Some(m) = crate::whitepoint::display_matrix(p.encoder.white_point, p.decoder.white_point) {
                 crate::whitepoint::apply_rows(&mut self.output, shown_parity, &m);
             }
         } else {
-            // コンポジットを通さない: 映像をデジタルのまま出す (DV なら FireWire 取り込み)
+            // コンポジットを通さない: 映像をデジタルのまま出す (DV なら FireWire 取り込み・HDMI 出力)
             write_field(input, self.field.parity, &mut self.output);
+            if p.encoder.enabled && connection == Connection::Direct {
+                crate::component::subsample_rows(&mut self.output, self.field.parity, p.output.direct_sampling);
+            }
         }
         self.deinterlacer.process_field(
             &mut self.output,
@@ -325,14 +352,16 @@ impl Pipeline {
         );
         let t4 = Instant::now();
         // 受像機の字幕デコーダ (画面に重ねる文字なので、インターレース解除の後に描く)
-        if p.encoder.enabled && p.decoder.caption_display {
+        // ダイレクト (HDMI) は VBI を運ばないので字幕・文字放送は出ない
+        let vbi_shown = encoded && connection != Connection::Direct;
+        if vbi_shown && p.decoder.caption_display {
             self.decoder.captions().render(&mut self.output, self.field_index);
         }
-        if p.encoder.enabled && p.decoder.teletext_display {
+        if vbi_shown && p.decoder.teletext_display {
             self.decoder.teletext().render(&mut self.output, self.field_index);
         }
         // コンポジット経路がない場合だけ、OSD をデジタル映像へ直接重ねる。
-        if !p.encoder.enabled {
+        if !encoded {
             if osd == Some(OsdMode::Composite) {
                 self.osd.burn_into_rgba(&mut self.output, opacity);
             }
@@ -366,6 +395,32 @@ impl Pipeline {
     /// 最終フィールドのコンポジット信号 (デバッグ・波形表示用)
     pub fn composite(&self) -> &Field {
         &self.field
+    }
+}
+
+/// ダイレクト (HDMI) 接続のときの受像機側の処理: デッキの中のデジタイザが同期を取って標本化し、
+/// 受像機はデジタルのまま表示する。受像機のアナログ処理 (輪郭補正・色相・ブラウン管のガンマ・発振器の揺れ) は通らない。
+/// 画質調整 (コントラスト・明るさ・色の濃さ)、白色点、デッキの再生 NR はそのまま効く
+fn direct_decoder_params(p: &Params) -> DecoderParams {
+    let d = &p.decoder;
+    DecoderParams {
+        setup: p.encoder.setup,
+        white_point: d.white_point,
+        contrast: d.contrast,
+        brightness: d.brightness,
+        saturation: d.saturation,
+        ynr_strength: d.ynr_strength,
+        dnr_strength: d.dnr_strength,
+        dnr_motion_threshold_ire: d.dnr_motion_threshold_ire,
+        nr_bits: d.nr_bits,
+        gamma: 2.2,
+        hue_deg: 0.0,
+        luma_shelf_db: 0.0,
+        chroma_shelf_db: 0.0,
+        vertical_position: 0.0,
+        caption_display: false,
+        teletext_display: false,
+        ..DecoderParams::default()
     }
 }
 
