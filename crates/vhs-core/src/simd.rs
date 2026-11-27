@@ -53,6 +53,40 @@ impl F32x8 {
     }
 }
 
+/// 表の線形補間 `t[i] + (t[i + 1] - t[i]) · (pos - i)`、`i = (pos as usize).min(max_i)` をレーンごとに行う
+/// (スカラーの同じ式とビット単位で一致する。NaN・負・巨大な pos の添字の扱いも `as usize` と同じ)。
+/// x86_64 では AVX2 の gather を使うので、[`x8`] が真の経路 ([`x8_kernel!`] の中) からだけ呼ぶこと
+#[inline(always)]
+pub fn table_lerp(table: &[f32], pos: F32x8, max_i: usize) -> F32x8 {
+    assert!(max_i + 1 < table.len() && max_i < i32::MAX as usize);
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: 添字は 0..=max_i に収め、max_i + 1 は表の中。AVX2 は呼び出し側が保証する
+    unsafe {
+        use std::arch::x86_64::*;
+        let p = _mm256_loadu_ps(pos.0.as_ptr());
+        let mut j = _mm256_cvttps_epi32(p);
+        // 2^31 以上は cvttps が INT_MIN を返すが、as usize では max_i に張り付く
+        let big = _mm256_castps_si256(_mm256_cmp_ps::<_CMP_GE_OQ>(p, _mm256_set1_ps(2147483648.0)));
+        let maxv = _mm256_set1_epi32(max_i as i32);
+        j = _mm256_blendv_epi8(j, maxv, big);
+        // 負・NaN は 0
+        j = _mm256_min_epi32(_mm256_max_epi32(j, _mm256_setzero_si256()), maxv);
+        let fr = _mm256_sub_ps(p, _mm256_cvtepi32_ps(j));
+        let t0 = _mm256_i32gather_ps::<4>(table.as_ptr(), j);
+        let t1 = _mm256_i32gather_ps::<4>(table.as_ptr().add(1), j);
+        let r = _mm256_add_ps(t0, _mm256_mul_ps(_mm256_sub_ps(t1, t0), fr));
+        let mut out = F32x8::splat(0.0);
+        _mm256_storeu_ps(out.0.as_mut_ptr(), r);
+        out
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    F32x8::from_fn(|l| {
+        let i = (pos.0[l] as usize).min(max_i);
+        let fr = pos.0[l] - i as f32;
+        table[i] + (table[i + 1] - table[i]) * fr
+    })
+}
+
 /// `buf` にライン長 `ls` おきに並んだ 8 本のライン (長さはちょうど `ls`)
 #[inline(always)]
 pub fn rows(buf: &[f32], ls: usize) -> [&[f32]; LANES] {
@@ -157,15 +191,15 @@ fn x8_supported() -> bool {
 /// それ以外ではそのまま呼ぶ (aarch64 は NEON が必須なので常に有効)。
 /// 呼び出し側は [`x8`] が真のときだけ呼ぶこと
 macro_rules! x8_kernel {
-    ($(#[$m:meta])* $vis:vis fn $name:ident $(<$($lt:lifetime),*>)? ($($arg:ident : $ty:ty),* $(,)?) $body:block) => {
+    ($(#[$m:meta])* $vis:vis fn $name:ident $(<$($lt:lifetime),*>)? ($($arg:ident : $ty:ty),* $(,)?) $(-> $ret:ty)? $body:block) => {
         $(#[$m])*
-        $vis fn $name $(<$($lt),*>)? ($($arg: $ty),*) {
+        $vis fn $name $(<$($lt),*>)? ($($arg: $ty),*) $(-> $ret)? {
             #[inline(always)]
-            fn inner $(<$($lt),*>)? ($($arg: $ty),*) $body
+            fn inner $(<$($lt),*>)? ($($arg: $ty),*) $(-> $ret)? $body
             #[cfg(target_arch = "x86_64")]
             {
                 #[target_feature(enable = "avx2")]
-                fn avx2 $(<$($lt),*>)? ($($arg: $ty),*) {
+                fn avx2 $(<$($lt),*>)? ($($arg: $ty),*) $(-> $ret)? {
                     inner($($arg),*)
                 }
                 debug_assert!($crate::simd::x8());
@@ -193,6 +227,36 @@ mod tests {
             let mut out = rows_mut(out, ls);
             for n in 0..ls {
                 v.process(F32x8::gather(&refs, n)).scatter(&mut out, n);
+            }
+        }
+    }
+
+    x8_kernel! {
+        fn lerp_x8(table: &[f32], pos: F32x8, max_i: usize) -> F32x8 {
+            table_lerp(table, pos, max_i)
+        }
+    }
+
+    /// 表引きは `as usize` の添字の扱い (負・NaN・巨大・無限大) も含めてスカラーの式と一致する
+    #[test]
+    fn table_lerp_matches_scalar() {
+        if !x8() {
+            return;
+        }
+        let table: Vec<f32> = (0..=100).map(|i| (i as f32 * 0.37).sin()).collect();
+        let max_i = 99;
+        let cases = [
+            0.0, 0.5, 1.25, 50.75, 98.9, 99.0, 99.5, 120.0, -0.5, -3.0, f32::NAN, f32::INFINITY, -f32::INFINITY, 3e9, 2147483648.0,
+            1e-30,
+        ];
+        for chunk in cases.chunks(LANES) {
+            let mut p = [0f32; LANES];
+            p[..chunk.len()].copy_from_slice(chunk);
+            let got = lerp_x8(&table, F32x8(p), max_i);
+            for l in 0..LANES {
+                let i = (p[l] as usize).min(max_i);
+                let want = table[i] + (table[i + 1] - table[i]) * (p[l] - i as f32);
+                assert_eq!(got.0[l].to_bits(), want.to_bits(), "pos {}", p[l]);
             }
         }
     }

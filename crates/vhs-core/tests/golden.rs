@@ -113,3 +113,21 @@ fn golden_ntsc_comb() {
     p.decoder.gamma = 2.5;
     run("ntsc_comb", p);
 }
+
+#[test]
+fn golden_ntsc_fm_ja() {
+    let mut p = full();
+    p.tape.luma_model = vhs_core::params::LumaModel::Fm;
+    p.tape.magnetic_model = vhs_core::params::MagneticModel::JilesAtherton;
+    p.tape.head_spacing_um = 0.05;
+    run("ntsc_fm_ja", p);
+}
+
+#[test]
+fn golden_ntsc_fm_linear() {
+    let mut p = full();
+    p.tape.luma_model = vhs_core::params::LumaModel::Fm;
+    p.tape.magnetic_model = vhs_core::params::MagneticModel::Linear;
+    p.tape.crease_rate = 0.5;
+    run("ntsc_fm_linear", p);
+}

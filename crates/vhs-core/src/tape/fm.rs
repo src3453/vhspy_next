@@ -20,6 +20,7 @@
 //!    (白のエッジの右に黒い筋 = ベアディング)。搬送波が消えるとノイズのゼロ交差を拾い、白黒の砂嵐になる
 
 use crate::filter::Cascade;
+use crate::simd::LANES;
 use super::magnetic::MagneticTransfer;
 use crate::rng::Rng;
 use crate::timing::{Levels, MAX_LINE_SAMPLES};
@@ -93,6 +94,273 @@ fn cross_fraction(x: &[f32], m: usize) -> f32 {
         t = t0 - f0 * (t1 - t0) / d;
     }
     t.clamp(0.0, 1.0)
+}
+
+crate::simd::x8_kernel! {
+    /// [`FmChannel::process_line`] の変調 (無記憶の磁性体・2 倍オーバーサンプリング) を段に分けた版。
+    /// 補間・周波数・cos の表引き・磁性体はサンプルごとに独立なのでベクトル化し、搬送波と低域変換クロマの
+    /// 位相の積算だけを逐次に回す。各サンプルの演算はもとのループと同じ順序なので、結果はビット単位で一致する
+    #[allow(clippy::too_many_arguments)]
+    fn modulate_memoryless_x8<'a>(
+        ch: &FmChannel,
+        luma: &[f32],
+        cu: Option<(&'a [f32], &'a [f32])>,
+        amp: f32,
+        line_spacing: f32,
+        drop: &[super::Dropout],
+        phase0: f32,
+        cu_phase0: f32,
+        rf: &mut [f32],
+    ) {
+        use crate::simd::{F32x8, LANES, table_lerp};
+        use std::f32::consts::{FRAC_PI_2, TAU};
+        const OS: usize = OVERSAMPLE;
+        let n = luma.len();
+        let len = rf.len();
+        let n_src = n + PRE_ROLL;
+        debug_assert_eq!(len, n_src * OS);
+        let pre = PRE_ROLL * OS;
+
+        // 元のレートの値 (助走はシンクチップ、先頭の 1 つ前と末尾の先はクランプ) を at(i - 1) から並べる
+        let mut pad = [0f32; MAX_LINE_SAMPLES + PRE_ROLL + 3];
+        for (k, p) in pad[..n_src + 3].iter_mut().enumerate() {
+            let j = k as isize - 1 - PRE_ROLL as isize;
+            *p = if j < 0 { ch.lv.sync } else { luma[(j as usize).min(n - 1)] };
+        }
+        // 1. 補間 (Catmull-Rom、frac = 0.5) と瞬時周波数
+        let mut f = [0f32; MAX_LEN];
+        let f = &mut f[..len];
+        let frac = 1.0 / OS as f32;
+        let (t2, t3) = (frac * frac, frac * frac * frac);
+        for (i, fo) in f.chunks_exact_mut(OS).enumerate() {
+            let (p0, p1, p2, p3) = (pad[i], pad[i + 1], pad[i + 2], pad[i + 3]);
+            fo[0] = ch.freq_of(p1);
+            let v = 0.5
+                * ((2.0 * p1)
+                    + (-p0 + p2) * frac
+                    + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+                    + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3);
+            fo[1] = ch.freq_of(v);
+        }
+        // 2. 位相の積算 (逐次)
+        let fs_gen = ch.fs2;
+        let (dphi_k, dcu) = (TAU / fs_gen, TAU * ch.cu_freq / fs_gen);
+        let mut ph = [0f32; MAX_LEN];
+        let ph = &mut ph[..len];
+        let mut phase = phase0;
+        for (p, &fi) in ph.iter_mut().zip(f.iter()) {
+            phase += dphi_k * fi;
+            if phase > TAU {
+                phase -= TAU;
+            }
+            *p = phase;
+        }
+        // 3. 搬送波の振幅 (スペーシング損失があるときだけ。exp は逐次のまま)
+        let mut a = [amp; MAX_LEN];
+        let a = &mut a[..len];
+        if line_spacing > 0.0 || !drop.is_empty() {
+            for (m, am) in a.iter_mut().enumerate() {
+                let src = (m / OS).saturating_sub(PRE_ROLL);
+                let mut spacing = line_spacing;
+                if m >= pre {
+                    for &(s, e, depth) in drop {
+                        let d = if src < s { s - src } else if src >= e { src + 1 - e } else { 0 };
+                        if d < super::DROPOUT_EDGE {
+                            spacing += depth * (1.0 - d as f32 / super::DROPOUT_EDGE as f32);
+                        }
+                    }
+                }
+                if spacing > 0.0 {
+                    *am *= (-ch.spacing_k * f[m].max(0.0) * spacing).exp();
+                }
+            }
+        }
+        // 4. 搬送波 (+ 低域変換クロマ) の表引き
+        let ct = cos_table();
+        let kpos = F32x8::splat(COS_N as f32 / TAU);
+        let full = len / LANES * LANES;
+        for m0 in (0..full).step_by(LANES) {
+            let c = table_lerp(ct, F32x8::load(&ph[m0..]) * kpos, COS_N - 1);
+            rf[m0..m0 + LANES].copy_from_slice(&c.0);
+        }
+        for m in full..len {
+            rf[m] = fast_cos(ct, ph[m]);
+        }
+        if let Some((cu_i, cu_q)) = cu {
+            // 低域変換クロマの位相は助走の後から回る
+            let mut cph = [0f32; MAX_LEN];
+            let cph = &mut cph[..len];
+            let mut cu_phase = cu_phase0;
+            for p in cph[pre..].iter_mut() {
+                cu_phase += dcu;
+                if cu_phase > TAU {
+                    cu_phase -= TAU;
+                }
+                *p = cu_phase;
+            }
+            let gain = F32x8::splat(ch.cu_gain);
+            let (q2, tau) = (F32x8::splat(FRAC_PI_2), F32x8::splat(TAU));
+            let mut m0 = pre;
+            while m0 + LANES <= len {
+                let p = F32x8::load(&cph[m0..]);
+                let cos = table_lerp(ct, p * kpos, COS_N - 1);
+                // fast_sin: p - π/2 が負なら 2π を足す
+                let ps = p - q2;
+                let ps = F32x8::from_fn(|l| if ps.0[l] < 0.0 { ps.0[l] + tau.0[l] } else { ps.0[l] });
+                let sin = table_lerp(ct, ps * kpos, COS_N - 1);
+                let ci = F32x8::from_fn(|l| cu_i[(m0 + l) / OS - PRE_ROLL]);
+                let cq = F32x8::from_fn(|l| cu_q[(m0 + l) / OS - PRE_ROLL]);
+                let r = F32x8::load(&rf[m0..]) + gain * (ci * cos - cq * sin);
+                rf[m0..m0 + LANES].copy_from_slice(&r.0);
+                m0 += LANES;
+            }
+            for m in m0..len {
+                let j = m / OS - PRE_ROLL;
+                rf[m] += ch.cu_gain * (cu_i[j] * fast_cos(ct, cph[m]) - cu_q[j] * fast_sin(ct, cph[m]));
+            }
+        }
+        // 5. 磁性体 (無記憶) と振幅
+        for (r, &am) in rf.iter_mut().zip(a.iter()) {
+            *r = am * ch.mag.transfer(*r);
+        }
+    }
+}
+
+/// 交差 `ms` それぞれの [`cross_fraction`] を `out` に書く
+fn cross_fractions(x: &[f32], ms: &[usize], out: &mut [f32]) {
+    use crate::simd::LANES;
+    let full = ms.len() / LANES * LANES;
+    if crate::simd::x8() {
+        cross_fractions_x8(x, &ms[..full], &mut out[..full]);
+    } else {
+        for (o, &m) in out[..full].iter_mut().zip(&ms[..full]) {
+            *o = cross_fraction(x, m);
+        }
+    }
+    for (o, &m) in out[full..].iter_mut().zip(&ms[full..]) {
+        *o = cross_fraction(x, m);
+    }
+}
+
+crate::simd::x8_kernel! {
+    /// [`cross_fraction`] を 8 交差ずつ同時に解く (交差 = レーン)。各レーンの演算・分岐はスカラー版と同じ
+    fn cross_fractions_x8(x: &[f32], ms: &[usize], out: &mut [f32]) {
+        use crate::simd::{F32x8, LANES};
+        for (mc, oc) in ms.chunks_exact(LANES).zip(out.chunks_exact_mut(LANES)) {
+            let p1 = F32x8::from_fn(|l| x[mc[l] - 1]);
+            let p2 = F32x8::from_fn(|l| x[mc[l]]);
+            let base: [isize; LANES] = std::array::from_fn(|l| mc[l] as isize - 1);
+            let (mut t0, mut f0) = ([0f32; LANES], p1.0);
+            let (mut t1, mut f1) = ([1f32; LANES], p2.0);
+            let mut t = F32x8::from_fn(|l| p1.0[l] / (p1.0[l] - p2.0[l])).0;
+            let mut done = [false; LANES];
+            for _ in 0..2 {
+                let f = lanczos_at_x8(x, &base, F32x8(t)).0;
+                for l in 0..LANES {
+                    if done[l] {
+                        continue;
+                    }
+                    if (f[l] < 0.0) == (f0[l] < 0.0) {
+                        (t0[l], f0[l]) = (t[l], f[l]);
+                    } else {
+                        (t1[l], f1[l]) = (t[l], f[l]);
+                    }
+                    let d = f1[l] - f0[l];
+                    if d.abs() < 1e-12 {
+                        done[l] = true;
+                        continue;
+                    }
+                    t[l] = t0[l] - f0[l] * (t1[l] - t0[l]) / d;
+                }
+            }
+            for l in 0..LANES {
+                oc[l] = t[l].clamp(0.0, 1.0);
+            }
+        }
+    }
+}
+
+/// [`lanczos_at`] の 8 レーン版 (レーンごとに別の位置)。各レーンの足し算の順序は同じ
+#[inline(always)]
+fn lanczos_at_x8(x: &[f32], base: &[isize; crate::simd::LANES], t: crate::simd::F32x8) -> crate::simd::F32x8 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: AVX2 の経路 (x8_kernel の中) からだけ呼ばれる
+        if let Some(v) = unsafe { lanczos_at_avx2(x, base, t) } {
+            return v;
+        }
+        let mut r = crate::simd::F32x8::splat(0.0);
+        for l in 0..crate::simd::LANES {
+            r.0[l] = lanczos_at(x, base[l], t.0[l]);
+        }
+        r
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    lanczos_at_x8_portable(x, base, t)
+}
+
+/// [`lanczos_at_x8`] の AVX2 版: 信号と窓の表を gather で引く。
+/// 窓の表の添字がどれかのレーンで範囲外 (異常な t) なら None を返し、呼び出し側がスカラーで計算する
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn lanczos_at_avx2(x: &[f32], base: &[isize; crate::simd::LANES], t: crate::simd::F32x8) -> Option<crate::simd::F32x8> {
+    use std::arch::x86_64::*;
+    const A: i32 = LANCZOS_A as i32;
+    let table = lanczos_table();
+    debug_assert!(x.len() < i32::MAX as usize);
+    unsafe {
+        let tv = _mm256_loadu_ps(t.0.as_ptr());
+        let res = _mm256_set1_ps(LANCZOS_RES as f32);
+        let sign = _mm256_set1_ps(-0.0);
+        // 表の添字 j と j + 1 が範囲に収まるか (pos < len - 1。NaN は外れる)
+        let limit = _mm256_set1_ps((table.len() - 1) as f32);
+        let mut ok = true;
+        let base_v = _mm256_setr_epi32(
+            base[0] as i32, base[1] as i32, base[2] as i32, base[3] as i32,
+            base[4] as i32, base[5] as i32, base[6] as i32, base[7] as i32,
+        );
+        let (lo, hi) = (_mm256_setzero_si256(), _mm256_set1_epi32(x.len() as i32 - 1));
+        let mut acc = _mm256_setzero_ps();
+        for k in (1 - A)..=A {
+            let i = _mm256_min_epi32(_mm256_max_epi32(_mm256_add_epi32(base_v, _mm256_set1_epi32(k)), lo), hi);
+            let xv = _mm256_i32gather_ps::<4>(x.as_ptr(), i);
+            let pos = _mm256_mul_ps(_mm256_andnot_ps(sign, _mm256_sub_ps(tv, _mm256_set1_ps(k as f32))), res);
+            ok &= _mm256_movemask_ps(_mm256_cmp_ps::<_CMP_LT_OQ>(pos, limit)) == 0xFF;
+            if !ok {
+                return None;
+            }
+            let j = _mm256_cvttps_epi32(pos);
+            let fr = _mm256_sub_ps(pos, _mm256_cvtepi32_ps(j));
+            let w0 = _mm256_i32gather_ps::<4>(table.as_ptr(), j);
+            let w1 = _mm256_i32gather_ps::<4>(table.as_ptr().add(1), j);
+            let w = _mm256_add_ps(w0, _mm256_mul_ps(_mm256_sub_ps(w1, w0), fr));
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(xv, w));
+        }
+        let mut r = crate::simd::F32x8::splat(0.0);
+        _mm256_storeu_ps(r.0.as_mut_ptr(), acc);
+        Some(r)
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn lanczos_at_x8_portable(x: &[f32], base: &[isize; crate::simd::LANES], t: crate::simd::F32x8) -> crate::simd::F32x8 {
+    use crate::simd::{F32x8, LANES};
+    const A: isize = LANCZOS_A as isize;
+    let table = lanczos_table();
+    let last = x.len() as isize - 1;
+    let mut acc = F32x8::splat(0.0);
+    for k in (1 - A)..=A {
+        let xv = F32x8::from_fn(|l| x[(base[l] + k).clamp(0, last) as usize]);
+        let pos = F32x8::from_fn(|l| (t.0[l] - k as f32).abs() * LANCZOS_RES as f32);
+        let j: [usize; LANES] = std::array::from_fn(|l| pos.0[l] as usize);
+        let fr = F32x8::from_fn(|l| pos.0[l] - j[l] as f32);
+        let w0 = F32x8::from_fn(|l| table[j[l]]);
+        let w1 = F32x8::from_fn(|l| table[j[l] + 1]);
+        let w = w0 + (w1 - w0) * fr;
+        acc = acc + xv * w;
+    }
+    acc
 }
 
 /// cos の表の大きさ (1 周期)
@@ -276,6 +544,17 @@ impl FmChannel {
     ///
     /// ライン・ドロップアウトのスペーシングは時間とともに変わるので FIR にせず、その瞬間の搬送波周波数での
     /// 損失 e^{-2π f d / v} を振幅に掛ける (準静的な近似。側波帯ごとの傾きは無視する)
+    /// 1 ラインを記録・再生する。
+    ///
+    /// - `luma`: 記録する輝度 (エンファシス・クリップ後) [IRE]
+    /// - `cu_i`, `cu_q`: 低域変換クロマの複素包絡線 [IRE] (色がなければ空でよい)
+    /// - `amp`: 搬送波の振幅 (トラッキングずれによる RF レベル。周波数によらない)
+    /// - `line_spacing`: このラインの余分なスペーシング (しわ・目詰まり) [m]
+    /// - `drop`: ドロップアウト ([開始, 終了) [サンプル] とスペーシング [m])。縁はなだらかに立ち上げる
+    /// - `out`: 復調した輝度 [IRE] (ディエンファシス前)
+    ///
+    /// ライン・ドロップアウトのスペーシングは時間とともに変わるので FIR にせず、その瞬間の搬送波周波数での
+    /// 損失 e^{-2π f d / v} を振幅に掛ける (準静的な近似。側波帯ごとの傾きは無視する)
     #[allow(clippy::too_many_arguments)]
     pub fn process_line(
         &self,
@@ -288,13 +567,80 @@ impl FmChannel {
         rng: &mut Rng,
         out: &mut [f32],
     ) {
+        let len = rf_len(luma.len());
+        let mut rf = [0f32; MAX_LEN];
+        let rf = &mut rf[..len];
+        self.record(luma, cu_i, cu_q, amp, line_spacing, drop, rng, rf);
+        let (mut lp, mut hp) = (self.rf_lp, self.rf_hp);
+        for v in rf.iter_mut() {
+            *v = hp.process(lp.process(*v));
+        }
+        let mut freq = [0f32; MAX_LEN];
+        let freq = &mut freq[..len];
+        self.demodulate(rf, freq);
+        let mut post = self.post_lp;
+        for v in freq.iter_mut() {
+            *v = post.process(*v);
+        }
+        self.resample(freq, out);
+    }
+
+    /// 8 ラインをまとめて記録・再生する ([`process_line`](Self::process_line) を 8 回呼ぶのと同じ結果)。
+    /// 伝送路と復調後の IIR は 8 ラインを SIMD のレーンに並べ (縦方向)、変調と復調はラインごとに行う。
+    /// `luma`・`cu_i`・`cu_q`・`out` は 8 ラインがライン長 `n` おきに並ぶ (色がなければ `cu_i`・`cu_q` は空)
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_lines_x8(
+        &self,
+        n: usize,
+        luma: &[f32],
+        cu_i: &[f32],
+        cu_q: &[f32],
+        amp: &[f32; LANES],
+        line_spacing: &[f32; LANES],
+        drop: &[&[super::Dropout]; LANES],
+        rng: &mut [Rng; LANES],
+        out: &mut [f32],
+    ) {
+        let len = rf_len(n);
+        let mut rf = vec![0f32; LANES * len];
+        let has_cu = !cu_i.is_empty();
+        for l in 0..LANES {
+            let r = l * n..(l + 1) * n;
+            let (ci, cq) = if has_cu { (&cu_i[r.clone()], &cu_q[r.clone()]) } else { (&[][..], &[][..]) };
+            self.record(&luma[r], ci, cq, amp[l], line_spacing[l], drop[l], &mut rng[l], &mut rf[l * len..(l + 1) * len]);
+        }
+        iir2_x8(&self.rf_lp, &self.rf_hp, &mut rf, len);
+        let mut freq = vec![0f32; LANES * len];
+        for l in 0..LANES {
+            let r = l * len..(l + 1) * len;
+            self.demodulate(&rf[r.clone()], &mut freq[r]);
+        }
+        iir2_x8(&self.post_lp, &Cascade::default(), &mut freq, len);
+        for l in 0..LANES {
+            self.resample(&freq[l * len..(l + 1) * len], &mut out[l * n..(l + 1) * n]);
+        }
+    }
+
+    /// 記録して伝送路の入口まで: 変調・磁性体・余分なスペーシングの FIR と RF ノイズ。`rf` の長さは [`rf_len`]
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &self,
+        luma: &[f32],
+        cu_i: &[f32],
+        cu_q: &[f32],
+        amp: f32,
+        line_spacing: f32,
+        drop: &[super::Dropout],
+        rng: &mut Rng,
+        rf: &mut [f32],
+    ) {
         use std::f32::consts::TAU;
         let n = luma.len();
-        debug_assert!(n <= MAX_LINE_SAMPLES && out.len() == n);
+        debug_assert!(n <= MAX_LINE_SAMPLES && rf.len() == rf_len(n));
         let os = self.oversample;
         let decim = os / OVERSAMPLE;
         let len_gen = (n + PRE_ROLL) * os;
-        let len = (n + PRE_ROLL) * OVERSAMPLE;
+        let len = rf.len();
         let has_cu = cu_i.len() == n && cu_q.len() == n && self.cu_gain > 0.0;
 
         // 元のレートでの値 (助走区間はシンクチップ)
@@ -304,18 +650,24 @@ impl FmChannel {
         };
 
         // --- 変調 + 伝送路 ---
-        let mut rf = [0f32; MAX_LEN];
         let mut phase = rng.uniform() * TAU;
         let mut cu_phase = rng.uniform() * TAU;
         let fs_gen = self.fs2 * decim as f32;
         let (dphi_k, dcu) = (TAU / fs_gen, TAU * self.cu_freq / fs_gen);
-        let (mut lp, mut hp) = (self.rf_lp, self.rf_hp);
         let mut aa = self.decimate;
         // Line-local state keeps this PoC compatible with the existing parallel line renderer.
         // The sync-carrier pre-roll gives the hysteresis loop several cycles to settle.
         let mut magnetic = self.mag.state();
         let ct = cos_table();
-        for m in 0..len_gen {
+        let staged = !self.mag.is_jiles_atherton() && crate::simd::x8();
+        if staged {
+            // 無記憶の磁性体 (2 倍、間引きなし): 位相の積算だけを逐次にし、残りはサンプル方向にベクトル化する
+            debug_assert!(os == OVERSAMPLE && aa.is_none());
+            let (phase0, cu_phase0) = (phase, cu_phase);
+            let cu = has_cu.then_some((cu_i, cu_q));
+            modulate_memoryless_x8(self, luma, cu, amp, line_spacing, drop, phase0, cu_phase0, rf);
+        }
+        for m in 0..if staged { 0 } else { len_gen } {
             let i = (m / os) as isize;
             // Catmull-Rom interpolation. At 2x this is the previous midpoint formula.
             let frac = (m % os) as f32 / os as f32;
@@ -377,7 +729,7 @@ impl FmChannel {
             let h = self.spacing_half;
             let taps = &self.spacing[..2 * h + 1];
             let mut src = [0f32; MAX_LEN];
-            src[..len].copy_from_slice(&rf[..len]);
+            src[..len].copy_from_slice(rf);
             for (m, o) in rf.iter_mut().enumerate().take(len) {
                 let mut acc = 0f32;
                 for (j, t) in taps.iter().enumerate() {
@@ -387,48 +739,74 @@ impl FmChannel {
                 *o = acc;
             }
         }
-        for v in rf.iter_mut().take(len) {
-            let x = *v + self.noise * rng.normal();
-            *v = hp.process(lp.process(x));
+        for v in rf.iter_mut() {
+            *v += self.noise * rng.normal();
         }
+    }
 
-        // --- リミッタ + 周期計測型の復調 ---
-        // ゼロ交差 (両方向) の間隔 Δt から f = 1 / (2Δt)。区間内のサンプルにはその区間の周波数を入れる
-        let mut freq = [0f32; MAX_LEN];
+    /// リミッタ + 周期計測型の復調: ゼロ交差 (両方向) の間隔 Δt から f = 1 / (2Δt)。
+    /// 区間内のサンプルにはその区間の周波数を入れる
+    fn demodulate(&self, rf: &[f32], freq: &mut [f32]) {
+        let len = rf.len();
         let mut last_cross = 0f32;
         let mut filled = 0usize;
         let mut f_prev = self.f_sync;
+        // 交差の位置を先に集め、交差ごとに独立な小数位置の計算をまとめて行う (8 交差ずつ SIMD のレーンに並べる)
+        let mut crosses = [0usize; MAX_LEN];
+        let mut n_cross = 0;
         for m in 1..len {
-            let (a, b) = (rf[m - 1], rf[m]);
-            if (a < 0.0) != (b < 0.0) {
-                let t = (m - 1) as f32 + cross_fraction(&rf[..len], m);
-                let dt = (t - last_cross).max(1e-3);
-                let f = self.fs2 / (2.0 * dt);
-                for v in &mut freq[filled..m] {
-                    *v = f;
-                }
-                filled = m;
-                last_cross = t;
-                f_prev = f;
+            if (rf[m - 1] < 0.0) != (rf[m] < 0.0) {
+                crosses[n_cross] = m;
+                n_cross += 1;
             }
         }
+        let mut fracs = [0f32; MAX_LEN];
+        cross_fractions(rf, &crosses[..n_cross], &mut fracs[..n_cross]);
+        for (&m, &frac) in crosses[..n_cross].iter().zip(&fracs[..n_cross]) {
+            let t = (m - 1) as f32 + frac;
+            let dt = (t - last_cross).max(1e-3);
+            let f = self.fs2 / (2.0 * dt);
+            for v in &mut freq[filled..m] {
+                *v = f;
+            }
+            filled = m;
+            last_cross = t;
+            f_prev = f;
+        }
         // 最後の交差以降は、その時点までの経過から周波数の上限を見積もる (交差がなければ下がっていく)
-        for (m, v) in freq.iter_mut().enumerate().take(len).skip(filled) {
+        for (m, v) in freq.iter_mut().enumerate().skip(filled) {
             let dt = (m as f32 - last_cross).max(1.0);
             *v = f_prev.min(self.fs2 / (2.0 * dt));
         }
+    }
 
-        // --- 復調後のローパス ---
-        let mut post = self.post_lp;
-        for v in freq.iter_mut().take(len) {
-            *v = post.process(*v);
-        }
-        // --- 遅れを打ち消して間引く ---
+    /// 遅れを打ち消して元のレートに間引き、周波数を輝度に戻す
+    fn resample(&self, freq: &[f32], out: &mut [f32]) {
+        let len = freq.len();
         for (j, o) in out.iter_mut().enumerate() {
             let t = ((j + PRE_ROLL) * OVERSAMPLE) as f32 + self.delay;
             let i0 = (t.floor() as usize).min(len - 2);
             let fr = (t - i0 as f32).clamp(0.0, 1.0);
             *o = self.level_of(freq[i0] + (freq[i0 + 1] - freq[i0]) * fr);
+        }
+    }
+}
+
+/// ライン長 `n` に対する再生側のバッファの長さ (助走込み、2 倍オーバーサンプリング)
+pub fn rf_len(n: usize) -> usize {
+    (n + PRE_ROLL) * OVERSAMPLE
+}
+
+crate::simd::x8_kernel! {
+    /// 8 ライン (長さ `len` おき) に縦続 IIR `f` → `g` を掛ける (縦方向 SIMD)。
+    /// 各レーンは `g.process(f.process(x))` をラインごとに回すのと同じ演算
+    fn iir2_x8(f: &Cascade, g: &Cascade, buf: &mut [f32], len: usize) {
+        use crate::simd::{F32x8, rows_mut};
+        let mut rows = rows_mut(buf, len);
+        let (mut f, mut g) = (f.lanes::<F32x8>(), g.lanes::<F32x8>());
+        for m in 0..len {
+            let x = F32x8::from_fn(|l| rows[l][m]);
+            g.process(f.process(x)).scatter(&mut rows, m);
         }
     }
 }
@@ -508,6 +886,54 @@ mod tests {
         let line = |level: f32| sd_in(level, 0.35e-6, &[], 100..800) / sd_in(level, 0.0, &[], 100..800);
         let (black, white) = (line(7.5), line(100.0));
         assert!(black > 1.0 && white > black, "line spacing noise ratio: black {black}, white {white}");
+    }
+
+    /// 8 ラインまとめた処理は、ラインごとの処理とビット単位で一致する (色・ドロップアウト・スペーシング・ノイズ込み)
+    #[test]
+    fn lines_x8_match_per_line() {
+        use crate::params::{JaSolver, MagneticMedia, MagneticModel};
+        if !crate::simd::x8() {
+            return;
+        }
+        let n = 910;
+        for model in [MagneticModel::Linear, MagneticModel::Tanh, MagneticModel::JilesAtherton] {
+            let ch = FmChannel::new(&FmConfig {
+                fs: NTSC.fs,
+                f_sync_hz: 3.4e6,
+                f_white_hz: 4.4e6,
+                levels: NTSC.ire,
+                channel_bw_hz: 5.5e6,
+                luma_bw_hz: 3.0e6,
+                noise: 0.05,
+                color_under_hz: 629e3,
+                color_under_level: 0.1,
+                mag: MagneticTransfer::rf(model, MagneticMedia::MetalParticle, 0.8, 3.0, JaSolver::Table),
+                writing_speed: 5.8,
+                extra_spacing: 0.05e-6,
+                ja_oversample: 4,
+            });
+            let luma: Vec<f32> = (0..LANES * n).map(|i| 50.0 + 45.0 * ((i % n) as f32 * 0.013 * (1 + i / n) as f32).sin()).collect();
+            let cu_i: Vec<f32> = (0..LANES * n).map(|i| 20.0 * (i as f32 * 0.002).cos()).collect();
+            let cu_q: Vec<f32> = (0..LANES * n).map(|i| 20.0 * (i as f32 * 0.003).sin()).collect();
+            let amp: [f32; LANES] = std::array::from_fn(|l| 1.0 - 0.05 * l as f32);
+            let spacing: [f32; LANES] = std::array::from_fn(|l| if l % 3 == 0 { 0.1e-6 } else { 0.0 });
+            let drops: Vec<Vec<crate::tape::Dropout>> =
+                (0..LANES).map(|l| if l % 2 == 1 { vec![(100 + 50 * l, 160 + 50 * l, 0.4e-6)] } else { vec![] }).collect();
+            let dr: [&[crate::tape::Dropout]; LANES] = std::array::from_fn(|l| drops[l].as_slice());
+
+            let mut want = vec![0f32; LANES * n];
+            for l in 0..LANES {
+                let r = l * n..(l + 1) * n;
+                let mut rng = Rng::new(l as u64);
+                ch.process_line(&luma[r.clone()], &cu_i[r.clone()], &cu_q[r.clone()], amp[l], spacing[l], dr[l], &mut rng, &mut want[r]);
+            }
+            let mut rngs: [Rng; LANES] = std::array::from_fn(|l| Rng::new(l as u64));
+            let mut got = vec![0f32; LANES * n];
+            ch.process_lines_x8(n, &luma, &cu_i, &cu_q, &amp, &spacing, &dr, &mut rngs, &mut got);
+            for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "{model:?}: line {} sample {}", i / n, i % n);
+            }
+        }
     }
 
     fn stats(v: &[f32]) -> (f32, f32, f32, f32) {

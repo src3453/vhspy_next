@@ -27,9 +27,24 @@ use crate::frame::Field;
 use crate::params::{LumaModel, TapeParams, TransportParams};
 use fm::{FmChannel, FmConfig};
 use crate::rng::Rng;
+use crate::simd::LANES;
 use crate::timing::*;
 use magnetic::MagneticTransfer;
 use rayon::prelude::*;
+
+crate::simd::x8_kernel! {
+    /// 8 ライン (ライン長 `ls` おき) にディエンファシスとシャープネスを掛ける (縦方向 SIMD)。
+    /// 各レーンは `sharp.process(de.process(x))` をラインごとに回すのと同じ演算
+    fn de_sharp_x8(de: &Biquad, sharp: &Biquad, buf: &mut [f32], ls: usize) {
+        use crate::simd::{F32x8, rows_mut};
+        let mut rows = rows_mut(buf, ls);
+        let mut f = Cascade::new(&[*de, *sharp]).lanes::<F32x8>();
+        for n in 0..ls {
+            let x = F32x8::from_fn(|l| rows[l][n]);
+            f.process(x).scatter(&mut rows, n);
+        }
+    }
+}
 
 const STREAM_PATH: u64 = 1;
 const STREAM_DROPOUT: u64 = 2;
@@ -380,6 +395,77 @@ impl TapeSim {
         let (parity, frame, index) = (field.parity, field.frame, field.index);
         let rf_level = &self.rf_level;
 
+        if let Some(fm) = &fm {
+            // ---- Fm モデル: 記録する輝度と色をラインごとに作り、FM の伝送は 8 ラインずつまとめて回す ----
+            let x8 = crate::simd::x8();
+            self.y_buf.par_chunks_mut(LANES * ls).zip(self.c_buf.par_chunks_mut(LANES * ls)).enumerate().for_each(
+                |(g, (ys, cs))| {
+                    let nl = ys.len() / ls;
+                    let l0 = g * LANES;
+                    let mut rec = vec![0f32; nl * ls];
+                    let mut cu_i = vec![0f32; nl * ls];
+                    let mut cu_q = vec![0f32; nl * ls];
+                    let mut rngs: Vec<Rng> = Vec::with_capacity(nl);
+                    for k in 0..nl {
+                        let l = l0 + k;
+                        let r = k * ls..(k + 1) * ls;
+                        let (co, rec, cu_i, cu_q) = (&mut cs[r.clone()], &mut rec[r.clone()], &mut cu_i[r.clone()], &mut cu_q[r]);
+                        let x = field.line(l);
+                        let mut rng = Rng::derive(seed, index, l as u64, STREAM_PATH);
+                        let base = s.line_phase_base(l, frame, parity);
+                        let noise_gain = 1.0 / rf_track[l];
+                        let spacing = base_spacing + line_spacing[l];
+                        let (mut rec_notch, mut rec_lp, mut pre) = (rec_notch, rec_lp, pre);
+                        let cn = tp.chroma_noise_ire * chroma_noise_norm * noise_gain / sm.loss(sm.f_cu, spacing);
+                        let mut chroma = ChromaRec { c_bp, lp_i: c_lp, lp_q: c_lp, n_i: cn_lp, n_q: cn_lp, mag: mag.clone(), cn };
+                        // 再生時の低域変換クロマの位相誤差 (APC で取り切れない残留分)
+                        let dphi = rng.normal() * phase_noise * (1.0 / rf_level[l]).min(4.0);
+                        let (cd, sd) = (dphi.cos(), dphi.sin());
+                        // Simple モデルと同じ乱数の並びにするため、使わない低域変換の位相も引いておく
+                        let _cu_phase = rng.uniform() * std::f32::consts::TAU;
+                        co.fill(0.0);
+                        for n in 0..ls {
+                            let xv = x[n];
+                            let yr = rec_lp.process(rec_notch.process(xv));
+                            rec[n] = pre.process(yr).clamp(lv.sync - 20.0, tp.white_clip_ire);
+                            let (bi, bq) = chroma.step(xv, (n + base) & 3, &mut rng);
+                            cu_i[n] = bi;
+                            cu_q[n] = bq;
+                            // 再生クロマを (遅延をつけて) 書き込む
+                            let (ri, rq) = (bi * cd - bq * sd, bi * sd + bq * cd);
+                            let out_n = n as i32 + delay;
+                            if (0..ls as i32).contains(&out_n) {
+                                let m = out_n as usize;
+                                let km = (m + base) & 3;
+                                co[m] = ri * COS4[km] + rq * SIN4[km];
+                            }
+                        }
+                        rngs.push(rng);
+                    }
+                    if x8 && nl == LANES {
+                        let mut rngs: [Rng; LANES] = rngs.try_into().unwrap_or_else(|_| unreachable!());
+                        let amp: [f32; LANES] = std::array::from_fn(|k| rf_track[l0 + k]);
+                        let lsp: [f32; LANES] = std::array::from_fn(|k| line_spacing[l0 + k]);
+                        let dr: [&[Dropout]; LANES] = std::array::from_fn(|k| drops[l0 + k].as_slice());
+                        fm.process_lines_x8(ls, &rec, &cu_i, &cu_q, &amp, &lsp, &dr, &mut rngs, ys);
+                        de_sharp_x8(&de, &sharp, ys, ls);
+                    } else {
+                        for (k, rng) in rngs.iter_mut().enumerate() {
+                            let l = l0 + k;
+                            let r = k * ls..(k + 1) * ls;
+                            let yo = &mut ys[r.clone()];
+                            fm.process_line(&rec[r.clone()], &cu_i[r.clone()], &cu_q[r], rf_track[l], line_spacing[l], &drops[l], rng, yo);
+                            let (mut de, mut sharp) = (de, sharp);
+                            for v in yo.iter_mut() {
+                                *v = sharp.process(de.process(*v));
+                            }
+                        }
+                    }
+                },
+            );
+            return;
+        }
+
         self.y_buf
             .par_chunks_mut(ls)
             .zip(self.c_buf.par_chunks_mut(ls))
@@ -414,36 +500,7 @@ impl TapeSim {
                     }
                 };
 
-                if let Some(fm) = &fm {
-                    // ---- Fm モデル: 記録する輝度と色を 1 ライン分作ってから FM で伝送する ----
-                    let mut rec = [0f32; MAX_LINE_SAMPLES];
-                    let mut cu_i = [0f32; MAX_LINE_SAMPLES];
-                    let mut cu_q = [0f32; MAX_LINE_SAMPLES];
-                    for n in 0..ls {
-                        let xv = x[n];
-                        let yr = rec_lp.process(rec_notch.process(xv));
-                        rec[n] = pre.process(yr).clamp(lv.sync - 20.0, tp.white_clip_ire);
-                        let (bi, bq) = chroma.step(xv, (n + base) & 3, &mut rng);
-                        cu_i[n] = bi;
-                        cu_q[n] = bq;
-                        put_chroma(co, n, bi, bq);
-                    }
-                    let mut demod = [0f32; MAX_LINE_SAMPLES];
-                    fm.process_line(
-                        &rec[..ls],
-                        &cu_i[..ls],
-                        &cu_q[..ls],
-                        rf_track[l],
-                        line_spacing[l],
-                        &drops[l],
-                        &mut rng,
-                        &mut demod[..ls],
-                    );
-                    for n in 0..ls {
-                        yo[n] = sharp.process(de.process(demod[n]));
-                    }
-                    return;
-                }
+                debug_assert!(fm.is_none());
 
                 for n in 0..ls {
                     let xv = x[n];
