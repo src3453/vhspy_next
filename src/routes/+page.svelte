@@ -2,7 +2,8 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { open, save } from "@tauri-apps/plugin-dialog";
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
+  import { parseQuery, search, segments, type SearchResult } from "#lib/search.ts";
   import { groups, help, getPath, setPath, isActive, presets, applyDiff, retarget, type Params } from "#lib/params.ts";
   import Scopes from "#lib/Scopes.svelte";
   import Oscilloscope from "#lib/Oscilloscope.svelte";
@@ -98,6 +99,102 @@
   let crtInfo = $state<CrtInfo | null>(null);
   let crtVersion = -1;
   let crtFilter = $state("");
+
+  // ---- パラメータ検索 ----
+  // 検索中は一致したグループを自動で開き、一致しないグループは閉じる。
+  // 検索をやめると、検索前に手で開閉していた状態に戻す。
+  let paramQuery = $state("");
+  let searchBox = $state<HTMLInputElement | null>(null);
+  let tokens = $derived(parseQuery(paramQuery));
+  let searching = $derived(tokens.length > 0);
+  /** 検索していないときの開閉状態 (キー: "g0".., "crt", "crt-params") */
+  let userOpen = $state<Record<string, boolean>>(Object.fromEntries(groups.map((_, i) => [`g${i}`, i < 2])));
+  /** 検索中に手で開閉した分。検索語が変わったら捨てて自動の開閉に戻す */
+  let searchOpen = $state<Record<string, boolean>>({});
+
+  const optionLabels = (c: (typeof groups)[number]["controls"][number]) =>
+    c.kind === "select" ? c.options.map((o) => o.label) : [];
+
+  /** グループごとの一致 (path → 結果) */
+  let groupHits = $derived.by(() =>
+    groups.map((g) => {
+      const hits = new Map<string, SearchResult>();
+      if (!searching) return hits;
+      for (const c of g.controls) {
+        const r = search(tokens, {
+          label: c.label,
+          keys: [g.title, c.path],
+          text: [help[c.path] ?? "", ...optionLabels(c)],
+        });
+        if (r) hits.set(c.path, r);
+      }
+      return hits;
+    }),
+  );
+
+  // CRT セクションの固定の行
+  const CRT_TITLE = "ブラウン管 (CRT シェーダー)";
+  const CRT_ROWS = [
+    { key: "enabled", label: "シェーダーを掛ける", text: "retroarch slang slangp" },
+    { key: "preset", label: "プリセット", text: "slangp crt-royale" },
+    { key: "height", label: "録画・書き出しの高さ", text: "解像度" },
+  ];
+  let crtHits = $derived.by(() => {
+    const rows = new Map<string, SearchResult>();
+    const ps = new Map<string, SearchResult>();
+    if (!searching) return { rows, params: ps };
+    for (const r of CRT_ROWS) {
+      const h = search(tokens, { label: r.label, keys: [CRT_TITLE], text: [r.text] });
+      if (h) rows.set(r.key, h);
+    }
+    const shader = crtInfo && params && crtInfo.preset === params.crt.preset ? crtInfo.params : [];
+    for (const p of shader) {
+      if (p.min === p.max) continue;
+      const h = search(tokens, { label: p.description, keys: ["シェーダーパラメータ", p.id] });
+      if (h) ps.set(p.id, h);
+    }
+    return { rows, params: ps };
+  });
+  let matchCount = $derived(groupHits.reduce((n, h) => n + h.size, 0) + crtHits.rows.size + crtHits.params.size);
+
+  function isOpen(key: string, auto: boolean) {
+    return searching ? (searchOpen[key] ?? auto) : (userOpen[key] ?? false);
+  }
+  function onToggle(key: string, e: Event) {
+    const o = (e.currentTarget as HTMLDetailsElement).open;
+    if (searching) searchOpen[key] = o;
+    else userOpen[key] = o;
+  }
+  function onSearchInput() {
+    searchOpen = {};
+  }
+  function onSearchKey(e: KeyboardEvent) {
+    if (e.key === "Escape") {
+      if (paramQuery) {
+        paramQuery = "";
+        searchOpen = {};
+      } else searchBox?.blur();
+      e.preventDefault();
+    } else if (e.key === "Enter") {
+      // 最初に一致したコントロールへ移る
+      e.preventDefault();
+      const el = document.querySelector<HTMLElement>(
+        ".panel .hit :is(input:not([type=search]), select, textarea, button)",
+      );
+      el?.scrollIntoView({ block: "center" });
+      el?.focus();
+    }
+  }
+  /** 検索中に表示するか (一致しないグループを手で開いたときは全部見せる) */
+  function shown(hits: Map<string, unknown>, key: string) {
+    return !searching || hits.size === 0 || hits.has(key);
+  }
+
+  // CRT を有効にしたら (プリセットの読込なども含め) セクションを開き、無効にしたら閉じる
+  $effect(() => {
+    const en = !!params?.crt.enabled;
+    untrack(() => (userOpen.crt = en));
+  });
   const CRT_HEIGHTS = [720, 960, 1080, 1440, 2160];
   const FIELD_RATES: Record<Params["standard"], number> = { ntsc: 60000 / 1001, pal: 50 };
   let fieldBudgetMs = $derived(1000 / FIELD_RATES[params?.standard ?? "ntsc"]);
@@ -274,8 +371,15 @@
   let crtVisible = $derived.by(() => {
     const ps = crtInfo && params && crtInfo.preset === params.crt.preset ? crtInfo.params : [];
     const q = crtFilter.trim().toLowerCase();
-    if (!q) return ps;
-    return ps.filter((p) => p.min !== p.max && (p.id.toLowerCase().includes(q) || p.description.toLowerCase().includes(q)));
+    // パネル全体の検索でシェーダーパラメータに一致があればそれだけを出す
+    const global = crtHits.params;
+    if (!q && global.size === 0) return ps;
+    return ps.filter(
+      (p) =>
+        p.min !== p.max &&
+        (!q || p.id.toLowerCase().includes(q) || p.description.toLowerCase().includes(q)) &&
+        (global.size === 0 || global.has(p.id)),
+    );
   });
 
   function applyPreset(i: number) {
@@ -351,6 +455,10 @@
     if (!immersive && e.key === "F11") {
       e.preventDefault();
       setImmersive(true);
+    } else if (!immersive && (e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === "f") {
+      e.preventDefault();
+      searchBox?.focus();
+      searchBox?.select();
     }
   }
 
@@ -446,6 +554,10 @@
 </script>
 
 <svelte:window onkeydown={onGlobalKey} />
+
+{#snippet label(text: string, hit: SearchResult | undefined)}
+  {#each segments(text, hit?.labelHits ?? []) as seg}{#if seg.hit}<mark>{seg.t}</mark>{:else}{seg.t}{/if}{/each}
+{/snippet}
 
 {#if immersive && params}
   <Immersive
@@ -644,20 +756,40 @@
       <button onclick={savePreset}>保存</button>
     </div>
     {#if params}
+      <div class="search">
+        <input
+          type="search"
+          placeholder="パラメータを検索 (Ctrl+F)"
+          bind:this={searchBox}
+          bind:value={paramQuery}
+          oninput={onSearchInput}
+          onkeydown={onSearchKey}
+          title="名前・説明・パスで曖昧検索。空白区切りで AND。Enter で最初の一致へ、Esc で消去"
+        />
+        {#if searching}<span class="count" class:none={matchCount === 0}>{matchCount} 件</span>{/if}
+      </div>
       <div class="seed">
         <label for="seed">シード</label>
         <input id="seed" type="number" bind:value={params.seed} />
         <button onclick={newSeed}>🎲</button>
       </div>
       {#each groups as g, gi}
-        <details open={gi < 2}>
-          <summary>{g.title}</summary>
-          {#if g.note}<p class="note">{g.note}</p>{/if}
+        {@const hits = groupHits[gi]}
+        <details
+          open={isOpen(`g${gi}`, hits.size > 0)}
+          ontoggle={(e) => onToggle(`g${gi}`, e)}
+          class:nomatch={searching && hits.size === 0}
+        >
+          <summary>{g.title}{#if searching && hits.size > 0}<span class="hits">{hits.size}</span>{/if}</summary>
+          {#if g.note && !(searching && hits.size > 0)}<p class="note">{g.note}</p>{/if}
           {#each g.controls as c}
             {@const off = !isActive(params, c.path)}
+            {@const hit = hits.get(c.path)}
+            {#if shown(hits, c.path)}
+            <div class="ctl" class:hit>
             {#if c.kind === "range"}
               <label class="row" class:off title={help[c.path]}>
-                <span class="name">{c.label}</span>
+                <span class="name">{@render label(c.label, hit)}</span>
                 <input
                   type="range"
                   disabled={off}
@@ -679,11 +811,11 @@
                   checked={getPath(params, c.path)}
                   onchange={(e) => setPath(params, c.path, (e.target as HTMLInputElement).checked)}
                 />
-                <span>{c.label}</span>
+                <span>{@render label(c.label, hit)}</span>
               </label>
             {:else if c.kind === "text"}
               <label class="row" class:off title={help[c.path]}>
-                <span class="name">{c.label}</span>
+                <span class="name">{@render label(c.label, hit)}</span>
                 <input
                   class="wide"
                   type="text"
@@ -695,7 +827,7 @@
               </label>
             {:else if c.kind === "font"}
               <div class="row" class:off title={help[c.path]}>
-                <span class="name">{c.label}</span>
+                <span class="name">{@render label(c.label, hit)}</span>
                 <input
                   type="text"
                   disabled={off}
@@ -713,7 +845,7 @@
               {/if}
             {:else if c.kind === "markup"}
               <label class="stack" class:off title={help[c.path]}>
-                <span class="name">{c.label}</span>
+                <span class="name">{@render label(c.label, hit)}</span>
                 <textarea
                   rows="6"
                   disabled={off}
@@ -728,7 +860,7 @@
               </label>
             {:else}
               <label class="row" class:off title={help[c.path]}>
-                <span class="name">{c.label}</span>
+                <span class="name">{@render label(c.label, hit)}</span>
                 <select
                   disabled={off}
                   value={getPath(params, c.path)}
@@ -738,22 +870,29 @@
                 </select>
               </label>
             {/if}
+            </div>
+            {/if}
           {/each}
         </details>
       {/each}
 
-      <details open={params.crt.enabled}>
-        <summary>ブラウン管 (CRT シェーダー)</summary>
-        <p class="note">
+      {@const crtMatch = crtHits.rows.size + crtHits.params.size}
+      <details
+        open={isOpen("crt", crtMatch > 0)}
+        ontoggle={(e) => onToggle("crt", e)}
+        class:nomatch={searching && crtMatch === 0}
+      >
+        <summary>{CRT_TITLE}{#if searching && crtMatch > 0}<span class="hits">{crtMatch}</span>{/if}</summary>
+        <p class="note" class:hidden={searching && crtMatch > 0}>
           RetroArch の slang シェーダープリセット (.slangp) を最終出力に掛ける (例: RetroArch の
           shaders/shaders_slang/crt/crt-royale.slangp)。プレビューは画面の画素数、録画・書き出しは下の高さで描く。
         </p>
-        <label class="row check">
+        <label class="row check" class:hit={crtHits.rows.has("enabled")}>
           <input type="checkbox" bind:checked={params.crt.enabled} />
-          <span>シェーダーを掛ける</span>
+          <span>{@render label("シェーダーを掛ける", crtHits.rows.get("enabled"))}</span>
         </label>
-        <div class="row">
-          <span class="name">プリセット</span>
+        <div class="row" class:hit={crtHits.rows.has("preset")}>
+          <span class="name">{@render label("プリセット", crtHits.rows.get("preset"))}</span>
           <input
             type="text"
             placeholder="未選択"
@@ -766,8 +905,8 @@
             <button class="small" onclick={() => invoke("reload_crt")} title="シェーダーを読み直す">⟳</button>
           </span>
         </div>
-        <label class="row" class:off={!params.crt.enabled}>
-          <span class="name">録画・書き出しの高さ</span>
+        <label class="row" class:off={!params.crt.enabled} class:hit={crtHits.rows.has("height")}>
+          <span class="name">{@render label("録画・書き出しの高さ", crtHits.rows.get("height"))}</span>
           <select bind:value={params.crt.height} disabled={!params.crt.enabled}>
             {#each CRT_HEIGHTS as h}<option value={h}>{Math.round((h * 4) / 3)}×{h}</option>{/each}
           </select>
@@ -782,8 +921,8 @@
           {/if}
         {/if}
         {#if crtVisible.length > 0 || crtFilter}
-          <details>
-            <summary>シェーダーパラメータ</summary>
+          <details open={isOpen("crt-params", crtHits.params.size > 0)} ontoggle={(e) => onToggle("crt-params", e)}>
+            <summary>シェーダーパラメータ{#if searching && crtHits.params.size > 0}<span class="hits">{crtHits.params.size}</span>{/if}</summary>
             <div class="crt-tools">
               <input type="search" placeholder="絞り込み" bind:value={crtFilter} />
               <button
@@ -797,8 +936,8 @@
               {#if p.min === p.max}
                 <p class="crt-head">{p.description}</p>
               {:else}
-                <label class="row" class:off={!params.crt.enabled} title={`${p.id}\n(ダブルクリックでプリセットの値)`}>
-                  <span class="name" class:changed={p.id in params.crt.params}>{p.description}</span>
+                <label class="row" class:off={!params.crt.enabled} class:hit={crtHits.params.has(p.id)} title={`${p.id}\n(ダブルクリックでプリセットの値)`}>
+                  <span class="name" class:changed={p.id in params.crt.params}>{@render label(p.description, crtHits.params.get(p.id))}</span>
                   <input
                     type="range"
                     disabled={!params.crt.enabled}
@@ -963,6 +1102,50 @@
   details {
     border-top: 1px solid var(--line);
     padding: 6px 0;
+  }
+  .search {
+    position: sticky;
+    top: -8px;
+    z-index: 2;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: -8px -10px 8px;
+    padding: 8px 10px 6px;
+    background: var(--panel);
+  }
+  .search input {
+    flex: 1;
+    min-width: 0;
+  }
+  .search .count {
+    color: var(--muted);
+    font-size: 11.5px;
+    white-space: nowrap;
+  }
+  .search .count.none {
+    color: #e07a7a;
+  }
+  details.nomatch > summary {
+    color: #5a5e69;
+    font-weight: 400;
+  }
+  summary .hits {
+    margin-left: 6px;
+    padding: 0 6px;
+    border-radius: 8px;
+    background: #2a3b52;
+    color: var(--accent);
+    font-size: 11px;
+    font-weight: 600;
+  }
+  mark {
+    background: none;
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .hidden {
+    display: none;
   }
   summary {
     cursor: pointer;
