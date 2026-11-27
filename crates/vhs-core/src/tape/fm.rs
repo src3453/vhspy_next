@@ -3,8 +3,9 @@
 //! 1 ラインごとに次の順で処理する (2 倍にオーバーサンプリング)。
 //!
 //! 1. オーバーサンプリング: Hi8 (白 7.7 MHz) でも搬送波と側波帯がナイキスト周波数に収まるようにする。
-//!    J-A では記録 (変調と磁性体) だけを 8 倍で計算し、ローパスを掛けて 2 倍に間引いてから再生側に渡す。
-//!    J-A で飽和した搬送波は方形波に近く高調波が多いので、低いレートで解くと折り返しが復調出力の揺れになる
+//!    J-A では記録 (変調と磁性体) だけを 4〜16 倍 ([`FmConfig::ja_oversample`]) で計算し、ローパスを掛けて
+//!    2 倍に間引いてから再生側に渡す。J-A で飽和した搬送波は方形波に近く高調波が多いので、低いレートで解くと
+//!    折り返しが復調出力の揺れになる (平坦な画で 4 倍は 1〜2 IRE、8 倍は 0.2〜0.4 IRE、16 倍は 0.2 IRE 以下)
 //! 2. 周波数変調: シンクチップ〜ホワイトピークを各フォーマットの搬送波周波数に割り当てる。
 //!    エンファシスで白のエッジが行き過ぎると、ホワイトピークより高い周波数まで振れる
 //! 3. 低域変換クロマの重畳と磁性体の伝達特性: 実機では色は FM 信号をバイアス代わりに同じトラックへ
@@ -27,8 +28,8 @@ use crate::timing::{Levels, MAX_LINE_SAMPLES};
 pub const OVERSAMPLE: usize = 2;
 /// ライン先頭の前に流す助走 (元のレートのサンプル数)。フィルタと復調器を落ち着かせる
 const PRE_ROLL: usize = 48;
-/// J-A の記録を計算するオーバーサンプリング倍率 ([`OVERSAMPLE`] の倍数)
-const JA_OVERSAMPLE: usize = 8;
+/// J-A の記録を計算するオーバーサンプリング倍率の上限
+pub const MAX_JA_OVERSAMPLE: usize = 16;
 /// 再生側 (伝送路・復調) のバッファの長さ
 const MAX_LEN: usize = (MAX_LINE_SAMPLES + PRE_ROLL) * OVERSAMPLE;
 /// スペーシング損失の FIR の片側の最大タップ数
@@ -37,7 +38,7 @@ const SPACING_HALF_MAX: usize = 160;
 /// FM 伝送路の設定 (フィールドごとに作る)
 #[derive(Clone)]
 pub struct FmChannel {
-    /// 記録を計算するオーバーサンプリング倍率 (J-A は 8 倍、それ以外は 2 倍)
+    /// 記録を計算するオーバーサンプリング倍率 (J-A は 4〜16 倍、それ以外は 2 倍)
     oversample: usize,
     /// 記録を再生側のレート (2 倍) に間引くときのアンチエイリアスのローパス (J-A のみ)
     decimate: Option<Cascade>,
@@ -200,11 +201,17 @@ pub struct FmConfig {
     pub writing_speed: f32,
     /// 再生 EQ が想定していない余分なスペーシング [m]
     pub extra_spacing: f32,
+    /// J-A の記録を計算するオーバーサンプリング倍率 ([`OVERSAMPLE`] の倍数に丸め、上限 [`MAX_JA_OVERSAMPLE`])
+    pub ja_oversample: usize,
 }
 
 impl FmChannel {
     pub fn new(c: &FmConfig) -> Self {
-        let oversample = if c.mag.is_jiles_atherton() { JA_OVERSAMPLE } else { OVERSAMPLE };
+        let oversample = if c.mag.is_jiles_atherton() {
+            (c.ja_oversample.div_ceil(OVERSAMPLE) * OVERSAMPLE).clamp(OVERSAMPLE, MAX_JA_OVERSAMPLE)
+        } else {
+            OVERSAMPLE
+        };
         let fs2 = c.fs * OVERSAMPLE as f32;
         let bw = c.channel_bw_hz.clamp(0.5e6, 0.45 * fs2);
         // 間引きのローパス: 伝送路の帯域は通し、間引いた後に帯域へ折り返す成分 (fs2 - bw 以上) を十分落とす
@@ -449,6 +456,7 @@ mod tests {
             mag: MagneticTransfer::new(crate::params::MagneticModel::Linear, 1.0),
             writing_speed: 5.8,
             extra_spacing,
+            ja_oversample: 4,
         })
     }
 
@@ -526,7 +534,7 @@ mod tests {
     #[test]
     fn jiles_atherton_rf_keeps_levels() {
         use crate::params::{JaSolver, MagneticMedia, MagneticModel};
-        for solver in [JaSolver::Table, JaSolver::Exact] {
+        for (solver, os) in [(JaSolver::Table, 4), (JaSolver::Table, 8), (JaSolver::Table, 16), (JaSolver::Exact, 8)] {
             let ch = FmChannel::new(&FmConfig {
                 fs: NTSC.fs,
                 f_sync_hz: 3.4e6,
@@ -546,13 +554,20 @@ mod tests {
                 ),
                 writing_speed: 5.8,
                 extra_spacing: 0.0,
+                ja_oversample: os,
             });
             for level in [7.5f32, 50.0, 100.0] {
                 let input = vec![level; 910];
                 let mut out = vec![0f32; 910];
                 ch.process_line(&input, &[], &[], 1.0, 0.0, &[], &mut Rng::new(1), &mut out);
                 let (mean, sd, _, _) = stats(&out[100..800]);
-                assert!((mean - level).abs() < 1.0 && sd < 0.5, "{solver:?} level {level}: mean {mean} sd {sd}");
+                // 4 倍では飽和した搬送波の高調波の折り返しが、平坦な画でも 1〜2 IRE の揺れとして残る
+                // (既定の RF ノイズ 0.05 での揺れ 7 IRE に比べれば小さい)
+                let max_sd = if os < 8 { 2.5 } else { 0.5 };
+                assert!(
+                    (mean - level).abs() < 1.0 && sd < max_sd,
+                    "{solver:?} x{os} level {level}: mean {mean} sd {sd}"
+                );
             }
         }
     }

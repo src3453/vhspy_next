@@ -419,6 +419,27 @@ pub enum JaSolver {
     Exact,
 }
 
+/// FM の RF で Jiles-Atherton の記録を計算するオーバーサンプリング倍率。
+/// 磁化の高調波が折り返して輝度に乗るので、倍率が高いほど正確で遅い
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JaOversample {
+    X4,
+    #[default]
+    X8,
+    X16,
+}
+
+impl JaOversample {
+    pub fn factor(self) -> usize {
+        match self {
+            Self::X4 => 4,
+            Self::X8 => 8,
+            Self::X16 => 16,
+        }
+    }
+}
+
 /// 磁性体の種類 (Jiles-Atherton の係数を選ぶ)
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -589,6 +610,8 @@ pub struct TapeParams {
     pub magnetic_media: MagneticMedia,
     /// J-A: FM 輝度の RF の解き方 (表引き / 厳密)
     pub ja_solver: JaSolver,
+    /// J-A: FM 輝度の記録を計算するオーバーサンプリング倍率
+    pub ja_oversample: JaOversample,
     /// J-A: FM 搬送波の記録磁界の振幅 [保磁力 Hc の倍数]。2 で再生 RF が基準の大きさ。
     /// 小さいと RF が弱くノイズが増え、大きいと飽和して搬送波と色の相互変調が増える。色のバイアスでもある
     pub rf_drive_hc: f32,
@@ -649,6 +672,7 @@ impl Default for TapeParams {
             magnetic_model: MagneticModel::Tanh,
             magnetic_media: MagneticMedia::Cobalt,
             ja_solver: JaSolver::Table,
+            ja_oversample: JaOversample::X8,
             rf_drive_hc: 2.0,
             saturation_ire: 50.0,
             rf_saturation: 1.5,

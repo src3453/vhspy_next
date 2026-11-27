@@ -125,6 +125,7 @@ export type Params = {
     magnetic_model: "linear" | "tanh" | "jiles_atherton";
     magnetic_media: MagneticMedia;
     ja_solver: "table" | "exact";
+    ja_oversample: "x4" | "x8" | "x16";
     rf_drive_hc: number;
     saturation_ire: number;
     rf_saturation: number;
@@ -571,7 +572,7 @@ export const groups: Group[] = [
   {
     title: "テープ: 磁性体",
     note: "Jiles–Atherton はテープの種類ごとに保磁力と角形比へ当てはめた係数で、記録磁界を保磁力 Hc の倍数で指定する。" +
-      "FM 輝度 RF はラインごとに状態を持って解き (8 倍オーバーサンプリング)、色と音声はバイアス (色は FM 搬送波、音声は交流バイアス) を掛けた J-A から作った曲線を使う。" +
+      "FM 輝度 RF はラインごとに状態を持って解き (既定は 8 倍オーバーサンプリング)、色と音声はバイアス (色は FM 搬送波、音声は交流バイアス) を掛けた J-A から作った曲線を使う。" +
       "係数は公称の保磁力・角形比からの見積もりで、実際のテープを測った値ではない。",
     controls: [
       {
@@ -599,6 +600,14 @@ export const groups: Group[] = [
         options: [
           { value: "table", label: "表引き (高速)" },
           { value: "exact", label: "厳密 (RK4)" },
+        ],
+      },
+      {
+        kind: "select", path: "tape.ja_oversample", label: "J-A のオーバーサンプリング",
+        options: [
+          { value: "x4", label: "4 倍 (高速)" },
+          { value: "x8", label: "8 倍" },
+          { value: "x16", label: "16 倍 (高精度)" },
         ],
       },
     ],
@@ -1095,6 +1104,10 @@ export const help: Record<string, string> = {
   "tape.ja_solver":
     "FM 輝度の RF で J-A を解く方法。表引きは磁界の折り返し点ごとに前もって細かく解いた磁化の曲線を引く (厳密解との差は 1% 未満で、10 倍以上速い)。" +
     "厳密は 1 サンプルずつ RK4 で積分する (遅い)。色と音声はどちらでも同じ表を使う。",
+  "tape.ja_oversample":
+    "FM 輝度の記録 (変調と J-A) を計算するレートの倍率。低いと飽和した搬送波の高調波が折り返し、輝度が細かく揺れる " +
+    "(平坦な画で 4 倍は 1〜2 IRE、8 倍は 0.2〜0.4 IRE。既定の RF ノイズ 7 IRE ほどに比べれば小さいが、ノイズを絞ると見える)。" +
+    "高いほど遅い (8 倍は 4 倍の約 1.6 倍、16 倍は約 3 倍の時間)。",
 
   // テープ: ドロップアウト
   "tape.dropout_rate": "1 ラインあたりのドロップアウト (磁性体の欠落による白や黒の横筋) の発生確率。",
@@ -1492,6 +1505,7 @@ const activeWhen: Record<string, (p: Params) => boolean> = {
   "tape.magnetic_media": (p) => p.tape.magnetic_model === "jiles_atherton",
   "tape.rf_drive_hc": (p) => p.tape.magnetic_model === "jiles_atherton",
   "tape.ja_solver": (p) => p.tape.magnetic_model === "jiles_atherton" && p.tape.luma_model === "fm",
+  "tape.ja_oversample": (p) => p.tape.magnetic_model === "jiles_atherton" && p.tape.luma_model === "fm",
   "audio.bias_level": (p) => p.audio.mode === "linear" && p.tape.magnetic_model === "jiles_atherton",
   "output.connection": (p) => composite(p) && p.tape.enabled && !(p.rf.enabled && p.rf.placement !== "before_tape"),
 

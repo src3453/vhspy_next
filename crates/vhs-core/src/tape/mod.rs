@@ -357,6 +357,7 @@ impl TapeSim {
                 mag: rf_mag.clone(),
                 writing_speed: tp.writing_speed_mps,
                 extra_spacing: tp.head_spacing_um * 1e-6,
+                ja_oversample: tp.ja_oversample.factor(),
             })
         });
         // 余分なスペーシング (再生 EQ が想定していないぶん: ヘッドの汚れ + しわ・目詰まり) の損失。
