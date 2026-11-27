@@ -14,12 +14,15 @@
 //! - Jiles–Atherton (Chowdhury, DAFx-19 の式 (6)〜(10)): 磁化の履歴を持つ。係数はテープの種類
 //!   ([`MagneticMedia`]) ごとに保磁力と角形比 (Mr/Ms) に合わせて当てはめた値 (Ms = 1 に正規化)。
 //!   記録磁界は保磁力 Hc を単位に指定する。
-//!   - FM の RF は状態を持って 1 サンプルずつ解く (ラインごとに初期化し、同期の助走でループを落ち着かせる)
+//!   - FM の RF は状態を持って 1 サンプルずつ解く (ラインごとに初期化し、同期の助走でループを落ち着かせる)。
+//!     既定 ([`JaSolver::Table`]) は磁界の折り返し点のモデル: 磁界が一方向に動く間の磁化 (枝) は
+//!     折り返し点で決まるので、折り返し点ごとの枝を前もって細かく解いた表を引く ([`TurnTable`])。
+//!     [`JaSolver::Exact`] は毎サンプル RK4 で積分する
 //!   - クロマの包絡線と音声は、バイアス (クロマには FM 搬送波、音声には交流バイアス) を掛けた J-A を
 //!     前もって解いて作った表を引く。バイアスの 1 周期で平均した磁化が入力に対してどう曲がるか
 //!     (バイアスが足りないとデッドゾーンと歪み、多すぎると感度が落ちる) を無記憶の曲線にしたもの
 
-use crate::params::{MagneticMedia, MagneticModel};
+use crate::params::{JaSolver, MagneticMedia, MagneticModel};
 use std::sync::{Arc, Mutex};
 
 /// Jiles–Atherton の係数 (Ms = 1 に正規化)
@@ -65,6 +68,14 @@ const LUT_N: usize = 65;
 const AUDIO_MAX: f32 = 4.0;
 /// 表を引くクロマの包絡線の上限 [IRE]
 const CHROMA_MAX_IRE: f32 = 200.0;
+/// 折り返し点の表の、折り返し点の磁界の点数
+const TURN_NR: usize = 64;
+/// 折り返し点の表の、折り返し点の磁化の基準点の数
+const TURN_NA: usize = 12;
+/// 折り返し点の表の、枝の上の磁界の点数
+const TURN_NH: usize = 256;
+/// 折り返し点の表が覆う磁界 (搬送波の振幅 1 の記録磁界に対する比)。超えた枝は厳密に解く
+const TURN_RANGE: f32 = 1.5;
 
 #[derive(Clone, Debug)]
 pub struct MagneticTransfer {
@@ -78,6 +89,8 @@ pub struct MagneticTransfer {
     /// J-A の無記憶近似の表 (0..=lut_max を等分。奇関数として負側に広げる)
     lut: Option<Arc<[f32]>>,
     lut_max: f32,
+    /// J-A の RF の折り返し点の表 ([`JaSolver::Table`] のとき)
+    turn: Option<Arc<[f32]>>,
 }
 
 impl MagneticTransfer {
@@ -91,18 +104,26 @@ impl MagneticTransfer {
             out_scale: 1.0,
             lut: None,
             lut_max: 1.0,
+            turn: None,
         }
     }
 
     /// FM の RF 用。入力は搬送波の振幅 = 1 の尺度。J-A では搬送波の振幅 1 が `drive_hc` × Hc の記録磁界になり、
     /// 出力は記録磁界が [`NOMINAL_RF_DRIVE`] のときの搬送波の基本波が 1 になるように正規化する
     /// (記録電流が足りないと再生 RF が弱く、多すぎると飽和して伸びない)
-    pub fn rf(model: MagneticModel, media: MagneticMedia, saturation: f32, drive_hc: f32) -> Self {
+    /// `solver` は状態付きの J-A の解き方
+    pub fn rf(model: MagneticModel, media: MagneticMedia, saturation: f32, drive_hc: f32, solver: JaSolver) -> Self {
         let mut t = Self::new(model, saturation);
         if model == MagneticModel::JilesAtherton {
-            t.ja = JaCoeffs::of(media);
-            t.field_per_unit = drive_hc.max(0.01) * t.ja.hc;
-            t.out_scale = 1.0 / nominal_fundamental(t.ja).max(1e-3);
+            let ja = JaCoeffs::of(media);
+            t.ja = ja;
+            t.field_per_unit = drive_hc.max(0.01) * ja.hc;
+            t.out_scale = 1.0 / nominal_fundamental(ja).max(1e-3);
+            if solver == JaSolver::Table {
+                let field = t.field_per_unit;
+                let key = cache_key(2, media, &[drive_hc]);
+                t.turn = Some(cached(key, || TurnTable::build(ja, field)));
+            }
         }
         t
     }
@@ -166,6 +187,7 @@ impl MagneticTransfer {
             out_scale: self.out_scale,
             magnetization: 0.0,
             previous_field: 0.0,
+            turn: self.turn.as_ref().map(|t| TurnState::new(t.clone(), self.field_per_unit)),
         }
     }
 
@@ -217,7 +239,7 @@ impl MagneticTransfer {
 }
 
 /// 1 本の信号列に沿った磁化履歴
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct MagneticState {
     model: MagneticModel,
     sat: f32,
@@ -226,6 +248,8 @@ pub struct MagneticState {
     out_scale: f32,
     magnetization: f32,
     previous_field: f32,
+    /// 折り返し点の表を引くときの枝の状態 (なければ毎サンプル RK4)
+    turn: Option<TurnState>,
 }
 
 impl MagneticState {
@@ -237,7 +261,10 @@ impl MagneticState {
             MagneticModel::Tanh => self.sat * fast_tanh(x / self.sat),
             MagneticModel::JilesAtherton => {
                 let field = x * self.field_per_unit;
-                self.magnetization = ja_step(self.ja, self.magnetization, self.previous_field, field);
+                self.magnetization = match self.turn.as_mut() {
+                    Some(t) => t.step(self.ja, self.magnetization, self.previous_field, field),
+                    None => ja_step(self.ja, self.magnetization, self.previous_field, field),
+                };
                 self.previous_field = field;
                 self.out_scale * self.magnetization
             }
@@ -296,6 +323,149 @@ fn ja_dm_dh(ja: JaCoeffs, m: f32, h: f32, dir: f32) -> f32 {
     };
     let feedback = (1.0 - ja.c * ja.alpha * dman_dh).max(1e-4);
     (irreversible + ja.c * dman_dh) / feedback
+}
+
+/// 折り返し点の表。上り枝 (磁界が増える向き) を、折り返し点の磁界 hr ([`TURN_NR`] 点)・
+/// 折り返し点の磁化 mr の基準点 ([`TURN_NA`] 点)・枝の上の磁界 h ([`TURN_NH`] 点) の格子で持つ。
+/// 磁界は ±[`TURN_RANGE`] × 記録磁界、磁化は ±(その磁界の主ループの最大磁化) を等分する。
+///
+/// - B(hr, ma, h): 折り返し点 (hr, ma) から h まで上ったときの磁化
+/// - W(hr, ma, h) = ∂m(h) / ∂mr: 折り返し点の磁化が基準点 ma からずれたときの、ずれの残り方
+///
+/// 枝の磁化は、mr に最も近い基準点 ma から m ≈ B + (mr - ma) W。
+/// 下り枝は J-A の奇対称 (h, m) → (-h, -m) で上り枝の表から引く。
+/// 並びは [磁化の範囲 | (B, W) の組 (NR × NA × NH)]
+struct TurnTable;
+
+impl TurnTable {
+    /// `field` は搬送波の振幅 1 の記録磁界
+    fn build(ja: JaCoeffs, field: f32) -> Arc<[f32]> {
+        use std::f32::consts::TAU;
+        let hmax = TURN_RANGE * field;
+        let fine = |m: f32, h0: f32, h1: f32| ja_step_rk::<4>(ja, m, h0, h1, 0.05);
+        let grid = |i: usize, n: usize| -hmax + 2.0 * hmax * i as f32 / (n - 1) as f32;
+        // 磁化の範囲: ±hmax の主ループの最大磁化
+        let mut mlim = 0f32;
+        let (mut m, mut h0) = (0f32, 0f32);
+        for i in 0..512 * 4 {
+            let h = hmax * (TAU * i as f32 / 512.0).sin();
+            m = fine(m, h0, h);
+            h0 = h;
+            mlim = mlim.max(m.abs());
+        }
+        let mlim = (mlim * 1.02).min(1.0);
+        let mut out = vec![0f32; 1 + 2 * TURN_NR * TURN_NA * TURN_NH];
+        out[0] = mlim;
+        for (n, row) in out[1..].chunks_exact_mut(2 * TURN_NH).enumerate() {
+            let hr = grid(n / TURN_NA, TURN_NR);
+            let ma = -mlim + 2.0 * mlim * (n % TURN_NA) as f32 / (TURN_NA - 1) as f32;
+            const EPS: f32 = 0.005;
+            let (mut m0, mut m1, mut m2) = (ma, ma + EPS, ma - EPS);
+            let mut h_prev = hr;
+            for (j, bw) in row.chunks_exact_mut(2).enumerate() {
+                let h = grid(j, TURN_NH);
+                if h > hr {
+                    m0 = fine(m0, h_prev, h);
+                    m1 = fine(m1, h_prev, h);
+                    m2 = fine(m2, h_prev, h);
+                    h_prev = h;
+                }
+                bw[0] = m0;
+                bw[1] = (m1 - m2) / (2.0 * EPS);
+            }
+        }
+        out.into()
+    }
+}
+
+/// [`TurnTable`] を引きながら進む枝の状態
+#[derive(Clone, Debug)]
+struct TurnState {
+    table: Arc<[f32]>,
+    hmax: f32,
+    /// 磁界 → 格子の位置の倍率
+    scale_r: f32,
+    scale_h: f32,
+    /// 磁化の基準点の範囲 (±mlim) と、磁化 → 基準点の番号の倍率
+    mlim: f32,
+    scale_m: f32,
+    /// 枝の向き (+1: 上り、-1: 下り)
+    dir: f32,
+    /// 折り返し点の磁界を挟む 2 本の枝の、表の中の先頭と、その間の割合
+    row0: usize,
+    row1: usize,
+    row_frac: f32,
+    /// 上り枝の座標での mr - ma (基準点からのずれ)
+    offset: f32,
+    /// この枝は表の範囲を超えたので RK4 で解く
+    exact: bool,
+}
+
+impl TurnState {
+    fn new(table: Arc<[f32]>, field: f32) -> Self {
+        let hmax = TURN_RANGE * field;
+        let mlim = table[0];
+        let mut s = Self {
+            table,
+            hmax,
+            scale_r: (TURN_NR - 1) as f32 / (2.0 * hmax),
+            scale_h: (TURN_NH - 1) as f32 / (2.0 * hmax),
+            mlim,
+            scale_m: (TURN_NA - 1) as f32 / (2.0 * mlim),
+            dir: 1.0,
+            row0: 0,
+            row1: 0,
+            row_frac: 0.0,
+            offset: 0.0,
+            exact: false,
+        };
+        s.begin(1.0, 0.0, 0.0);
+        s
+    }
+
+    /// 磁界 hr、磁化 mr で向き dir の枝を始める
+    #[inline]
+    fn begin(&mut self, dir: f32, hr: f32, mr: f32) {
+        self.dir = dir;
+        self.exact = hr.abs() > self.hmax;
+        if self.exact {
+            return;
+        }
+        let p = ((dir * hr + self.hmax) * self.scale_r).clamp(0.0, (TURN_NR - 1) as f32 - 1e-3);
+        let r = p as usize;
+        self.row_frac = p - r as f32;
+        let mu = dir * mr;
+        let k = (((mu + self.mlim) * self.scale_m).round().max(0.0) as usize).min(TURN_NA - 1);
+        self.offset = mu - (-self.mlim + k as f32 / self.scale_m);
+        let row_len = 2 * TURN_NH;
+        self.row0 = 1 + (r * TURN_NA + k) * row_len;
+        self.row1 = self.row0 + TURN_NA * row_len;
+    }
+
+    /// 磁界を h0 → h1 と動かしたときの磁化
+    #[inline(always)]
+    fn step(&mut self, ja: JaCoeffs, m: f32, h0: f32, h1: f32) -> f32 {
+        if (h1 - h0) * self.dir < 0.0 {
+            self.begin(-self.dir, h0, m);
+        }
+        if !self.exact && h1.abs() > self.hmax {
+            self.exact = true;
+        }
+        if self.exact {
+            return ja_step(ja, m, h0, h1);
+        }
+        let p = ((self.dir * h1 + self.hmax) * self.scale_h).clamp(0.0, (TURN_NH - 1) as f32 - 1e-3);
+        let j = p as usize;
+        let f = p - j as f32;
+        let (r0, r1) = (self.row0 + 2 * j, self.row1 + 2 * j);
+        let (a, b) = (&self.table[r0..r0 + 4], &self.table[r1..r1 + 4]);
+        // 行ごとに h で補間してから、行の間を補間する
+        let lerp = |x: f32, y: f32, t: f32| x + (y - x) * t;
+        let (ba, wa) = (lerp(a[0], a[2], f), lerp(a[1], a[3], f));
+        let (bb, wb) = (lerp(b[0], b[2], f), lerp(b[1], b[3], f));
+        let m_up = lerp(ba, bb, self.row_frac) + self.offset * lerp(wa, wb, self.row_frac);
+        (self.dir * m_up).clamp(-1.0, 1.0)
+    }
 }
 
 /// 1 周期を `STEPS` 点で何周期か回し、最後の 1 周期の基本波の振幅を返す
@@ -540,12 +710,42 @@ mod tests {
     #[test]
     fn rf_drive_sets_carrier_level() {
         let rf = |d: f32| {
-            MagneticTransfer::rf(MagneticModel::JilesAtherton, MagneticMedia::Cobalt, 1.0, d).carrier_fundamental(0.0)
+            MagneticTransfer::rf(MagneticModel::JilesAtherton, MagneticMedia::Cobalt, 1.0, d, JaSolver::Table)
+                .carrier_fundamental(0.0)
         };
         let (lo, nom, hi) = (rf(0.7), rf(NOMINAL_RF_DRIVE), rf(4.0));
         assert!((nom - 1.0).abs() < 0.02, "{nom}");
         assert!(lo < 0.5 * nom, "{lo}");
         assert!(hi > nom && hi < 2.0 * nom, "{hi}");
+    }
+
+    /// FM の RF (搬送波 3.4〜4.4 MHz + 低域変換クロマ、8 倍オーバーサンプリング) で、折り返し点の表が
+    /// 厳密な RK4 とほぼ同じ磁化を返す。表の範囲を超える過大な色でも外れない
+    #[test]
+    fn turn_table_matches_exact() {
+        use std::f32::consts::TAU;
+        let fs = 8.0 * 4.0 * 315.0e6 / 88.0;
+        for media in
+            [MagneticMedia::Cobalt, MagneticMedia::HighCobalt, MagneticMedia::MetalParticle, MagneticMedia::FerricAudio]
+        {
+            for (drive, cu) in [(1.0, 0.1), (2.0, 0.15), (4.0, 0.3), (2.0, 0.8)] {
+                let mk = |s| MagneticTransfer::rf(MagneticModel::JilesAtherton, media, 1.0, drive, s);
+                let (mut fast, mut exact) = (mk(JaSolver::Table).state(), mk(JaSolver::Exact).state());
+                let (mut ph, mut cph) = (0f32, 0f32);
+                let (mut err, mut pow) = (0f64, 0f64);
+                for i in 0..(910 + 48) * 8 {
+                    let f = 3.9e6 + 0.5e6 * (TAU * i as f32 / 3000.0).sin();
+                    ph = (ph + TAU * f / fs) % TAU;
+                    cph = (cph + TAU * 629e3 / fs) % TAU;
+                    let x = ph.cos() + cu * cph.cos();
+                    let (a, b) = (fast.process(x), exact.process(x));
+                    err += ((a - b) as f64).powi(2);
+                    pow += (b as f64).powi(2);
+                }
+                let rel = (err / pow).sqrt();
+                assert!(rel < 0.015, "{media:?} drive {drive} cu {cu}: {:.3} %", 100.0 * rel);
+            }
+        }
     }
 
     /// 音声: バイアスがないと小信号が通らない (デッドゾーン)。適正なバイアスでほぼ直線、足りないと早く飽和する

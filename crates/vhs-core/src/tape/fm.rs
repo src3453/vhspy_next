@@ -522,30 +522,38 @@ mod tests {
         }
     }
 
-    /// J-A (メタルテープ、記録磁界 3 Hc) で RF を記録しても、FM なので輝度のレベルは保たれる
+    /// J-A (メタルテープ、記録磁界 3 Hc) で RF を記録しても、FM なので輝度のレベルは保たれる (表引き・厳密とも)
     #[test]
     fn jiles_atherton_rf_keeps_levels() {
-        use crate::params::{MagneticMedia, MagneticModel};
-        let ch = FmChannel::new(&FmConfig {
-            fs: NTSC.fs,
-            f_sync_hz: 3.4e6,
-            f_white_hz: 4.4e6,
-            levels: NTSC.ire,
-            channel_bw_hz: 5.5e6,
-            luma_bw_hz: 3.0e6,
-            noise: 0.0,
-            color_under_hz: 629e3,
-            color_under_level: 0.0,
-            mag: MagneticTransfer::rf(MagneticModel::JilesAtherton, MagneticMedia::MetalParticle, 1.0, 3.0),
-            writing_speed: 5.8,
-            extra_spacing: 0.0,
-        });
-        for level in [7.5f32, 50.0, 100.0] {
-            let input = vec![level; 910];
-            let mut out = vec![0f32; 910];
-            ch.process_line(&input, &[], &[], 1.0, 0.0, &[], &mut Rng::new(1), &mut out);
-            let (mean, sd, _, _) = stats(&out[100..800]);
-            assert!((mean - level).abs() < 1.0 && sd < 0.5, "level {level}: mean {mean} sd {sd}");
+        use crate::params::{JaSolver, MagneticMedia, MagneticModel};
+        for solver in [JaSolver::Table, JaSolver::Exact] {
+            let ch = FmChannel::new(&FmConfig {
+                fs: NTSC.fs,
+                f_sync_hz: 3.4e6,
+                f_white_hz: 4.4e6,
+                levels: NTSC.ire,
+                channel_bw_hz: 5.5e6,
+                luma_bw_hz: 3.0e6,
+                noise: 0.0,
+                color_under_hz: 629e3,
+                color_under_level: 0.0,
+                mag: MagneticTransfer::rf(
+                    MagneticModel::JilesAtherton,
+                    MagneticMedia::MetalParticle,
+                    1.0,
+                    3.0,
+                    solver,
+                ),
+                writing_speed: 5.8,
+                extra_spacing: 0.0,
+            });
+            for level in [7.5f32, 50.0, 100.0] {
+                let input = vec![level; 910];
+                let mut out = vec![0f32; 910];
+                ch.process_line(&input, &[], &[], 1.0, 0.0, &[], &mut Rng::new(1), &mut out);
+                let (mean, sd, _, _) = stats(&out[100..800]);
+                assert!((mean - level).abs() < 1.0 && sd < 0.5, "{solver:?} level {level}: mean {mean} sd {sd}");
+            }
         }
     }
 }

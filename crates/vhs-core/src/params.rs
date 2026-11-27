@@ -408,6 +408,17 @@ pub enum MagneticModel {
     JilesAtherton,
 }
 
+/// FM の RF で Jiles-Atherton を解く方法
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JaSolver {
+    /// 磁界の折り返し点ごとに、前もって細かく解いた枝の表を引く (速い。誤差は厳密解の 1% 未満)
+    #[default]
+    Table,
+    /// 1 サンプルずつ RK4 で積分する (遅い)
+    Exact,
+}
+
 /// 磁性体の種類 (Jiles-Atherton の係数を選ぶ)
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -576,6 +587,8 @@ pub struct TapeParams {
     pub magnetic_model: MagneticModel,
     /// 磁性体の種類 (J-A のときに使う)
     pub magnetic_media: MagneticMedia,
+    /// J-A: FM 輝度の RF の解き方 (表引き / 厳密)
+    pub ja_solver: JaSolver,
     /// J-A: FM 搬送波の記録磁界の振幅 [保磁力 Hc の倍数]。2 で再生 RF が基準の大きさ。
     /// 小さいと RF が弱くノイズが増え、大きいと飽和して搬送波と色の相互変調が増える。色のバイアスでもある
     pub rf_drive_hc: f32,
@@ -635,6 +648,7 @@ impl Default for TapeParams {
             chroma_delay_samples: 3,
             magnetic_model: MagneticModel::Tanh,
             magnetic_media: MagneticMedia::Cobalt,
+            ja_solver: JaSolver::Table,
             rf_drive_hc: 2.0,
             saturation_ire: 50.0,
             rf_saturation: 1.5,

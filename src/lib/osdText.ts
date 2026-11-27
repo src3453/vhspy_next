@@ -219,6 +219,7 @@ export const controlLabels: Record<string, string> = {
   "tape.rf_saturation": "RF ﾎｳﾜ",
   "tape.magnetic_media": "ﾃｰﾌﾟ ﾉ ｼｭﾙｲ",
   "tape.rf_drive_hc": "FM ｷﾛｸ ｼﾞｶｲ",
+  "tape.ja_solver": "J-A ﾉ ﾄｷｶﾀ",
   "audio.bias_level": "ﾊﾞｲｱｽ",
 
   "tape.dropout_rate": "ﾊｯｾｲﾘﾂ",
@@ -419,6 +420,7 @@ export const optionLabels: Record<string, Record<string, string>> = {
   "tape.luma_model": { fm: "FM ｹｲｻﾝ", simple: "ｶﾝｲ" },
   "output.connection": { composite: "ｺﾝﾎﾟｼﾞｯﾄ", s_video: "S ｴｲｿﾞｳ" },
   "tape.magnetic_model": { tanh: "tanh ﾎｳﾜ", jiles_atherton: "J-A ﾋｽﾃﾘｼｽ", linear: "ｾﾝｹｲ" },
+  "tape.ja_solver": { table: "ﾋｮｳ (ｺｳｿｸ)", exact: "ｹﾞﾝﾐﾂ" },
   "tape.magnetic_media": { cobalt: "ｺﾊﾞﾙﾄ", high_cobalt: "ｺｳ Hc ｺﾊﾞﾙﾄ", metal_particle: "ﾒﾀﾙ", ferric_audio: "ｻﾝｶﾃﾂ" },
   "rf.placement": { after_tape: "ﾃｰﾌﾟ ﾉ ｱﾄ", before_tape: "ﾃｰﾌﾟ ﾉ ﾏｴ", both: "ﾘｮｳﾎｳ" },
   "decoder.yc_separation": { notch: "ﾉｯﾁ", comb: "ｸｼｶﾞﾀ", comb3d: "3ｼﾞｹﾞﾝ" },

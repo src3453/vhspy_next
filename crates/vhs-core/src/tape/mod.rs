@@ -335,8 +335,13 @@ impl TapeSim {
             cu_per_ire,
         );
         // FM の RF の伝達特性 (搬送波の振幅 = 1 の尺度)
-        let rf_mag =
-            MagneticTransfer::rf(tp.magnetic_model, tp.magnetic_media, tp.rf_saturation.max(0.05), tp.rf_drive_hc);
+        let rf_mag = MagneticTransfer::rf(
+            tp.magnetic_model,
+            tp.magnetic_media,
+            tp.rf_saturation.max(0.05),
+            tp.rf_drive_hc,
+            tp.ja_solver,
+        );
         let simple_rf = SimpleRf::new(&rf_mag, tp, s);
         let fm = (tp.luma_model == LumaModel::Fm).then(|| {
             FmChannel::new(&FmConfig {

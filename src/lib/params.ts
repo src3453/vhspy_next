@@ -124,6 +124,7 @@ export type Params = {
     chroma_delay_samples: number;
     magnetic_model: "linear" | "tanh" | "jiles_atherton";
     magnetic_media: MagneticMedia;
+    ja_solver: "table" | "exact";
     rf_drive_hc: number;
     saturation_ire: number;
     rf_saturation: number;
@@ -593,6 +594,13 @@ export const groups: Group[] = [
         ],
       },
       r("tape.rf_drive_hc", "FM の記録磁界", 0.3, 6, 0.05, "×Hc"),
+      {
+        kind: "select", path: "tape.ja_solver", label: "J-A の解き方",
+        options: [
+          { value: "table", label: "表引き (高速)" },
+          { value: "exact", label: "厳密 (RK4)" },
+        ],
+      },
     ],
   },
   {
@@ -1084,6 +1092,9 @@ export const help: Record<string, string> = {
     "FM 搬送波を記録する磁界の振幅 (保磁力 Hc の倍数)。2 で再生 RF が基準の大きさ。小さいと磁化しきれず RF が弱くノイズが増え、" +
     "大きいと飽和して搬送波と色の相互変調 (鮮やかな色の部分の輝度のモアレ) が増える。搬送波は色のバイアスでもあるので、" +
     "大きいほど色は直線的に記録される。",
+  "tape.ja_solver":
+    "FM 輝度の RF で J-A を解く方法。表引きは磁界の折り返し点ごとに前もって細かく解いた磁化の曲線を引く (厳密解との差は 1% 未満で、10 倍以上速い)。" +
+    "厳密は 1 サンプルずつ RK4 で積分する (遅い)。色と音声はどちらでも同じ表を使う。",
 
   // テープ: ドロップアウト
   "tape.dropout_rate": "1 ラインあたりのドロップアウト (磁性体の欠落による白や黒の横筋) の発生確率。",
@@ -1480,6 +1491,7 @@ const activeWhen: Record<string, (p: Params) => boolean> = {
   "tape.rf_saturation": (p) => p.tape.magnetic_model === "tanh",
   "tape.magnetic_media": (p) => p.tape.magnetic_model === "jiles_atherton",
   "tape.rf_drive_hc": (p) => p.tape.magnetic_model === "jiles_atherton",
+  "tape.ja_solver": (p) => p.tape.magnetic_model === "jiles_atherton" && p.tape.luma_model === "fm",
   "audio.bias_level": (p) => p.audio.mode === "linear" && p.tape.magnetic_model === "jiles_atherton",
   "output.connection": (p) => composite(p) && p.tape.enabled && !(p.rf.enabled && p.rf.placement !== "before_tape"),
 
