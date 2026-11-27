@@ -172,6 +172,15 @@ export type Params = {
     interference_ire: number;
     interference_mhz: number;
     sound_beat: number;
+    agc_enabled: boolean;
+    agc_mode: "keyed" | "peak" | "average" | "manual";
+    agc_time_ms: number;
+    agc_range_db: number;
+    agc_offset_db: number;
+    signal_db: number;
+    overload_db: number;
+    flutter_db: number;
+    flutter_hz: number;
   };
   decoder: {
     yc_separation: "notch" | "comb" | "comb3d";
@@ -629,6 +638,23 @@ export const groups: Group[] = [
       r("rf.interference_ire", "ビート妨害", 0, 20, 0.1, "IRE"),
       r("rf.interference_mhz", "ビート周波数", 0.1, 4.5, 0.01, "MHz"),
       r("rf.sound_beat", "音声ビート", 0, 3, 0.01),
+      b("rf.agc_enabled", "受信レベルと AGC を模擬"),
+      {
+        kind: "select", path: "rf.agc_mode", label: "AGC 方式",
+        options: [
+          { value: "keyed", label: "キード (同期先端)" },
+          { value: "peak", label: "ピーク" },
+          { value: "average", label: "平均値" },
+          { value: "manual", label: "固定利得 (AGC なし)" },
+        ],
+      },
+      r("rf.signal_db", "受信レベル", -50, 30, 0.5, "dB"),
+      r("rf.agc_time_ms", "AGC 時定数", 0.1, 1000, 0.1, "ms"),
+      r("rf.agc_range_db", "AGC 範囲", 0, 60, 1, "dB"),
+      r("rf.agc_offset_db", "AGC 基準ずれ", -12, 12, 0.1, "dB"),
+      r("rf.overload_db", "過入力レベル", 0, 30, 0.5, "dB"),
+      r("rf.flutter_db", "フラッター", 0, 20, 0.1, "dB"),
+      r("rf.flutter_hz", "フラッター周波数", 0.1, 30, 0.1, "Hz"),
     ],
   },
   {
@@ -1007,6 +1033,21 @@ export const help: Record<string, string> = {
   "rf.interference_ire": "ビート妨害 (斜めの縞模様) の強さ。",
   "rf.interference_mhz": "ビート妨害の周波数。縞の細かさ・角度が変わる。",
   "rf.sound_beat": "音声搬送波が映像に漏れる量。920 kHz ビートや音声に連動する縞が出る。",
+  "rf.agc_enabled":
+    "受信レベルの変化とチューナの AGC (自動利得制御) を模擬する。信号を負変調の包絡線に直して利得をかけ、包絡線検波してブランキングでクランプする。" +
+    "スノー・ビート妨害は受信機の入口で一定なので、電波が弱いほど (AGC が利得を上げるほど) 相対的に増える。",
+  "rf.agc_mode":
+    "キード: 同期先端の振幅を測る。絵柄に左右されない。\n" +
+    "ピーク: 包絡線の最大値を追う (速く下げ、ゆっくり戻す)。スノーのピークで利得が下がり画面が白っぽくなる。\n" +
+    "平均値: 包絡線の平均を測る。負変調なので暗い場面で利得が下がってコントラストが落ち、明るい場面で上がって白飛びする。\n" +
+    "固定利得: AGC なし。受信レベルの変化がそのままコントラスト・同期の深さに出る。",
+  "rf.signal_db": "受信レベル (標準からの差)。下げると AGC が利得を上げ、スノー・妨害が強まる。範囲を超えるとコントラストが落ち、同期が浅くなって画面が流れる。上げすぎるとフロントエンドが飽和する。",
+  "rf.agc_time_ms": "AGC が受信レベルの変化に追いつく速さ。遅いとフラッターで明るさが揺れ、速すぎる平均値 AGC は画面の上下で明るさが波打つ。",
+  "rf.agc_range_db": "AGC が利得を変えられる幅 (±)。これを超える弱電界・強電界は補正しきれない。",
+  "rf.agc_offset_db": "AGC の基準のずれ。+ でコントラスト過大 (白飛び・同期が深い)、- でコントラスト不足 (同期が浅く外れやすい)。",
+  "rf.overload_db": "チューナの入口が歪み始める受信レベル。受信レベルがこれを超えると同期先端・黒側が潰れ、同期が不安定になる。",
+  "rf.flutter_db": "飛行機の反射などで受信レベルが周期的に揺れる深さ (フラッター)。AGC が追いつかないと明るさ・スノーが脈打つ。",
+  "rf.flutter_hz": "フラッターの周波数。飛行機の通過に合わせてゆっくり変わる。",
 
   // エンコーダ
   standard:
@@ -1308,6 +1349,15 @@ const activeWhen: Record<string, (p: Params) => boolean> = {
   "rf.interference_ire": (p) => p.rf.enabled,
   "rf.interference_mhz": (p) => p.rf.enabled,
   "rf.sound_beat": (p) => p.rf.enabled,
+  "rf.agc_enabled": (p) => p.rf.enabled,
+  "rf.agc_mode": (p) => p.rf.enabled && p.rf.agc_enabled,
+  "rf.signal_db": (p) => p.rf.enabled && p.rf.agc_enabled,
+  "rf.agc_time_ms": (p) => p.rf.enabled && p.rf.agc_enabled && p.rf.agc_mode !== "manual",
+  "rf.agc_range_db": (p) => p.rf.enabled && p.rf.agc_enabled && p.rf.agc_mode !== "manual",
+  "rf.agc_offset_db": (p) => p.rf.enabled && p.rf.agc_enabled,
+  "rf.overload_db": (p) => p.rf.enabled && p.rf.agc_enabled,
+  "rf.flutter_db": (p) => p.rf.enabled && p.rf.agc_enabled,
+  "rf.flutter_hz": (p) => p.rf.enabled && p.rf.agc_enabled && p.rf.flutter_db > 0,
 
   // エンコーダ
   "signal.": composite,
@@ -1571,6 +1621,15 @@ export const presets: { name: string; diff: DeepPartial<Params> }[] = [
     name: "電波の弱い放送を録画",
     diff: {
       rf: { enabled: true, placement: "before_tape", snow_ire: 8, ghost_gain: 0.25, ghost_delay_us: 2.5 },
+    },
+  },
+  {
+    name: "飛行機フラッターの放送",
+    diff: {
+      rf: {
+        enabled: true, placement: "before_tape", snow_ire: 2, ghost_gain: 0.1,
+        agc_enabled: true, agc_mode: "keyed", agc_time_ms: 150, signal_db: -14, flutter_db: 9, flutter_hz: 4,
+      },
     },
   },
   {

@@ -1067,6 +1067,21 @@ impl RfPlacement {
     }
 }
 
+/// チューナの AGC (自動利得制御) が受信レベルを何で測るか
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgcMode {
+    /// キード AGC: 同期先端の振幅を測る (絵柄に左右されない。一般的なテレビ)
+    #[default]
+    Keyed,
+    /// ピーク AGC: 包絡線の最大値を追う (速いアタック・遅いリリース。雑音のピークで利得が下がる)
+    Peak,
+    /// 平均値 AGC: 包絡線の平均を測る (負変調なので暗い絵ほど利得が下がり、APL で明るさが揺れる)
+    Average,
+    /// 固定利得 (AGC なし): 受信レベルの変化がそのままコントラスト・同期の深さに出る
+    Manual,
+}
+
 /// RF 接続 (VCR の RF モジュレータ → テレビ、または放送受信) のチューナ経由の劣化
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -1086,6 +1101,24 @@ pub struct RfParams {
     pub interference_mhz: f32,
     /// 音声搬送波が映像に漏れる量 (920 kHz ビート / 音声連動の縞)
     pub sound_beat: f32,
+    /// 受信レベルと AGC を模擬する (負変調の包絡線で扱う)。オフなら利得は常に理想
+    pub agc_enabled: bool,
+    /// AGC の検波方式
+    pub agc_mode: AgcMode,
+    /// AGC ループの時定数 [ms] (ピーク AGC ではリリース側。アタックはその 1/20)
+    pub agc_time_ms: f32,
+    /// AGC が利得を変えられる幅 (±) [dB]。超えると弱電界で暗く・強電界で利得が下がりきらない
+    pub agc_range_db: f32,
+    /// AGC の基準のずれ [dB] (+ でコントラスト過大・同期が深く、- でコントラスト不足・同期が浅い)
+    pub agc_offset_db: f32,
+    /// 受信レベル (標準からの差) [dB]。下げるほどスノー・妨害が相対的に増える
+    pub signal_db: f32,
+    /// フロントエンドが歪み始める受信レベル [dB]。超えると同期先端・黒側が圧縮される
+    pub overload_db: f32,
+    /// フラッター (飛行機の反射などによる受信レベルの揺れ) の深さ [dB]
+    pub flutter_db: f32,
+    /// フラッターの周波数 [Hz] (ドップラーでゆっくり変わる)
+    pub flutter_hz: f32,
 }
 
 impl Default for RfParams {
@@ -1099,6 +1132,15 @@ impl Default for RfParams {
             interference_ire: 0.0,
             interference_mhz: 2.7,
             sound_beat: 0.0,
+            agc_enabled: false,
+            agc_mode: AgcMode::Keyed,
+            agc_time_ms: 10.0,
+            agc_range_db: 40.0,
+            agc_offset_db: 0.0,
+            signal_db: 0.0,
+            overload_db: 12.0,
+            flutter_db: 0.0,
+            flutter_hz: 3.0,
         }
     }
 }
