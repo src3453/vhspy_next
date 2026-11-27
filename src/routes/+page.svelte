@@ -383,13 +383,14 @@
   });
 
   function applyPreset(i: number) {
-    // 今のテレビ方式とテープのフォーマットは引き継ぐ (プリセットが指定していればそちら)
+    // テレビ方式とテープのフォーマットはプリセットの一部なので引き継がない (指定がなければ既定の値)。
+    // 引き継ぐと、DV や PAL のプリセットの後に別のプリセットを選んでも DV / PAL のまま残ってしまう
     const preset = presets[i];
     if (!defaults || !preset) return;
-    // FM モデルで使っていたときだけフォーマットの値をすべて引き継ぐ (簡易モデルの既定の見た目は変えない)
+    // FM モデルで使っていたときだけフォーマットの値をすべて合わせる (簡易モデルの既定の見た目は変えない)
     const fm = params?.tape.luma_model === "fm";
-    const standard = preset.diff.standard ?? params?.standard ?? "ntsc";
-    const format = preset.diff.tape?.format ?? params?.tape.format ?? "vhs";
+    const standard = preset.diff.standard ?? defaults.standard;
+    const format = preset.diff.tape?.format ?? defaults.tape.format;
     // 形式を切り替えるプリセットでは、その形式に対応する搬送波・帯域などを先に適用する。
     const base = retarget(defaults, standard, format, preset.diff.tape?.format !== undefined || fm);
     const crt = params ? $state.snapshot(params.crt) : null;
@@ -748,7 +749,14 @@
 
   <aside class="panel">
     <div class="presets">
-      <select onchange={(e) => applyPreset(Number((e.target as HTMLSelectElement).value))}>
+      <select
+        onchange={(e) => {
+          const sel = e.target as HTMLSelectElement;
+          applyPreset(Number(sel.value));
+          // 見出しに戻し、同じプリセットをもう一度選んでも適用されるようにする
+          sel.selectedIndex = 0;
+        }}
+      >
         <option value="" disabled selected>プリセット…</option>
         {#each presets as p, i}<option value={i}>{p.name}</option>{/each}
       </select>

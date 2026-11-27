@@ -1713,7 +1713,7 @@ export const standardDiffs: Record<Standard, DeepPartial<Params>> = {
   pal: { standard: "pal", encoder: { luma_bw_mhz: 5.0 }, audio: { hum_hz: 50 } },
 };
 
-// 組み込みプリセット (既定値からの差分。テレビ方式は今の方式を引き継ぐ)
+// 組み込みプリセット (既定値からの差分。テレビ方式・テープのフォーマットも指定がなければ既定値)
 export const presets: { name: string; diff: DeepPartial<Params> }[] = [
   { name: "VHS 標準 (SP)", diff: {} },
   {
