@@ -128,6 +128,9 @@ fn encode(
     let (parity, frame_no, field_index) = (field.parity, field.frame, field.index);
     let lv = s.ire.with_setup(p.setup);
     let span = lv.span();
+    // ガンマ補正: 入力 (sRGB ≒ 2.2 乗) を線形に戻してから 1/γ 乗する
+    let tx_exp = 2.2 / p.gamma.max(0.1);
+    let tx_gamma = (tx_exp - 1.0).abs() > 1e-6;
     let burst = s.burst_start..s.burst_end;
 
     // 垂直同期: 幅広パルスの振幅減衰・雑音は信号そのものに掛ける (受像機の垂直同期分離が取り損ねると
@@ -223,6 +226,11 @@ fn encode(
             } else {
                 let row = &frame.data[(2 * a + parity as usize) * aw * 3..];
                 (row[px], row[px + 1], row[px + 2])
+            };
+            let (r, g, b) = if tx_gamma {
+                (r.max(0.0).powf(tx_exp), g.max(0.0).powf(tx_exp), b.max(0.0).powf(tx_exp))
+            } else {
+                (r, g, b)
             };
             let y = lv.black + span * (0.299 * r + 0.587 * g + 0.114 * b);
             Some(if pal {

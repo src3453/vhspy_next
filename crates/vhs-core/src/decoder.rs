@@ -360,6 +360,8 @@ impl Decoder {
         // --- Y/C 分離とバースト検出 (ライン並列) ---
         let notch = Cascade::new(&[Biquad::notch_at(s.fsc, 1.0, s.fs)]);
         let c_bp = Cascade::new(&[Biquad::bandpass_at(s.fsc, 1.5, s.fs)]);
+        // 受像機の輝度ハイシェルフ (輪郭補正)。Y/C 分離のあとに掛ける
+        let y_shelf = Biquad::high_shelf_at(p.luma_shelf_mhz.clamp(0.01, 0.45 * s.fs * 1e-6) * 1e6, p.luma_shelf_db, s.fs);
         // くし形の相手: 副搬送波が 180° ずれたライン (NTSC は 1H、PAL は V の符号も揃う 2H 前)
         let comb_lag: u64 = if pal { 2 } else { 1 };
         let use_3d = p.yc_separation == YcSeparation::Comb3d && !separate;
@@ -427,6 +429,13 @@ impl Decoder {
                         for n in 0..ls {
                             y[n] = nf.process(x[n]);
                             c[n] = bp.process(x[n]);
+                        }
+                    }
+
+                    if p.luma_shelf_db.abs() >= 1e-4 {
+                        let mut f = y_shelf;
+                        for v in y.iter_mut() {
+                            *v = f.process(*v);
                         }
                     }
 
@@ -506,8 +515,14 @@ impl Decoder {
             ChromaDemod::IqWide => (p.chroma_bw_mhz, p.narrow_bw_mhz),
             ChromaDemod::RyBy | ChromaDemod::Xz => (p.narrow_bw_mhz, p.narrow_bw_mhz),
         };
-        let c_lp_a = Cascade::butter_lowpass_at(2, bw_a.max(0.01) * 1e6, s.fs);
-        let c_lp_b = if bw_b == bw_a { c_lp_a } else { Cascade::butter_lowpass_at(2, bw_b.max(0.01) * 1e6, s.fs) };
+        // 復調後の色差ハイシェルフをローパスの後段に足す (群遅延の補正にも含まれる)
+        let c_shelf = Biquad::high_shelf_at(p.chroma_shelf_mhz.clamp(0.01, 0.45 * s.fs * 1e-6) * 1e6, p.chroma_shelf_db, s.fs);
+        let c_lp = |bw: f32| {
+            let lp = Cascade::butter_lowpass_at(2, bw.max(0.01) * 1e6, s.fs);
+            Cascade::new(&[lp.sections()[0], c_shelf])
+        };
+        let c_lp_a = c_lp(bw_a);
+        let c_lp_b = if bw_b == bw_a { c_lp_a } else { c_lp(bw_b) };
         let matrix = chroma_matrix(demod, p);
         // NTSC は I/Q 軸 (U/V から 33°) で検波する。PAL は U/V 軸のまま
         let hue = if pal { p.hue_deg.to_radians() } else { p.hue_deg.to_radians() + 33f32.to_radians() };
@@ -610,6 +625,9 @@ impl Decoder {
         let parity = row0 as usize;
         let row_bytes = aw * 4;
         let (nr_y, nr_u, nr_v) = (&self.nr_y, &self.nr_u, &self.nr_v);
+        // ブラウン管のガンマ: 電圧 → 光 (γ 乗) を、出力先 (sRGB ≒ 2.2 乗) の符号値に直す
+        let rx_exp = p.gamma.max(0.1) / 2.2;
+        let rx_gamma = (rx_exp - 1.0).abs() > 1e-6;
         out.data.par_chunks_mut(row_bytes).enumerate().for_each(|(row, dst)| {
             if row % 2 != parity {
                 return;
@@ -625,6 +643,11 @@ impl Decoder {
                 } else {
                     let [mr, mg, mb] = matrix;
                     (yy + mr[0] * u[x] + mr[1] * v[x], yy + mg[0] * u[x] + mg[1] * v[x], yy + mb[0] * u[x] + mb[1] * v[x])
+                };
+                let (r, g, b) = if rx_gamma {
+                    (r.max(0.0).powf(rx_exp), g.max(0.0).powf(rx_exp), b.max(0.0).powf(rx_exp))
+                } else {
+                    (r, g, b)
                 };
                 let o = x * 4;
                 dst[o] = to_u8(r);

@@ -373,6 +373,9 @@ pub struct EncoderParams {
     pub setup: Setup,
     /// 番組を作ったモニタの基準白 (視聴者が順応している白)。受像機の `white_point` と違うと色かぶりになる
     pub white_point: WhitePoint,
+    /// 送り側のガンマ補正 (逆特性) が想定する受像機のガンマ γ。RGB に 1/γ 乗を掛けてから符号化する。
+    /// 入力画像は sRGB (≒ 2.2 乗) とみなすので、2.2 なら何もしない。撮像管カメラはカメラ側の `camera_gamma` を使う
+    pub gamma: f32,
 }
 
 impl Default for EncoderParams {
@@ -387,6 +390,7 @@ impl Default for EncoderParams {
             burst_level_pct: 100.0,
             setup: Setup::Auto,
             white_point: WhitePoint::D65,
+            gamma: 2.2,
         }
     }
 }
@@ -896,11 +900,21 @@ pub struct DecoderParams {
     pub frame_buffer_bits: u32,
     /// 復調後の色差帯域 [MHz]
     pub chroma_bw_mhz: f32,
+    /// 輝度のハイシェルフ (画質調整の輪郭補正に相当) の利得 [dB]。正で輪郭が立ち、負で甘くなる。0 で素通し
+    pub luma_shelf_db: f32,
+    /// 輝度のハイシェルフのコーナー周波数 [MHz]
+    pub luma_shelf_mhz: f32,
+    /// 色差のハイシェルフ (復調後) の利得 [dB]。正で色の輪郭が立ち、負でさらににじむ。0 で素通し
+    pub chroma_shelf_db: f32,
+    /// 色差のハイシェルフのコーナー周波数 [MHz]
+    pub chroma_shelf_mhz: f32,
     /// 受像機が黒とみなすレベル (セットアップ)。送り側と違うと、7.5 IRE の信号を 0 IRE の受像機で見れば
     /// 黒が浮いて白っぽく、逆なら暗部がつぶれる
     pub setup: Setup,
     /// 受像機 (ブラウン管) の白色点。RGB = 1 をどの色で光らせるか
     pub white_point: WhitePoint,
+    /// 受像機 (ブラウン管) のガンマ。送り側の想定より大きいと暗部が沈んでコントラストが強く、小さいと眠い絵になる
+    pub gamma: f32,
     /// NTSC の色復調方式
     pub chroma_demod: ChromaDemod,
     /// 狭帯域側 (Q・R-Y/B-Y・X/Z) の色差帯域 [MHz]。`chroma_demod` が `Iq` 以外のとき使う
@@ -972,8 +986,13 @@ impl Default for DecoderParams {
             motion_adaptive: true,
             frame_buffer_bits: 8,
             chroma_bw_mhz: 1.3,
+            luma_shelf_db: 0.0,
+            luma_shelf_mhz: 2.0,
+            chroma_shelf_db: 0.0,
+            chroma_shelf_mhz: 0.5,
             setup: Setup::Auto,
             white_point: WhitePoint::D65,
+            gamma: 2.2,
             chroma_demod: ChromaDemod::Iq,
             narrow_bw_mhz: 0.5,
             // 増幅率がそろった 3 管で R-Y・G-Y・B-Y の誤差が最小になるよう合わせた値。

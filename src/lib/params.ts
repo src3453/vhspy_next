@@ -74,7 +74,7 @@ export type Params = {
     white_clip: number;
     camera_gamma: number;
   };
-  encoder: { enabled: boolean; luma_bw_mhz: number; i_bw_mhz: number; q_bw_mhz: number; uv_bw_mhz: number; chroma_gain: number; burst_level_pct: number; setup: Setup; white_point: WhitePoint };
+  encoder: { enabled: boolean; luma_bw_mhz: number; i_bw_mhz: number; q_bw_mhz: number; uv_bw_mhz: number; chroma_gain: number; burst_level_pct: number; setup: Setup; white_point: WhitePoint; gamma: number };
   signal: {
     vertical_sync: { jitter: number; attenuation_pct: number; noise_ire: number };
     horizontal_sync: { jitter: number; attenuation_pct: number; noise_ire: number };
@@ -199,8 +199,13 @@ export type Params = {
     motion_adaptive: boolean;
     frame_buffer_bits: number;
     chroma_bw_mhz: number;
+    luma_shelf_db: number;
+    luma_shelf_mhz: number;
+    chroma_shelf_db: number;
+    chroma_shelf_mhz: number;
     setup: Setup;
     white_point: WhitePoint;
+    gamma: number;
     chroma_demod: "iq" | "iq_wide" | "ry_by" | "xz";
     narrow_bw_mhz: number;
     xz_x_axis_deg: number;
@@ -703,6 +708,7 @@ export const groups: Group[] = [
           { value: "d93", label: "D93 (9300 K + 27 MPCD・日本)" },
         ],
       },
+      r("encoder.gamma", "送り側ガンマ補正 (想定 γ)", 1, 3.5, 0.05),
     ],
   },
   {
@@ -782,6 +788,10 @@ export const groups: Group[] = [
       r("decoder.motion_threshold_ire", "3D: 動き検出しきい値", 0.5, 20, 0.5, "IRE"),
       r("decoder.frame_buffer_bits", "3D: バッファのビット数 (0 = なし)", 0, 12, 1, "bit"),
       r("decoder.chroma_bw_mhz", "色差帯域", 0.2, 3, 0.05, "MHz"),
+      r("decoder.luma_shelf_db", "輝度ハイシェルフ", -12, 12, 0.5, "dB"),
+      r("decoder.luma_shelf_mhz", "輝度ハイシェルフ周波数", 0.5, 5, 0.1, "MHz"),
+      r("decoder.chroma_shelf_db", "色差ハイシェルフ", -12, 12, 0.5, "dB"),
+      r("decoder.chroma_shelf_mhz", "色差ハイシェルフ周波数", 0.1, 2, 0.05, "MHz"),
       {
         kind: "select", path: "decoder.setup", label: "受像機のセットアップ",
         options: [
@@ -797,6 +807,7 @@ export const groups: Group[] = [
           { value: "d93", label: "D93 (9300 K + 27 MPCD・日本)" },
         ],
       },
+      r("decoder.gamma", "受像機のガンマ γ", 1, 3.5, 0.05),
       {
         kind: "select", path: "decoder.chroma_demod", label: "色復調方式",
         options: [
@@ -1220,6 +1231,17 @@ export const help: Record<string, string> = {
     "白は 100 IRE のままなので、黒〜白の振幅と色信号の振幅も変わる。",
   "encoder.white_point":
     "番組を作ったモニタの基準白 (視聴者が順応している白)。北米は D65、日本は 9300 K + 27 MPCD。受像機の色温度と同じなら色かぶりは出ない。",
+  "encoder.gamma":
+    "送り側のガンマ補正 (逆特性) が想定する受像機のガンマ。RGB を 1/γ 乗して送る。NTSC は 2.2 (SMPTE 170M の OETF は約 1/0.45)。" +
+    "入力画像は sRGB (≒ 2.2 乗) とみなすので 2.2 で素通し。撮像管カメラ経由ではカメラ側のガンマを使う。",
+  "decoder.luma_shelf_db":
+    "受像機の輝度経路のハイシェルフ (画質調整の輪郭補正)。Y/C 分離のあとに掛ける。正で輪郭が立ちリンギングが出て、負で甘くなる。0 で素通し。",
+  "decoder.luma_shelf_mhz": "輝度ハイシェルフのコーナー周波数。これより上の帯域が持ち上がる (下がる)。",
+  "decoder.chroma_shelf_db":
+    "復調後の色差のハイシェルフ。正で色の輪郭が立ち (にじみが減るように見える)、負でさらににじむ。0 で素通し。",
+  "decoder.chroma_shelf_mhz": "色差ハイシェルフのコーナー周波数。色差帯域より低めに置くと効きが分かりやすい。",
+  "decoder.gamma":
+    "受像機 (ブラウン管) のガンマ。実際の管は 2.2〜2.8 程度。送り側の想定より大きいと暗部が沈んで硬い絵に、小さいと白っぽく眠い絵になる。",
   "decoder.setup":
     "受像機が黒とみなすレベル。送り側と食い違うと、7.5 IRE の信号を 0 IRE の受像機で見れば黒が浮いて全体が白っぽく、" +
     "0 IRE の信号を 7.5 IRE の受像機で見れば暗部がつぶれて黒に沈む。",
@@ -1504,6 +1526,7 @@ const activeWhen: Record<string, (p: Params) => boolean> = {
   "encoder.burst_level_pct": composite,
   "encoder.setup": composite,
   "encoder.white_point": composite,
+  "encoder.gamma": composite,
   "encoder.i_bw_mhz": (p) => composite(p) && p.standard === "ntsc",
   "encoder.q_bw_mhz": (p) => composite(p) && p.standard === "ntsc",
   "encoder.uv_bw_mhz": (p) => composite(p) && p.standard === "pal",
@@ -1519,6 +1542,8 @@ const activeWhen: Record<string, (p: Params) => boolean> = {
   "decoder.dnr_motion_threshold_ire": (p) => analogTape(p) && p.decoder.dnr_strength > 0,
   "decoder.nr_bits": analogTape,
   "decoder.pal_delay_line": (p) => p.standard === "pal",
+  "decoder.luma_shelf_mhz": (p) => p.decoder.luma_shelf_db !== 0,
+  "decoder.chroma_shelf_mhz": (p) => p.decoder.chroma_shelf_db !== 0,
   "decoder.chroma_demod": (p) => p.standard === "ntsc",
   "decoder.narrow_bw_mhz": (p) => p.standard === "ntsc" && p.decoder.chroma_demod !== "iq",
   "decoder.xz_x_axis_deg": xzDemod,
