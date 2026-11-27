@@ -7,6 +7,17 @@ export type TapeFormat = "vhs" | "svhs" | "beta" | "super_beta" | "video8" | "hi
 type DigitalFormat = "dv" | "digital8";
 export const isDigitalFormat = (f: TapeFormat): f is DigitalFormat => f === "dv" || f === "digital8";
 
+export type ClockParams = {
+  offset_ppm: number;
+  drift_ppm: number;
+  drift_time_s: number;
+  wow_ppm: number;
+  wow_hz: number;
+  flutter_ppm: number;
+  flutter_hz: number;
+  jitter_ns: number;
+};
+
 export type Params = {
   /** テレビ方式 */
   standard: Standard;
@@ -201,7 +212,7 @@ export type Params = {
     color_killer: boolean;
     h_pll: number;
     burst_pll: number;
-    vcxo_offset_hz: number;
+    clocks: { chroma: ClockParams; horizontal: ClockParams; vertical: ClockParams };
     pal_delay_line: boolean;
     ynr_strength: number;
     dnr_strength: number;
@@ -805,7 +816,6 @@ export const groups: Group[] = [
       b("decoder.color_killer", "カラーキラー"),
       r("decoder.h_pll", "水平 AFC 追従", 0, 1, 0.01),
       r("decoder.burst_pll", "色副搬送波 PLL 追従", 0.02, 1, 0.01),
-      r("decoder.vcxo_offset_hz", "色発振器の周波数ずれ", -300, 300, 1, "Hz"),
       b("decoder.pal_delay_line", "PAL 遅延線"),
       r("decoder.contrast", "コントラスト", 0, 2, 0.01),
       r("decoder.brightness", "明るさ", -0.5, 0.5, 0.01),
@@ -820,6 +830,36 @@ export const groups: Group[] = [
       b("decoder.teletext_display", "文字放送受信機 (JTES)"),
       r("decoder.teletext_program", "文字放送: 番組番号", 0, 999, 1),
       r("decoder.teletext_page", "文字放送: ページ", 1, 99, 1),
+    ],
+  },
+  {
+    title: "受像機: 発振器 (クロック)",
+    note: "受像機の水晶・セラミック振動子などの周波数誤差。ppm は公称周波数に対する比 (色副搬送波 NTSC で 1 ppm ≒ 3.58 Hz、水平で 1 ppm ≒ 0.016 Hz)。ずれ・ドリフト・ワウ・フラッタは周波数に、ジッタはラインごとの時間に掛かる。",
+    controls: [
+      r("decoder.clocks.chroma.offset_ppm", "色副搬送波 VCXO: 周波数ずれ", -300, 300, 0.5, "ppm"),
+      r("decoder.clocks.chroma.drift_ppm", "色副搬送波 VCXO: ドリフト", 0, 50, 0.5, "ppm rms"),
+      r("decoder.clocks.chroma.drift_time_s", "色副搬送波 VCXO: ドリフトの時間", 0.1, 600, 0.1, "s"),
+      r("decoder.clocks.chroma.wow_ppm", "色副搬送波 VCXO: ワウ", 0, 50, 0.5, "ppm"),
+      r("decoder.clocks.chroma.wow_hz", "色副搬送波 VCXO: ワウの周波数", 0.05, 5, 0.05, "Hz"),
+      r("decoder.clocks.chroma.flutter_ppm", "色副搬送波 VCXO: フラッタ", 0, 50, 0.5, "ppm"),
+      r("decoder.clocks.chroma.flutter_hz", "色副搬送波 VCXO: フラッタの周波数", 1, 120, 0.5, "Hz"),
+      r("decoder.clocks.chroma.jitter_ns", "色副搬送波 VCXO: ジッタ", 0, 50, 0.5, "ns rms"),
+      r("decoder.clocks.horizontal.offset_ppm", "水平発振器: 周波数ずれ", -50000, 50000, 10, "ppm"),
+      r("decoder.clocks.horizontal.drift_ppm", "水平発振器: ドリフト", 0, 5000, 10, "ppm rms"),
+      r("decoder.clocks.horizontal.drift_time_s", "水平発振器: ドリフトの時間", 0.1, 600, 0.1, "s"),
+      r("decoder.clocks.horizontal.wow_ppm", "水平発振器: ワウ", 0, 5000, 10, "ppm"),
+      r("decoder.clocks.horizontal.wow_hz", "水平発振器: ワウの周波数", 0.05, 5, 0.05, "Hz"),
+      r("decoder.clocks.horizontal.flutter_ppm", "水平発振器: フラッタ", 0, 5000, 10, "ppm"),
+      r("decoder.clocks.horizontal.flutter_hz", "水平発振器: フラッタの周波数", 1, 120, 0.5, "Hz"),
+      r("decoder.clocks.horizontal.jitter_ns", "水平発振器: ジッタ", 0, 1000, 5, "ns rms"),
+      r("decoder.clocks.vertical.offset_ppm", "垂直発振器: 周波数ずれ", -100000, 100000, 100, "ppm"),
+      r("decoder.clocks.vertical.drift_ppm", "垂直発振器: ドリフト", 0, 20000, 100, "ppm rms"),
+      r("decoder.clocks.vertical.drift_time_s", "垂直発振器: ドリフトの時間", 0.1, 600, 0.1, "s"),
+      r("decoder.clocks.vertical.wow_ppm", "垂直発振器: ワウ", 0, 20000, 100, "ppm"),
+      r("decoder.clocks.vertical.wow_hz", "垂直発振器: ワウの周波数", 0.05, 5, 0.05, "Hz"),
+      r("decoder.clocks.vertical.flutter_ppm", "垂直発振器: フラッタ", 0, 20000, 100, "ppm"),
+      r("decoder.clocks.vertical.flutter_hz", "垂直発振器: フラッタの周波数", 1, 120, 0.5, "Hz"),
+      r("decoder.clocks.vertical.jitter_ns", "垂直発振器: ジッタ", 0, 500000, 1000, "ns rms"),
     ],
   },
   {
@@ -1202,9 +1242,29 @@ export const help: Record<string, string> = {
     "色副搬送波の PLL がバーストに追従する速さ (ライン単位)。1 = ラインごとに即時同期。" +
     "小さくするとテープのライン単位の位相ゆらぎを取り切れず、NTSC では色相の横縞、PAL では彩度のむらになる。" +
     "実機の APC は 0.1〜0.3 程度で、発振器の周波数ずれが定常的な色相ずれとして残る。",
-  "decoder.vcxo_offset_hz":
+  "decoder.clocks.chroma.offset_ppm":
     "受像機の色副搬送波発振器 (水晶 VCXO) の自走周波数のずれ。PLL の追従が 1 未満だと定常位相誤差が残り、" +
-    "NTSC では画面全体の色相ずれ (色合いツマミで直す類のもの)、PAL では彩度低下になる。0 で理想的な発振器。",
+    "NTSC では画面全体の色相ずれ (色合いツマミで直す類のもの)、PAL では彩度低下になる。0 で理想的な発振器。14 ppm ≒ 50 Hz (NTSC)。",
+  "decoder.clocks.chroma.drift_ppm": "色副搬送波発振器の温度などによるゆっくりした不規則な周波数変化 (rms)。PLL の追従が有限だと色相がゆっくりさまよう。",
+  "decoder.clocks.chroma.wow_ppm": "色副搬送波発振器の遅い周期的な周波数の揺れ。色相がゆっくり行き来する。",
+  "decoder.clocks.chroma.flutter_ppm": "色副搬送波発振器の速い周期的な周波数の揺れ (電源リプル・振動など)。色相が細かく揺れ、周波数によっては横縞になる。",
+  "decoder.clocks.chroma.jitter_ns": "色副搬送波の基準位相のラインごとの揺れ (rms)。1 ns ≒ 1.3° (NTSC)。色相のライン単位のざらつきになる。",
+  "decoder.clocks.horizontal.offset_ppm":
+    "水平発振器の自走周波数のずれ。水平 AFC の追従が有限だと画面全体が横にずれ (≒ ずれ × 1 ライン × (1 − 追従) / 追従)、" +
+    "引き込み範囲を超えると同期が外れて画面が斜めに裂ける。",
+  "decoder.clocks.horizontal.drift_ppm": "水平発振器のゆっくりした不規則な周波数変化 (rms)。画面の横位置がゆっくりさまよう。",
+  "decoder.clocks.horizontal.wow_ppm": "水平発振器の遅い周期的な周波数の揺れ。画面がゆっくり左右に揺れる。",
+  "decoder.clocks.horizontal.flutter_ppm": "水平発振器の速い周期的な周波数の揺れ (電源リプルなど)。縦の線が波打つ。",
+  "decoder.clocks.horizontal.jitter_ns": "水平発振器のラインごとの時間の揺れ (rms)。1 サンプル ≒ 70 ns (NTSC)。縦の輪郭がぎざぎざになる。",
+  "decoder.clocks.vertical.offset_ppm":
+    "垂直発振器の周波数ずれ (垂直ホールドの自走周期にさらに掛かる)。同期の窓の中なら引き込まれ、外れると画面が上下に流れる。",
+  "decoder.clocks.vertical.drift_ppm": "垂直発振器のゆっくりした不規則な周波数変化 (rms)。窓の端にいると、ときどき同期が外れて流れる。",
+  "decoder.clocks.vertical.wow_ppm": "垂直発振器の遅い周期的な周波数の揺れ。",
+  "decoder.clocks.vertical.flutter_ppm": "垂直発振器の速い周期的な周波数の揺れ。",
+  "decoder.clocks.vertical.jitter_ns": "垂直発振器が自走するときのトリガ時刻の揺れ (rms)。1 ライン ≒ 63.6 µs。自走で流れているときに画面が上下に震える。",
+  "decoder.clocks.chroma.drift_time_s": "ドリフトの相関時間。これより長い時間をかけて別の周波数へ移っていく。",
+  "decoder.clocks.horizontal.drift_time_s": "ドリフトの相関時間。これより長い時間をかけて別の周波数へ移っていく。",
+  "decoder.clocks.vertical.drift_time_s": "ドリフトの相関時間。これより長い時間をかけて別の周波数へ移っていく。",
   "decoder.pal_delay_line":
     "PAL の 1H 遅延線 (PAL-D)。切るとシンプル PAL になり、位相の誤差がライン交互の色相ずれ (ハノーバーバー) として見える。",
   "decoder.acc": "カラーバーストの振幅で色の濃さを自動調整する (ACC)。",

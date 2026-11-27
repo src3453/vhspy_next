@@ -103,7 +103,8 @@ impl CompositeParams {
             color_killer: u32::from(dec.color_killer),
             pal_delay_line: u32::from(dec.pal_delay_line),
             output_linear: 0,
-            vcxo_offset_hz: dec.vcxo_offset_hz,
+            // GPU 版は発振器の固定のずれだけを扱う (ドリフト・ワウ・フラッタ・ジッタ・水平/垂直発振器は未対応)
+            vcxo_offset_hz: dec.clocks.chroma.offset_ppm * 1e-6 * standard.spec().fsc,
         }
     }
 }

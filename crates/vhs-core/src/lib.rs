@@ -13,6 +13,7 @@ pub mod audio;
 pub mod camera;
 pub mod caption;
 pub mod capture;
+mod clock;
 pub mod decoder;
 pub mod deinterlace;
 pub mod dv;
@@ -58,7 +59,7 @@ mod tests {
     fn clean_roundtrip_preserves_color() {
         let mut p = Params::default();
         p.tape.enabled = false;
-        p.decoder.vcxo_offset_hz = 0.0;
+        p.decoder.clocks.chroma.offset_ppm = 0.0;
         p.decoder.yc_separation = params::YcSeparation::Comb;
         for (r, g, b) in [(200, 40, 40), (40, 200, 40), (40, 40, 200), (230, 200, 30), (128, 128, 128)] {
             let mut pl = Pipeline::new(p.clone());
@@ -167,7 +168,7 @@ mod tests {
         p.encoder.luma_bw_mhz = 5.0;
         p.tape.enabled = false;
         // 色の正確さを見るテスト用なので、受像機の発振器は理想 (周波数ずれなし) にする
-        p.decoder.vcxo_offset_hz = 0.0;
+        p.decoder.clocks.chroma.offset_ppm = 0.0;
         p
     }
 
@@ -281,7 +282,7 @@ mod tests {
         for pal in [false, true] {
             let mut p = if pal { pal_clean() } else { Params::default() };
             p.tape.enabled = false;
-            p.decoder.vcxo_offset_hz = 0.0;
+            p.decoder.clocks.chroma.offset_ppm = 0.0;
             p.decoder.yc_separation = params::YcSeparation::Comb3d;
             for rgb in COLORS {
                 let pl = run_flat(&p, rgb, 10);
@@ -386,7 +387,7 @@ mod tests {
             let mut p = if pal { pal_clean() } else { Params::default() };
             p.tape.enabled = false;
             p.decoder.burst_pll = 0.2;
-            p.decoder.vcxo_offset_hz = 0.0;
+            p.decoder.clocks.chroma.offset_ppm = 0.0;
             for rgb in COLORS {
                 let pl = run_flat(&p, rgb, 4);
                 let (w, h) = pl.output_size();
@@ -410,7 +411,7 @@ mod tests {
         let hue_err = |k: f32, hz: f32| {
             let mut q = p.clone();
             q.decoder.burst_pll = k;
-            q.decoder.vcxo_offset_hz = hz;
+            q.decoder.clocks.chroma.offset_ppm = hz / timing::NTSC.fsc * 1e6;
             let pl = run_flat(&q, rgb, 4);
             let (w, h) = pl.output_size();
             let got = pixel(&pl, h / 2, w / 2);
@@ -629,6 +630,73 @@ mod tests {
         let mut p = clean_ntsc();
         p.decoder.v_hold_pct = 10.0;
         assert!(black_band_seen(p, 40));
+    }
+
+    /// 垂直発振器の周波数が大きくずれる (速い) と、ホールドが正しくても同期の窓を外れて流れる。
+    /// 小さなずれなら窓の中で引き込まれる
+    #[test]
+    fn vertical_clock_offset_rolls() {
+        let mut p = clean_ntsc();
+        p.decoder.clocks.vertical.offset_ppm = 1000.0;
+        assert!(!black_band_seen(p.clone(), 40));
+        p.decoder.clocks.vertical.offset_ppm = 100_000.0;
+        assert!(black_band_seen(p, 40));
+    }
+
+    /// 左半分が黒・右半分が白の画像を通し、出力の各行で白へ変わる列
+    fn edge_columns(p: &Params, fields: usize) -> Vec<usize> {
+        let s = p.standard.spec();
+        let (w, h) = s.image_size();
+        let mut input = RgbFrame::new(w, h);
+        for (i, px) in input.data.chunks_exact_mut(3).enumerate() {
+            let v = if i % w >= w / 2 { 200 } else { 20 };
+            px.copy_from_slice(&[v, v, v]);
+        }
+        let mut pl = Pipeline::new(p.clone());
+        for _ in 0..fields {
+            pl.process_field(&input);
+        }
+        let (w, h) = pl.output_size();
+        (h / 4..3 * h / 4)
+            .step_by(2)
+            .map(|row| (w / 8..w).find(|&x| pixel(&pl, row, x)[1] > 110).unwrap_or(0))
+            .collect()
+    }
+
+    /// 水平発振器の周波数ずれは、AFC の追従が有限なら定常的な横位置のずれ ≒ Δf/f·L·(1 − k)/k として残る
+    #[test]
+    fn horizontal_clock_offset_shifts_picture() {
+        let mut p = clean_ntsc();
+        p.decoder.h_pll = 0.25;
+        let base = edge_columns(&p, 6);
+        p.decoder.clocks.horizontal.offset_ppm = 2000.0;
+        let shifted = edge_columns(&p, 6);
+        // 2000 ppm × 910 サンプル × 3 = 約 5.5 サンプル
+        let d = shifted[0] as i32 - base[0] as i32;
+        assert!((4..=7).contains(&d.abs()), "shift {d} (base {} → {})", base[0], shifted[0]);
+        // 全部の行で同じだけずれる (同期は保たれている。±1 はドットクロールでしきい値をまたぐぶん)
+        assert!(shifted.iter().all(|&x| x.abs_diff(shifted[0]) <= 1), "{shifted:?}");
+    }
+
+    /// 水平発振器のずれが AFC の引き込み範囲を超えると同期が外れ、行ごとに横位置がばらばらになる (斜めに裂ける)
+    #[test]
+    fn horizontal_clock_far_off_tears() {
+        let mut p = clean_ntsc();
+        p.decoder.h_pll = 0.25;
+        p.decoder.clocks.horizontal.offset_ppm = 300_000.0;
+        let cols = edge_columns(&p, 6);
+        let (lo, hi) = (cols.iter().min().unwrap(), cols.iter().max().unwrap());
+        assert!(hi - lo > 100, "{lo}..{hi}");
+    }
+
+    /// 水平発振器のジッタは行ごとの横位置のぎざぎざになる
+    #[test]
+    fn horizontal_clock_jitter_roughens_edges() {
+        let mut p = clean_ntsc();
+        p.decoder.clocks.horizontal.jitter_ns = 300.0;
+        let cols = edge_columns(&p, 6);
+        let (lo, hi) = (cols.iter().min().unwrap(), cols.iter().max().unwrap());
+        assert!(hi - lo >= 4, "{lo}..{hi}");
     }
 
     /// 垂直同期 (幅広パルス) が弱いと積分回路がトリガされず、自走して流れる

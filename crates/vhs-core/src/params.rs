@@ -800,6 +800,86 @@ pub enum ChromaDemod {
     Xz,
 }
 
+/// 発振器 1 つぶんの周波数の誤差と揺れ。すべて公称周波数に対する比 [ppm] で指定する
+/// (1 ppm = 色副搬送波 NTSC で約 3.58 Hz、水平 15.734 kHz で約 0.016 Hz)。
+///
+/// 瞬時の周波数誤差 = `offset_ppm` + ドリフト + ワウ + フラッタ。これを積分した位相のずれに、
+/// ラインごとに独立な時間ジッタ (`jitter_ns`) が加わる。PLL・AFC で同期している発振器では
+/// 周波数誤差はループの追従が有限なぶんだけ定常位相誤差として残り、ジッタは出力にそのまま乗る
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ClockParams {
+    /// 自走周波数のずれ (水晶・セラミック振動子の個体差・調整ずれ) [ppm]
+    pub offset_ppm: f32,
+    /// ドリフト (温度などによるゆっくりした不規則な変化) の rms [ppm]
+    pub drift_ppm: f32,
+    /// ドリフトの相関時間 [s] (これより長い時間で別の値へ移っていく)
+    pub drift_time_s: f32,
+    /// ワウ (遅い周期的な周波数の揺れ) の振幅 [ppm]
+    pub wow_ppm: f32,
+    /// ワウの周波数 [Hz]
+    pub wow_hz: f32,
+    /// フラッタ (速い周期的な周波数の揺れ。電源リプル・振動など) の振幅 [ppm]
+    pub flutter_ppm: f32,
+    /// フラッタの周波数 [Hz]
+    pub flutter_hz: f32,
+    /// ジッタ (ラインごとに独立な時間の揺れ) の rms [ns]
+    pub jitter_ns: f32,
+}
+
+impl Default for ClockParams {
+    fn default() -> Self {
+        Self {
+            offset_ppm: 0.0,
+            drift_ppm: 0.0,
+            drift_time_s: 20.0,
+            wow_ppm: 0.0,
+            wow_hz: 0.5,
+            flutter_ppm: 0.0,
+            flutter_hz: 12.0,
+            jitter_ns: 0.0,
+        }
+    }
+}
+
+impl ClockParams {
+    /// 誤差も揺れもない理想的な発振器か
+    pub fn is_ideal(&self) -> bool {
+        self.offset_ppm == 0.0
+            && self.drift_ppm == 0.0
+            && self.wow_ppm == 0.0
+            && self.flutter_ppm == 0.0
+            && self.jitter_ns == 0.0
+    }
+}
+
+/// 受像機の発振器
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ReceiverClocks {
+    /// 色副搬送波発振器 (水晶 VCXO)。バーストに PLL で同期する。追従が有限 (`burst_pll` < 1) だと
+    /// 周波数のずれが定常位相誤差 ≒ 2π·Δf·T_H·(1 − k)/k として残り、NTSC では色相ずれ、PAL では彩度低下になる。
+    /// バーストのないライン (垂直帰線区間・カラーキラー域) では位相がずれの速さで流れる
+    pub chroma: ClockParams,
+    /// 水平発振器 (AFC で水平同期に同期する)。ずれは画面の横位置のずれ、揺れは横揺れ・ラインごとのぎざぎざになる。
+    /// ずれが AFC の引き込み範囲を超えると同期が外れ、画面が斜めに裂ける
+    pub horizontal: ClockParams,
+    /// 垂直発振器 (`v_hold_pct` の自走周期にさらに掛かる)。同期の窓の中にあるあいだは効かず、
+    /// 窓を外れると画面が上下に流れる
+    pub vertical: ClockParams,
+}
+
+impl Default for ReceiverClocks {
+    fn default() -> Self {
+        Self {
+            // NTSC の色副搬送波で約 50 Hz
+            chroma: ClockParams { offset_ppm: 14.0, ..Default::default() },
+            horizontal: ClockParams::default(),
+            vertical: ClockParams::default(),
+        }
+    }
+}
+
 /// 受像機 (NTSC / PAL デコーダ)
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -846,10 +926,8 @@ pub struct DecoderParams {
     /// 小さいとテープのライン単位の位相ゆらぎを取り切れず、NTSC は色相の揺れ、PAL は彩度低下
     /// (遅延線なしならハノーバーバー) になる。実機の APC はループ帯域が数百 Hz で、0.1〜0.3 程度に当たる
     pub burst_pll: f32,
-    /// 受像機の色副搬送波発振器 (VCXO) の自走周波数のずれ [Hz]。PLL の追従が有限 (`burst_pll` < 1) だと
-    /// 定常位相誤差 ≒ 2π·Δf·T_H·(1 − k)/k が残り、NTSC では画面全体の色相ずれ、PAL では彩度低下になる。
-    /// バーストのないライン (垂直帰線区間・カラーキラー域) では位相がこの速さで流れる
-    pub vcxo_offset_hz: f32,
+    /// 受像機の発振器 (色副搬送波 VCXO・水平発振器・垂直発振器) の周波数のずれと揺れ
+    pub clocks: ReceiverClocks,
     /// PAL: 1H 遅延線で前のラインと色差を平均する (位相誤差が色相ずれではなく彩度低下になる)。
     /// 切ると「シンプル PAL」になり、位相誤差がハノーバーバー (ライン交互の色相ずれ) として見える
     pub pal_delay_line: bool,
@@ -909,7 +987,7 @@ impl Default for DecoderParams {
             color_killer: true,
             h_pll: 0.25,
             burst_pll: 0.7,
-            vcxo_offset_hz: 50.0,
+            clocks: ReceiverClocks::default(),
             pal_delay_line: true,
             ynr_strength: 0.0,
             dnr_strength: 0.0,

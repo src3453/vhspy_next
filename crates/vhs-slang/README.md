@@ -31,8 +31,10 @@ How the serial parts are parallelised:
 - **The subcarrier PLL** is per-line (parallel) when `burst_pll = 1`.
   For `burst_pll < 1` (the default, 0.2, like a real receiver's APC loop) it
   wraps angles in a nonlinear recurrence, so one thread runs it serially over
-  groupshared values. The receiver's crystal offset (`vcxo_offset_hz`) adds a
-  constant per-line phase step to the prediction.
+  groupshared values. The receiver's crystal offset (`decoder.clocks.chroma.offset_ppm`,
+  passed to the shader as `vcxo_offset_hz`) adds a constant per-line phase step to
+  the prediction. Clock drift, wow, flutter and jitter, and the horizontal and
+  vertical oscillator errors (`decoder.clocks.horizontal` / `vertical`), are not ported.
 - **The AFC-aligned signal** is not stored. Kernels interpolate it from the
   composite signal when they read it.
 - **Input resampling** runs once per host frame for both fields, not once per

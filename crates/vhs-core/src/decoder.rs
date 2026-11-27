@@ -17,6 +17,8 @@
 //! - NTSC は I/Q、PAL は U/V を同期検波。ACC とカラーキラー付き
 //! - PAL: スウィンギングバーストから PAL スイッチの向きを決め (アイデント)、
 //!   1H 遅延線で前のラインと色差を平均する (位相誤差 → 彩度低下)。遅延線なしならハノーバーバーが出る
+//! - 発振器の誤差: 色副搬送波 VCXO・水平発振器・垂直発振器それぞれの周波数のずれ・ドリフト・ワウ・フラッタ・ジッタ
+//!   ([`crate::params::ReceiverClocks`])
 //! - 字幕デコーダ: 垂直同期から数えたライン 21 のクローズドキャプションを解読する ([`crate::vbi`])
 
 use crate::filter::{Biquad, Cascade, fractional_shift};
@@ -26,6 +28,7 @@ use crate::params::{ChromaDemod, DecoderParams, YcSeparation};
 use crate::raster;
 use crate::timing::*;
 use crate::caption::CaptionDecoder;
+use crate::clock::{CLOCK_CHROMA, CLOCK_HORIZONTAL, CLOCK_VERTICAL, ClockSim};
 use crate::vbi;
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -109,6 +112,10 @@ pub struct Decoder {
     /// 字幕を読んだ直前の帰線 (同じ画面を 2 回読まない)
     caption_last: Option<i64>,
     teletext: crate::teletext::TeletextDecoder,
+    /// 発振器の揺れの状態
+    clk_chroma: ClockSim,
+    clk_h: ClockSim,
+    clk_v: ClockSim,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -180,6 +187,9 @@ impl Decoder {
             caption: CaptionDecoder::default(),
             caption_last: None,
             teletext: Default::default(),
+            clk_chroma: ClockSim::default(),
+            clk_h: ClockSim::default(),
+            clk_v: ClockSim::default(),
         }
     }
 
@@ -298,27 +308,49 @@ impl Decoder {
             self.v_free_hold = start as f64 + period;
             self.caption.reset();
             self.teletext.reset();
+            self.clk_chroma.reset();
+            self.clk_h.reset();
+            self.clk_v.reset();
         }
         self.next_stream = Some(end);
 
         // --- 水平 AFC (逐次) ---
+        // 水平発振器は次の同期の位置を自分の周期で予測し、検出した同期との差 (位相比較器は ±半ラインで折り返す)
+        // に追従係数を掛けて引き寄せる。発振器が公称より速い (周期が短い) と予測は前へずれる
         let k = p.h_pll.clamp(0.0, 1.0);
+        let line_time = s.line_time() as f64;
+        let half = 0.5 * ls as f32;
+        let wrap_half = |d: f32| d - ls as f32 * (d / ls as f32).round();
         for i in 0..n_new {
+            let clk = self.clk_h.step(&p.clocks.horizontal, start + i as u64, line_time, CLOCK_HORIZONTAL);
+            let pred = self.h_sync_pos - (clk.freq_err * ls as f64) as f32;
+            let mut pos_h = pred;
             if let Some(pos) = find_sync_edge(field.line(i), s) {
-                self.h_sync_pos += k * (pos - self.h_sync_pos);
+                pos_h = pred + k * wrap_half(pos - pred);
             }
-            self.corrections[i] = self.h_sync_pos - s.sync_end as f32;
+            // 同期が外れて流れていくときも、ラインの頭からの位置として持つ
+            let rel = pos_h - s.sync_end as f32;
+            if rel.abs() > half {
+                pos_h = s.sync_end as f32 + wrap_half(rel);
+            }
+            self.h_sync_pos = pos_h;
+            self.corrections[i] = pos_h + (clk.jitter_s * s.fs as f64) as f32 - s.sync_end as f32;
         }
         let corr = &self.corrections;
         self.chunk_aligned[..n_new * ls].par_chunks_mut(ls).enumerate().for_each(|(i, dst)| {
-            fractional_shift(field.line(i), dst, -corr[i], lv.blank);
+            let prev = (i > 0).then(|| field.line(i - 1));
+            let next = (i + 1 < n_new).then(|| field.line(i + 1));
+            shift_across_lines(prev, field.line(i), next, dst, -corr[i], lv.blank);
         });
         // S 映像: C も同じ補正で揃える
         let separate = field.separate;
         if separate {
             self.chunk_aligned_c.resize(self.chunk_aligned.len(), 0.0);
             self.chunk_aligned_c[..n_new * ls].par_chunks_mut(ls).enumerate().for_each(|(i, dst)| {
-                fractional_shift(field.chroma_line(i).unwrap(), dst, -corr[i], 0.0);
+                let c = |j: usize| field.chroma_line(j).unwrap();
+                let prev = (i > 0).then(|| c(i - 1));
+                let next = (i + 1 < n_new).then(|| c(i + 1));
+                shift_across_lines(prev, c(i), next, dst, -corr[i], 0.0);
             });
         }
 
@@ -657,15 +689,21 @@ impl Decoder {
                 d
             }
         };
-        let period = self.free_period(p);
+        let nominal = self.free_period(p);
         let window = p.v_sync_window.clamp(0.02, 0.9) as f64;
         let thr = s.ire.sync / 2.0;
         let start = field.stream_line(0);
+        let line_time = s.line_time() as f64;
         for i in 0..n_new {
             let line = field.line(i);
-            let base = (start + i as u64) as f64;
+            let sl = start + i as u64;
+            let base = sl as f64;
+            // 垂直発振器の周波数誤差で自走周期が変わり、ジッタで自走のトリガ時刻が揺れる
+            let clk = self.clk_v.step(&p.clocks.vertical, sl, line_time, CLOCK_VERTICAL);
+            let period = nominal / (1.0 + clk.freq_err);
+            let jitter = clk.jitter_s / line_time;
             // 自走のトリガがこのラインの中に来るか
-            let mut free_at = (self.v_last + period).max(self.v_free_hold);
+            let mut free_at = (self.v_last + period + jitter).max(self.v_free_hold);
             for (n, &x) in line.iter().enumerate() {
                 self.v_int += alpha * ((x < thr) as u8 as f32 - self.v_int);
                 let t = base + n as f64 / ls as f64;
@@ -677,12 +715,12 @@ impl Decoder {
                     self.v_armed = false;
                     self.v_last = t;
                     self.push_retrace(t - delay);
-                    free_at = self.v_last + period;
+                    free_at = self.v_last + period + jitter;
                 } else if t >= free_at {
                     // 自走 (同期が来ない・窓の外)
                     self.v_last = free_at;
                     self.push_retrace(free_at - delay);
-                    free_at = self.v_last + period;
+                    free_at = self.v_last + period + jitter;
                 }
             }
         }
@@ -700,9 +738,10 @@ impl Decoder {
     /// バースト相関の位相 μ は NTSC では副搬送波位相 φ そのもの、PAL では φ - 45°·sV (スウィンギングバースト)。
     /// - PAL アイデント: 隣り合うラインの μ の差は (ライン当たりの位相の進み) - 90°·sV になるので、
     ///   投票を積み重ねて PAL スイッチ (フリップフロップ) の向きを決める
-    /// - PLL: 前のラインの基準位相 + ライン当たりの進み (受像機の VCXO の周波数ずれぶんを含む) を予測とし、
+    /// - PLL: 前のラインの基準位相 + ライン当たりの進み (受像機の VCXO の周波数誤差ぶんを含む) を予測とし、
     ///   バーストとの差に `burst_pll` を掛けて追従する (1 次ループなので周波数ずれは定常位相誤差として残る)。
-    ///   バーストが弱い・ない (帰線区間) ラインは予測のまま惰性で回る
+    ///   バーストが弱い・ない (帰線区間) ラインは予測のまま惰性で回る。
+    ///   VCXO のジッタはループの状態ではなく、そのラインの検波に使う基準位相に乗る
     fn lock_subcarrier(&mut self, start: u64, n_new: usize, p: &DecoderParams) {
         use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, TAU};
         let s = self.std;
@@ -710,11 +749,14 @@ impl Decoder {
         let step = s.line_phase_step() as f32 * FRAC_PI_2;
         let pal = s.is_pal();
         let k = p.burst_pll.clamp(0.0, 1.0);
-        // VCXO が 1 ラインのあいだに余分に進む位相
-        let drift = TAU * p.vcxo_offset_hz * s.line_time();
+        let line_time = s.line_time() as f64;
         let cap = self.line_refs.len() as u64;
         for i in 0..n_new {
             let sl = start + i as u64;
+            let clk = self.clk_chroma.step(&p.clocks.chroma, sl, line_time, CLOCK_CHROMA);
+            // VCXO が 1 ラインのあいだに余分に進む位相と、このラインの位相ジッタ
+            let drift = (std::f64::consts::TAU * s.fsc as f64 * clk.freq_err * line_time) as f32;
+            let jitter = (std::f64::consts::TAU * s.fsc as f64 * clk.jitter_s) as f32;
             let b = self.chunk_bursts[i];
             let valid = b.amp >= 3.0;
             let mu = b.zi.atan2(b.zr) - FRAC_PI_2;
@@ -762,9 +804,31 @@ impl Decoder {
             if p.color_killer && !valid {
                 gain = 0.0;
             }
-            self.line_refs[(sl % cap) as usize] = LineRef { phase, sv, gain };
+            self.line_refs[(sl % cap) as usize] = LineRef { phase: phase + jitter, sv, gain };
         }
     }
+}
+
+/// 水平 AFC の補正でラインをずらす。ずれが大きい (同期が外れて流れている) ときは、
+/// はみ出したぶんを前後のラインから持ってくる (帰線区間の黒帯と同期が画面に入ってくる)
+fn shift_across_lines(prev: Option<&[f32]>, cur: &[f32], next: Option<&[f32]>, dst: &mut [f32], shift: f32, fill: f32) {
+    // 小さいずれは 1 ラインだけで済ませる (はみ出すのは帰線区間の端だけ)
+    if shift.abs() < 16.0 {
+        fractional_shift(cur, dst, shift, fill);
+        return;
+    }
+    let ls = cur.len();
+    let mut buf = vec![fill; 3 * ls];
+    if let Some(p) = prev {
+        buf[..ls].copy_from_slice(p);
+    }
+    buf[ls..2 * ls].copy_from_slice(cur);
+    if let Some(n) = next {
+        buf[2 * ls..].copy_from_slice(n);
+    }
+    let mut out = vec![0f32; 3 * ls];
+    fractional_shift(&buf, &mut out, shift, fill);
+    dst.copy_from_slice(&out[ls..2 * ls]);
 }
 
 /// NTSC: I/Q 検波出力 (I, Q) から色差 (R-Y, G-Y, B-Y) への係数。

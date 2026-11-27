@@ -54,12 +54,24 @@ namespace VhsNext
         [Serializable] private sealed class JsonDecoder
         {
             public string yc_separation = "notch";
-            public float chroma_bw_mhz = 1.3f, h_pll = 0.25f, burst_pll = 0.2f, vcxo_offset_hz = 50f;
+            public float chroma_bw_mhz = 1.3f, h_pll = 0.25f, burst_pll = 0.2f;
+            public JsonClocks clocks = new JsonClocks();
             public bool acc = true, color_killer = true, pal_delay_line = true;
             public float contrast = 1f, brightness = 0f, saturation = 1f, hue_deg = 0f;
         }
 
-        [Serializable] private sealed class JsonParams
+        [Serializable] private sealed class JsonClock
+        {
+            public float offset_ppm;
+        }
+
+        [Serializable] private sealed class JsonClocks
+        {
+            // Only the chroma VCXO's static offset is ported to the GPU path.
+            public JsonClock chroma = new JsonClock { offset_ppm = 14f };
+        }
+
+                [Serializable] private sealed class JsonParams
         {
             public string standard = "ntsc";
             public JsonEncoder encoder = new JsonEncoder();
@@ -152,7 +164,8 @@ namespace VhsNext
                 colorKiller = json.decoder.color_killer ? 1u : 0u,
                 palDelayLine = json.decoder.pal_delay_line ? 1u : 0u,
                 outputLinear = 1,
-                vcxoOffsetHz = json.decoder.vcxo_offset_hz
+                vcxoOffsetHz = json.decoder.clocks.chroma.offset_ppm * 1e-6f
+                    * (pal ? 4433618.75f : 3579545.45f)
             };
 
             for (int i = 0; i < KernelNames.Length; ++i)
