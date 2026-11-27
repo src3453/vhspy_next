@@ -25,6 +25,7 @@ pub mod pattern;
 pub mod pipeline;
 mod nr;
 pub mod raster;
+pub mod rawout;
 pub mod rf;
 pub mod rng;
 pub mod tape;

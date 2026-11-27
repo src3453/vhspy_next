@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 use vhs_core::audio::AudioProcessor;
+use vhs_core::rawout::{RawChannel, RawOptions, RawWriter, SampleFormat, describe};
 use vhs_core::{Params, Pipeline, RgbFrame, Standard};
 
 /// 1 フィールドの時間 (NTSC なら 1001/60000 s)
@@ -269,6 +270,15 @@ fn export(
     let total = probe_duration(input)
         .map(|d| (d * tv.field_rate_ratio.0 as f64 / tv.field_rate_ratio.1 as f64) as u64);
 
+    // 拡張子が .s8 / .u8 / .s16 ならコンポジット信号を DAC 用の raw サンプル列で書き出す
+    if let Some(format) = output
+        .extension()
+        .and_then(|e| e.to_str())
+        .and_then(SampleFormat::from_name)
+    {
+        return export_raw(app, input, output, params, format, total, cancel);
+    }
+
     // 音声は先に全部処理して一時 WAV にする (映像より桁違いに軽い)
     let mut audio_tmp = None;
     if params.audio.enabled {
@@ -355,6 +365,79 @@ fn export(
     }
     drop(stream);
     rec.finish()
+}
+
+/// コンポジット信号を raw サンプル列 (FL2000 + osmo-fl2k などの DAC 用) で書き出す。
+/// 8 bit は 4fsc の 2 倍 (NTSC 28.64 MS/s) にアップサンプルし、16 bit は 4fsc のまま。
+/// 設定 (サンプルレート・レベル) は同じ名前の .txt に書く。音声は含まない
+fn export_raw(
+    app: &AppHandle,
+    input: &Path,
+    output: &Path,
+    params: Params,
+    format: SampleFormat,
+    total: Option<u64>,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    use std::io::Write;
+    if !params.encoder.enabled {
+        return Err("エンコーダが無効なのでコンポジット信号がありません".into());
+    }
+    let tv = params.tv();
+    let upsample = if format == SampleFormat::S16Le { 1 } else { 2 };
+    let opts = RawOptions::new(tv, format, upsample);
+    let file = std::fs::File::create(output).map_err(|e| format!("{}: {e}", output.display()))?;
+    let mut writer = RawWriter::new(
+        std::io::BufWriter::with_capacity(1 << 22, file),
+        tv,
+        opts,
+        RawChannel::Composite,
+    );
+    let rate = writer.sample_rate();
+    let info = format!(
+        "{}play: fl2k_file -s {} \"{}\"\n",
+        describe(tv, &opts, rate),
+        rate.round() as u64,
+        output.display()
+    );
+    std::fs::write(output.with_extension("txt"), &info).map_err(|e| e.to_string())?;
+
+    let stream = FrameStream::open(
+        &StreamSpec::File {
+            path: input.to_path_buf(),
+            looped: false,
+            realtime: false,
+        },
+        false,
+        tv,
+    )?;
+    let mut pipeline = Pipeline::new(params);
+    let mut done = 0u64;
+    for frame in stream.rx.iter() {
+        if cancel.load(Ordering::Relaxed) {
+            drop(writer);
+            let _ = std::fs::remove_file(output);
+            return Err("キャンセルしました".into());
+        }
+        pipeline.process_field(&frame);
+        writer
+            .write_field(pipeline.composite())
+            .map_err(|e| format!("書き込みに失敗しました: {e}"))?;
+        done += 1;
+        if done % 30 == 0 {
+            let _ = app.emit(
+                "export-progress",
+                ExportProgress {
+                    done,
+                    total,
+                    finished: false,
+                    error: None,
+                },
+            );
+        }
+    }
+    writer.flush().map_err(|e| e.to_string())?;
+    writer.into_inner().flush().map_err(|e| e.to_string())
 }
 
 fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {

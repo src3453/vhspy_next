@@ -9,6 +9,7 @@
   import SyncView from "#lib/SyncView.svelte";
   import ScopeOverlay from "#lib/ScopeOverlay.svelte";
   import Immersive from "#lib/Immersive.svelte";
+  import Menu from "#lib/Menu.svelte";
   import { getCurrentWindow } from "@tauri-apps/api/window";
 
   type Stats = {
@@ -31,6 +32,7 @@
   type CrtInfo = { preset: string; loading: boolean; error: string | null; gpu: string | null; params: ShaderParam[] };
   type ExportProgress = { done: number; total: number | null; finished: boolean; error: string | null };
   type PerformanceSegment = { key: string; label: string; ms: number };
+  type WindowInfo = { title: string; width: number; height: number };
 
   let params = $state<Params | null>(null);
   let defaults = $state.raw<Params | null>(null);
@@ -39,12 +41,27 @@
   let camera = $state("");
   let cameraScaling = $state("area");
   let windowTitle = $state("");
+  let windows = $state<WindowInfo[]>([]);
+  let windowsLoading = $state(false);
+  /** false ならウィンドウ全体をキャプチャする */
+  let windowCrop = $state(false);
   let windowCropX = $state(0);
   let windowCropY = $state(0);
   let windowCropWidth = $state(1280);
   let windowCropHeight = $state(720);
   let windowScaling = $state("area");
-  let patternType = $state("pattern");
+  const PATTERNS = [
+    { kind: "pattern", label: "診断パターン" },
+    { kind: "smpte", label: "SMPTE カラーバー" },
+    { kind: "ebu", label: "EBU カラーバー" },
+  ];
+  const SCALINGS = [
+    { value: "nearest", label: "Nearest" },
+    { value: "bilinear", label: "Bilinear" },
+    { value: "bicubic", label: "Bicubic" },
+    { value: "area", label: "Area" },
+    { value: "lanczos", label: "Lanczos" },
+  ];
   let message = $state("");
   let exporting = $state<ExportProgress | null>(null);
   let canvas: HTMLCanvasElement;
@@ -126,22 +143,35 @@
     run(() => invoke("open_source", { req: { kind: "camera", device: camera, scaling: cameraScaling } }));
   }
 
-  function openWindow() {
-    if (!windowTitle.trim()) {
-      message = "キャプチャするウィンドウのタイトルを入力してください";
+  async function refreshWindows() {
+    windowsLoading = true;
+    try {
+      windows = await invoke<WindowInfo[]>("list_windows");
+    } catch (e) {
+      message = String(e);
+    } finally {
+      windowsLoading = false;
+    }
+  }
+
+  function openWindow(title = windowTitle) {
+    if (!title) {
+      message = "キャプチャするウィンドウを選んでください";
       return;
     }
-    if (windowCropX < 0 || windowCropY < 0 || windowCropWidth < 1 || windowCropHeight < 1) {
+    if (windowCrop && (windowCropX < 0 || windowCropY < 0 || windowCropWidth < 1 || windowCropHeight < 1)) {
       message = "クロップ位置は 0 以上、幅と高さは 1 以上にしてください";
       return;
     }
-    run(() => invoke("open_source", { req: {
-      kind: "window", title: windowTitle.trim(), crop_x: windowCropX, crop_y: windowCropY,
-      crop_width: windowCropWidth, crop_height: windowCropHeight, scaling: windowScaling,
-    } }));
+    windowTitle = title;
+    // 幅・高さ 0 はクロップなし (ウィンドウ全体)
+    const crop = windowCrop
+      ? { crop_x: windowCropX, crop_y: windowCropY, crop_width: windowCropWidth, crop_height: windowCropHeight }
+      : { crop_x: 0, crop_y: 0, crop_width: 0, crop_height: 0 };
+    run(() => invoke("open_source", { req: { kind: "window", title, ...crop, scaling: windowScaling } }));
   }
 
-  function openPattern(kind = patternType) {
+  function openPattern(kind: string) {
     run(() => invoke("open_source", { req: { kind } }));
   }
 
@@ -169,7 +199,13 @@
     if (typeof input !== "string") return;
     const output = await save({
       defaultPath: input.replace(/\.[^.\\/]+$/, "") + "_vhs.mp4",
-      filters: [{ name: "MP4", extensions: ["mp4"] }],
+      filters: [
+        { name: "MP4", extensions: ["mp4"] },
+        // コンポジット信号の raw サンプル列 (FL2000 + osmo-fl2k などで実機のテレビへ)
+        { name: "コンポジット raw (fl2k_file 用 符号付き 8 bit)", extensions: ["s8"] },
+        { name: "コンポジット raw (符号なし 8 bit)", extensions: ["u8"] },
+        { name: "コンポジット raw (16 bit, 4fsc)", extensions: ["s16"] },
+      ],
     });
     if (!output) return;
     exporting = { done: 0, total: null, finished: false, error: null };
@@ -422,35 +458,71 @@
 <main class:immersive>
   <section class="stage">
     <div class="toolbar">
-      <select bind:value={patternType} title="テストパターンの種類">
-        <option value="pattern">診断パターン</option>
-        <option value="smpte">SMPTE カラーバー</option>
-        <option value="ebu">EBU カラーバー</option>
-      </select>
-      <button onclick={() => openPattern()}>パターンを表示</button>
-      <select bind:value={camera} title="カメラ">
-        {#each cameras as c}<option value={c}>{c}</option>{/each}
-      </select>
-      <button onclick={() => run(refreshCameras)} title="カメラ一覧を更新">⟳</button>
-      <label>補間方式
-        <select bind:value={cameraScaling} title="カメラのスケーリング方式">
-          <option value="nearest">Nearest</option><option value="bilinear">Bilinear</option><option value="bicubic">Bicubic</option><option value="area">Area</option><option value="lanczos">Lanczos</option>
-        </select>
-      </label>
-      <button onclick={openCamera} disabled={!camera}>カメラを開く</button>
-      <label>ウィンドウ
-        <input class="capture-title" type="text" bind:value={windowTitle} placeholder="ウィンドウタイトル" title="キャプチャ対象のウィンドウタイトル" />
-      </label>
-      <label>クロップ X <input class="crop-num" type="number" min="0" bind:value={windowCropX} /></label>
-      <label>Y <input class="crop-num" type="number" min="0" bind:value={windowCropY} /></label>
-      <label>幅 <input class="crop-num" type="number" min="1" bind:value={windowCropWidth} /></label>
-      <label>高さ <input class="crop-num" type="number" min="1" bind:value={windowCropHeight} /></label>
-      <label>補間方式
-        <select bind:value={windowScaling} title="ウィンドウキャプチャのスケーリング方式">
-          <option value="nearest">Nearest</option><option value="bilinear">Bilinear</option><option value="bicubic">Bicubic</option><option value="area">Area</option><option value="lanczos">Lanczos</option>
-        </select>
-      </label>
-      <button onclick={openWindow}>ウィンドウを開く</button>
+      <Menu label="テストパターン" title="テストパターンを表示する">
+        {#snippet children(close)}
+          {#each PATTERNS as p (p.kind)}
+            <button class="item" onclick={() => { close(); openPattern(p.kind); }}>{p.label}</button>
+          {/each}
+        {/snippet}
+      </Menu>
+      <Menu label="カメラ" title="カメラ (DirectShow デバイス) を開く">
+        {#snippet children(close)}
+          <div class="head">
+            カメラ
+            <button class="small" onclick={() => run(refreshCameras)} title="カメラ一覧を更新">⟳</button>
+          </div>
+          <div class="list">
+            {#each cameras as c (c)}
+              <button class="item" class:current={c === camera} title={c} onclick={() => { camera = c; close(); openCamera(); }}>{c}</button>
+            {:else}
+              <div class="empty">カメラが見つかりません</div>
+            {/each}
+          </div>
+          <div class="sep"></div>
+          <label class="field">補間方式
+            <select bind:value={cameraScaling} title="カメラのスケーリング方式">
+              {#each SCALINGS as m (m.value)}<option value={m.value}>{m.label}</option>{/each}
+            </select>
+          </label>
+        {/snippet}
+      </Menu>
+      <Menu label="ウィンドウ" title="ウィンドウをキャプチャする" onopen={refreshWindows}>
+        {#snippet children(close)}
+          <div class="head">
+            {windowsLoading ? "ウィンドウを探しています…" : "ウィンドウ"}
+            <button class="small" onclick={refreshWindows} title="ウィンドウ一覧を更新">⟳</button>
+          </div>
+          <div class="list">
+            {#each windows as w, i (i)}
+              <button class="item" class:current={w.title === windowTitle} title={w.title} onclick={() => { close(); openWindow(w.title); }}>
+                <span class="title">{w.title}</span><span class="sub">{w.width}×{w.height}</span>
+              </button>
+            {:else}
+              {#if !windowsLoading}<div class="empty">キャプチャできるウィンドウがありません</div>{/if}
+            {/each}
+          </div>
+          <div class="sep"></div>
+          <label class="field"><input type="checkbox" bind:checked={windowCrop} /> 範囲を切り抜く</label>
+          {#if windowCrop}
+            <div class="field crop">
+              <label>X <input class="crop-num" type="number" min="0" bind:value={windowCropX} /></label>
+              <label>Y <input class="crop-num" type="number" min="0" bind:value={windowCropY} /></label>
+              <label>幅 <input class="crop-num" type="number" min="1" bind:value={windowCropWidth} /></label>
+              <label>高さ <input class="crop-num" type="number" min="1" bind:value={windowCropHeight} /></label>
+            </div>
+          {/if}
+          <label class="field">補間方式
+            <select bind:value={windowScaling} title="ウィンドウキャプチャのスケーリング方式">
+              {#each SCALINGS as m (m.value)}<option value={m.value}>{m.label}</option>{/each}
+            </select>
+          </label>
+          {#if windowTitle}
+            <button class="item" onclick={() => { close(); openWindow(); }} title="今の設定で開き直す">
+              「{windowTitle}」を開き直す
+            </button>
+          {/if}
+        {/snippet}
+      </Menu>
       <button onclick={openFile}>ファイルを開く…</button>
       <span class="spacer"></span>
       <button class:rec={!!stats?.recording} onclick={toggleRecording}>
@@ -922,12 +994,11 @@
   }
   input[type="range"] {
     width: 100%;
-    accent-color: var(--accent);
   }
-  button,
-  select,
-  input[type="number"],
-  input[type="text"] {
+  /* フォームコントロールのテーマ。コンポーネントのスタイルはスコープされるので、
+     Scopes・Oscilloscope・SyncView・Menu の中のボタンにも効くよう :global にする
+     (:where で詳細度を 0 にして、各コンポーネントの個別の指定が勝つようにする) */
+  :global(:where(button, select, input[type="number"], input[type="text"], input[type="search"])) {
     background: #2a2d36;
     color: var(--text);
     border: 1px solid #3a3e4a;
@@ -935,15 +1006,15 @@
     padding: 4px 8px;
     font: inherit;
   }
-  button:hover:not(:disabled) {
+  :global(:where(button:hover:not(:disabled))) {
     border-color: var(--accent);
   }
-  button:disabled,
-  select:disabled,
-  input:disabled,
-  textarea:disabled {
+  :global(:where(button, select, input, textarea):disabled) {
     opacity: 0.5;
     cursor: default;
+  }
+  :global(:where(input[type="range"], input[type="checkbox"], input[type="radio"])) {
+    accent-color: var(--accent);
   }
   /* 今の設定では効かないコントロール */
   .off .name,
@@ -971,12 +1042,24 @@
     color: var(--muted);
     white-space: nowrap;
   }
-  .toolbar input.capture-title {
-    width: 150px;
+  .toolbar .crop {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px 10px;
+  }
+  .toolbar .crop label {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    justify-content: space-between;
   }
   .toolbar input.crop-num {
-    width: 58px;
+    width: 64px;
     padding: 3px 5px;
+  }
+  .toolbar .item .title {
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .row input[type="text"] {
     min-width: 0;

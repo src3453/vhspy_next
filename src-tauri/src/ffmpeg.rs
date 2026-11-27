@@ -226,10 +226,14 @@ impl FrameStream {
                 crop_height,
                 ..
             } => {
-                if *crop_width == 0 || *crop_height == 0 {
+                // 幅・高さとも 0 ならクロップしない (ウィンドウ全体)
+                if *crop_width == 0 && *crop_height == 0 {
+                    String::new()
+                } else if *crop_width == 0 || *crop_height == 0 {
                     return Err("クロップ幅と高さは 1 以上にしてください".into());
+                } else {
+                    format!("crop={crop_width}:{crop_height}:{crop_x}:{crop_y},")
                 }
-                format!("crop={crop_width}:{crop_height}:{crop_x}:{crop_y},")
             }
             _ => String::new(),
         };

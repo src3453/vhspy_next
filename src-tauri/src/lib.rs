@@ -4,6 +4,7 @@ mod ffmpeg;
 mod scope;
 mod still;
 mod syncview;
+mod winlist;
 
 use engine::{Engine, SourceSpec, Stats};
 use ffmpeg::{ScalingMethod, StreamSpec};
@@ -68,6 +69,12 @@ fn set_menu_osd(engine: State<'_, Engine>, markup: Option<String>) {
 #[tauri::command]
 async fn list_cameras() -> Result<Vec<String>, String> {
     ffmpeg::list_cameras()
+}
+
+/// キャプチャできるウィンドウの一覧 (手前にあるものから)
+#[tauri::command]
+async fn list_windows() -> Vec<winlist::WindowInfo> {
+    winlist::list_windows()
 }
 
 #[tauri::command]
@@ -290,6 +297,7 @@ pub fn run() {
             set_params,
             set_menu_osd,
             list_cameras,
+            list_windows,
             open_source,
             get_frame,
             get_composite,
