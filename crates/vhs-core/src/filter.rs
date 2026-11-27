@@ -3,6 +3,7 @@
 //! アナログ回路の因果的な振る舞い (群遅延・リンギング) を再現するため、
 //! ゼロ位相フィルタではなく素直な因果 IIR を使う。
 
+use crate::simd::Lane;
 use std::f32::consts::PI;
 
 #[derive(Clone, Copy, Debug)]
@@ -198,6 +199,62 @@ impl Cascade {
             s.reset();
         }
     }
+
+    /// 同じ係数・同じ状態のフィルタをレーン型 `V` で回す版 (縦方向 SIMD 用。各レーンが 1 本のライン)
+    #[inline(always)]
+    pub fn lanes<V: Lane>(&self) -> CascadeX<V> {
+        let mut c = CascadeX { s: [BiquadX::from(&Biquad::IDENTITY); MAX_SECTIONS], n: self.n };
+        for (d, s) in c.s.iter_mut().zip(&self.s[..self.n]) {
+            *d = BiquadX::from(s);
+        }
+        c
+    }
+}
+
+/// [`Biquad`] のレーン型版。係数は全レーン共通、状態はレーンごと。
+/// 演算の順序は [`Biquad::process`] と同じなので、各レーンの結果はスカラー版とビット単位で一致する
+#[derive(Clone, Copy, Debug)]
+pub struct BiquadX<V> {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    z1: V,
+    z2: V,
+}
+
+impl<V: Lane> BiquadX<V> {
+    #[inline(always)]
+    fn from(b: &Biquad) -> Self {
+        Self { b0: b.b0, b1: b.b1, b2: b.b2, a1: b.a1, a2: b.a2, z1: V::splat(b.z1), z2: V::splat(b.z2) }
+    }
+
+    #[inline(always)]
+    pub fn process(&mut self, x: V) -> V {
+        let y = V::splat(self.b0) * x + self.z1;
+        self.z1 = V::splat(self.b1) * x - V::splat(self.a1) * y + self.z2;
+        self.z2 = V::splat(self.b2) * x - V::splat(self.a2) * y;
+        y
+    }
+}
+
+/// [`Cascade`] のレーン型版 ([`Cascade::lanes`] で作る)
+#[derive(Clone, Copy, Debug)]
+pub struct CascadeX<V> {
+    s: [BiquadX<V>; MAX_SECTIONS],
+    n: usize,
+}
+
+impl<V: Lane> CascadeX<V> {
+    #[inline(always)]
+    pub fn process(&mut self, x: V) -> V {
+        let mut y = x;
+        for s in &mut self.s[..self.n] {
+            y = s.process(y);
+        }
+        y
+    }
 }
 
 /// 小数サンプル遅延の補間の片側タップ数 (Lanczos 窓の半径)
@@ -236,20 +293,54 @@ pub fn fractional_shift(src: &[f32], dst: &mut [f32], shift: f32, fill: f32) {
     }
     let sum: f32 = w.iter().sum();
     w.iter_mut().for_each(|wi| *wi /= sum);
-    let inner = (i0 + SHIFT_TAPS)..(len + i0 - SHIFT_TAPS);
-    for (n, d) in dst.iter_mut().enumerate() {
+    // 全タップが src の中に収まる出力の範囲 (内側) と、範囲外を fill で埋める端に分ける
+    let dlen = dst.len() as isize;
+    let lo = (i0 + SHIFT_TAPS).clamp(0, dlen) as usize;
+    let hi = (len + i0 - SHIFT_TAPS).clamp(lo as isize, dlen) as usize;
+    for n in (0..lo).chain(hi..dst.len()) {
         let k = n as isize - i0;
         let mut acc = 0.0;
-        if inner.contains(&(n as isize)) {
-            for (i, wi) in w.iter().enumerate() {
-                acc += wi * src[(k - (i as isize + 1 - SHIFT_TAPS)) as usize];
-            }
+        for (i, wi) in w.iter().enumerate() {
+            acc += wi * get(k - (i as isize + 1 - SHIFT_TAPS));
+        }
+        dst[n] = acc;
+    }
+    if lo < hi {
+        // 出力 n の窓は src[n - i0 - a ..= n - i0 + a - 1] を逆順に重み付けしたもの
+        let base = (lo as isize - i0 - SHIFT_TAPS) as usize;
+        let src = &src[base..base + (hi - lo) + 2 * SHIFT_TAPS as usize - 1];
+        if crate::simd::x8() {
+            shift_inner_x8(src, &mut dst[lo..hi], &w);
         } else {
-            for (i, wi) in w.iter().enumerate() {
-                acc += wi * get(k - (i as isize + 1 - SHIFT_TAPS));
-            }
+            shift_inner(src, &mut dst[lo..hi], &w);
+        }
+    }
+}
+
+/// [`fractional_shift`] の内側: `dst[m] = Σ_i w[i]·src[m + 2a - 1 - i]` (i の順に足す)
+#[inline(always)]
+fn shift_inner_impl(src: &[f32], dst: &mut [f32], w: &[f32; 2 * SHIFT_TAPS as usize]) {
+    const T: usize = 2 * SHIFT_TAPS as usize;
+    let n = dst.len();
+    let src = &src[..n + T - 1];
+    for (m, d) in dst.iter_mut().enumerate() {
+        let s = &src[m..m + T];
+        let mut acc = 0.0;
+        for i in 0..T {
+            acc += w[i] * s[T - 1 - i];
         }
         *d = acc;
+    }
+}
+
+fn shift_inner(src: &[f32], dst: &mut [f32], w: &[f32; 2 * SHIFT_TAPS as usize]) {
+    shift_inner_impl(src, dst, w)
+}
+
+crate::simd::x8_kernel! {
+    /// [`shift_inner`] を AVX2 でコンパイルしたもの (出力サンプルの方向に自動ベクトル化される。各出力の足し算の順序は同じ)
+    fn shift_inner_x8(src: &[f32], dst: &mut [f32], w: &[f32; 2 * SHIFT_TAPS as usize]) {
+        shift_inner_impl(src, dst, w)
     }
 }
 

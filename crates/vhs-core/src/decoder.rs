@@ -29,6 +29,7 @@ use crate::raster;
 use crate::timing::*;
 use crate::caption::CaptionDecoder;
 use crate::clock::{CLOCK_CHROMA, CLOCK_HORIZONTAL, CLOCK_VERTICAL, ClockSim};
+use crate::simd::{self, F32x8, LANES, x8_kernel};
 use crate::vbi;
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -277,6 +278,13 @@ fn vsync_delay(s: &'static Standard, alpha: f32) -> f64 {
     0.0
 }
 
+fn push_retrace(retraces: &mut VecDeque<f64>, r: f64) {
+    retraces.push_back(r);
+    while retraces.len() > 8 {
+        retraces.pop_front();
+    }
+}
+
 /// 積分回路のトリガ・再アームのしきい値
 const V_TRIGGER: f32 = 0.5;
 const V_REARM: f32 = 0.3;
@@ -321,11 +329,13 @@ impl Decoder {
         let line_time = s.line_time() as f64;
         let half = 0.5 * ls as f32;
         let wrap_half = |d: f32| d - ls as f32 * (d / ls as f32).round();
-        for i in 0..n_new {
+        // 同期の検出はラインごとに独立なので先に並列で済ませる
+        let edges: Vec<Option<f32>> = (0..n_new).into_par_iter().map(|i| find_sync_edge(field.line(i), s)).collect();
+        for (i, &edge) in edges.iter().enumerate() {
             let clk = self.clk_h.step(&p.clocks.horizontal, start + i as u64, line_time, CLOCK_HORIZONTAL);
             let pred = self.h_sync_pos - (clk.freq_err * ls as f64) as f32;
             let mut pos_h = pred;
-            if let Some(pos) = find_sync_edge(field.line(i), s) {
+            if let Some(pos) = edge {
                 pos_h = pred + k * wrap_half(pos - pred);
             }
             // 同期が外れて流れていくときも、ラインの頭からの位置として持つ
@@ -396,65 +406,73 @@ impl Decoder {
                 }
             };
             let burst_gate = s.burst_start..s.burst_end + 16;
+            let shelf = (p.luma_shelf_db.abs() >= 1e-4).then_some(y_shelf);
+            // ラインごとの Y/C 分離の方式
+            let line_sep = |i: usize| -> YcLine<'_> {
+                let sl = start + i as u64;
+                let frame_ref = frame_ok_from
+                    .filter(|&f| use_3d && sl >= f + frame_lag)
+                    .map(|_| frame_mem.line(sl - frame_lag));
+                let prev = (sl >= comb_lag).then(|| aligned_line(sl - comb_lag)).flatten();
+                if separate {
+                    YcLine::Separate(&chunk_aligned_c[i * ls..(i + 1) * ls])
+                } else if let Some(xf) = frame_ref {
+                    YcLine::Frame(xf, prev)
+                } else if let (true, Some(prev)) = (use_comb || use_3d, prev) {
+                    YcLine::Comb(prev)
+                } else {
+                    YcLine::Notch
+                }
+            };
+            let x8 = crate::simd::x8();
             self.chunk_luma[..n_new * ls]
-                .par_chunks_mut(ls)
-                .zip(self.chunk_chroma[..n_new * ls].par_chunks_mut(ls))
-                .zip(self.chunk_bursts[..n_new].par_iter_mut())
+                .par_chunks_mut(LANES * ls)
+                .zip(self.chunk_chroma[..n_new * ls].par_chunks_mut(LANES * ls))
+                .zip(self.chunk_bursts[..n_new].par_chunks_mut(LANES))
                 .enumerate()
-                .for_each(|(i, ((y, c), burst))| {
-                    let sl = start + i as u64;
-                    let x = &chunk_aligned[i * ls..(i + 1) * ls];
-                    let frame_ref = frame_ok_from
-                        .filter(|&f| use_3d && sl >= f + frame_lag)
-                        .map(|_| frame_mem.line(sl - frame_lag));
-                    let prev = (sl >= comb_lag).then(|| aligned_line(sl - comb_lag)).flatten();
-                    if separate {
-                        // S 映像: Y/C 分離は要らない (C は帯域外の雑音だけ落とす)
-                        let xc = &chunk_aligned_c[i * ls..(i + 1) * ls];
-                        let mut bp = c_bp;
-                        for n in 0..ls {
-                            y[n] = x[n];
-                            c[n] = bp.process(xc[n]);
-                        }
-                    } else if let Some(xf) = frame_ref {
-                        separate_3d(x, xf, prev, y, c, c_bp, motion_thr);
-                    } else if let (true, Some(prev)) = (use_comb || use_3d, prev) {
-                        let mut bp = c_bp;
-                        for n in 0..ls {
-                            c[n] = bp.process(0.5 * (x[n] - prev[n]));
-                            y[n] = x[n] - c[n];
-                        }
+                .for_each(|(g, ((ys, cs), bursts))| {
+                    let i0 = g * LANES;
+                    let nl = bursts.len();
+                    let seps: Vec<YcLine> = (i0..i0 + nl).map(line_sep).collect();
+                    let xs = &chunk_aligned[i0 * ls..(i0 + nl) * ls];
+                    // 8 本そろって同じ方式 (3 次元以外) なら 8 レーンでまとめて回す
+                    let uniform = nl == LANES && seps.iter().all(|m| std::mem::discriminant(m) == std::mem::discriminant(&seps[0]));
+                    if x8 && uniform && !matches!(seps[0], YcLine::Frame(..)) {
+                        let mode = match seps[0] {
+                            YcLine::Separate(_) => YcX8::Separate(&chunk_aligned_c[i0 * ls..(i0 + nl) * ls]),
+                            YcLine::Comb(_) => YcX8::Comb(std::array::from_fn(|l| match seps[l] {
+                                YcLine::Comb(pv) => pv,
+                                _ => unreachable!(),
+                            })),
+                            _ => YcX8::Notch,
+                        };
+                        yc_separate_x8(mode, xs, &notch, &c_bp, shelf.as_ref(), ys, cs, ls);
                     } else {
-                        let (mut nf, mut bp) = (notch, c_bp);
-                        for n in 0..ls {
-                            y[n] = nf.process(x[n]);
-                            c[n] = bp.process(x[n]);
-                        }
-                    }
-
-                    if p.luma_shelf_db.abs() >= 1e-4 {
-                        let mut f = y_shelf;
-                        for v in y.iter_mut() {
-                            *v = f.process(*v);
+                        for (l, sep) in seps.iter().enumerate() {
+                            let r = l * ls..(l + 1) * ls;
+                            yc_separate_line(*sep, &xs[r.clone()], &mut ys[r.clone()], &mut cs[r], notch, c_bp, shelf, motion_thr);
                         }
                     }
 
                     // バースト位相・振幅の検出
                     // バーストゲートはテープ再生時の包絡線の遅れも含むよう広めに取る。
                     // 位相は全体の和から、振幅 (ACC 用) は 1 周期ごとの包絡線のピークから求める。
-                    let (mut zr, mut zi) = (0f32, 0f32);
-                    let mut amp = 0f32;
-                    for cyc in burst_gate.clone().step_by(4) {
-                        let (mut cr, mut ci) = (0f32, 0f32);
-                        for n in cyc..cyc + 4 {
-                            cr += c[n] * COS4[n & 3];
-                            ci -= c[n] * SIN4[n & 3];
+                    for (l, burst) in bursts.iter_mut().enumerate() {
+                        let c = &cs[l * ls..(l + 1) * ls];
+                        let (mut zr, mut zi) = (0f32, 0f32);
+                        let mut amp = 0f32;
+                        for cyc in burst_gate.clone().step_by(4) {
+                            let (mut cr, mut ci) = (0f32, 0f32);
+                            for n in cyc..cyc + 4 {
+                                cr += c[n] * COS4[n & 3];
+                                ci -= c[n] * SIN4[n & 3];
+                            }
+                            zr += cr;
+                            zi += ci;
+                            amp = amp.max(0.5 * (cr * cr + ci * ci).sqrt());
                         }
-                        zr += cr;
-                        zi += ci;
-                        amp = amp.max(0.5 * (cr * cr + ci * ci).sqrt());
+                        *burst = Burst { zr, zi, amp };
                     }
-                    *burst = Burst { zr, zi, amp };
                 });
         }
 
@@ -533,38 +551,42 @@ impl Decoder {
         // I/Q 復調では帯域の広い (遅れの小さい) I を遅延線で Q に揃える。ここではそれぞれの遅れだけ前へ出す
         let lead = |lp: &Cascade| (c_bp.group_delay(s.fsc, s.fs) + lp.group_delay(1e3, s.fs) - luma_delay).round().max(0.0) as usize;
         let (lead_a, lead_b) = (lead(&c_lp_a), lead(&c_lp_b));
-        let lead_max = lead_a.max(lead_b);
         let (chroma, line_refs) = (&self.chroma, &self.line_refs);
-        self.det_a.par_chunks_mut(aw).zip(self.det_b.par_chunks_mut(aw)).enumerate().for_each(|(k, (da, db))| {
-            let j = j0 + k as i64;
-            if !line_ok(j) {
-                da.fill(0.0);
-                db.fill(0.0);
+        let geom = DetGeom { ls, active_start, active_end, lead_a, lead_b };
+        let det_x8 = crate::simd::x8();
+        self.det_a.par_chunks_mut(LANES * aw).zip(self.det_b.par_chunks_mut(LANES * aw)).enumerate().for_each(|(g, (das, dbs))| {
+            let k0 = g * LANES;
+            let nl = das.len() / aw;
+            // 副搬送波の基準位相から、4 相ぶんの検波軸
+            let axes = |j: i64| {
+                let psi = line_refs[(j as u64 % line_refs.len() as u64) as usize].phase;
+                let mut cos_t = [0f32; 4];
+                let mut sin_t = [0f32; 4];
+                for q in 0..4 {
+                    let a = q as f32 * std::f32::consts::FRAC_PI_2 + psi + hue;
+                    cos_t[q] = a.cos();
+                    sin_t[q] = a.sin();
+                }
+                (cos_t, sin_t)
+            };
+            let js: Vec<i64> = (0..nl).map(|l| j0 + (k0 + l) as i64).collect();
+            if det_x8 && nl == LANES && js.iter().all(|&j| line_ok(j)) {
+                let ax: Vec<_> = js.iter().map(|&j| axes(j)).collect();
+                let cos_t: [F32x8; 4] = std::array::from_fn(|q| F32x8::from_fn(|l| ax[l].0[q]));
+                let sin_t: [F32x8; 4] = std::array::from_fn(|q| F32x8::from_fn(|l| ax[l].1[q]));
+                let c: [&[f32]; LANES] = std::array::from_fn(|l| chroma.line(js[l] as u64));
+                detect_x8(&c, &cos_t, &sin_t, &c_lp_a, &c_lp_b, &geom, das, dbs, aw);
                 return;
             }
-            let c = chroma.line(j as u64);
-            let psi = line_refs[(j as u64 % line_refs.len() as u64) as usize].phase;
-            let mut cos_t = [0f32; 4];
-            let mut sin_t = [0f32; 4];
-            for q in 0..4 {
-                let a = q as f32 * std::f32::consts::FRAC_PI_2 + psi + hue;
-                cos_t[q] = a.cos();
-                sin_t[q] = a.sin();
-            }
-            let (mut alp, mut blp) = (c_lp_a, c_lp_b);
-            let (mut a, mut b) = (0.0, 0.0);
-            for n in 0..active_end + lead_max {
-                if n < ls {
-                    a = alp.process(2.0 * c[n] * cos_t[n & 3]);
-                    b = blp.process(2.0 * c[n] * sin_t[n & 3]);
+            for (l, &j) in js.iter().enumerate() {
+                let (da, db) = (&mut das[l * aw..(l + 1) * aw], &mut dbs[l * aw..(l + 1) * aw]);
+                if !line_ok(j) {
+                    da.fill(0.0);
+                    db.fill(0.0);
+                    continue;
                 }
-                // ラインの終わりを越えたぶんは最後の値を保つ
-                if n >= active_start + lead_a && n < active_end + lead_a {
-                    da[n - active_start - lead_a] = a;
-                }
-                if n >= active_start + lead_b && n < active_end + lead_b {
-                    db[n - active_start - lead_b] = b;
-                }
+                let (cos_t, sin_t) = axes(j);
+                detect_line(chroma.line(j as u64), &cos_t, &sin_t, c_lp_a, c_lp_b, &geom, da, db);
             }
         });
 
@@ -628,32 +650,26 @@ impl Decoder {
         // ブラウン管のガンマ: 電圧 → 光 (γ 乗) を、出力先 (sRGB ≒ 2.2 乗) の符号値に直す
         let rx_exp = p.gamma.max(0.1) / 2.2;
         let rx_gamma = (rx_exp - 1.0).abs() > 1e-6;
+        let conv = RgbConv {
+            span: lv.span(),
+            contrast: p.contrast,
+            brightness: p.brightness,
+            pal,
+            matrix,
+            exp: rx_gamma.then_some(rx_exp),
+        };
+        let rgb_x8 = crate::simd::x8();
         out.data.par_chunks_mut(row_bytes).enumerate().for_each(|(row, dst)| {
             if row % 2 != parity {
                 return;
             }
             let l = row / 2;
-            let y = &nr_y[l * aw..(l + 1) * aw];
-            let u = &nr_u[l * aw..(l + 1) * aw];
-            let v = &nr_v[l * aw..(l + 1) * aw];
-            for x in 0..aw {
-                let yy = y[x] / lv.span() * p.contrast + p.brightness;
-                let (r, g, b) = if pal {
-                    (yy + 1.140 * v[x], yy - 0.395 * u[x] - 0.581 * v[x], yy + 2.032 * u[x])
-                } else {
-                    let [mr, mg, mb] = matrix;
-                    (yy + mr[0] * u[x] + mr[1] * v[x], yy + mg[0] * u[x] + mg[1] * v[x], yy + mb[0] * u[x] + mb[1] * v[x])
-                };
-                let (r, g, b) = if rx_gamma {
-                    (r.max(0.0).powf(rx_exp), g.max(0.0).powf(rx_exp), b.max(0.0).powf(rx_exp))
-                } else {
-                    (r, g, b)
-                };
-                let o = x * 4;
-                dst[o] = to_u8(r);
-                dst[o + 1] = to_u8(g);
-                dst[o + 2] = to_u8(b);
-                dst[o + 3] = 255;
+            let r = l * aw..(l + 1) * aw;
+            let (y, u, v) = (&nr_y[r.clone()], &nr_u[r.clone()], &nr_v[r]);
+            if rgb_x8 {
+                rgb_row_x8(&conv, y, u, v, dst);
+            } else {
+                rgb_row(&conv, y, u, v, dst);
             }
         });
 
@@ -717,6 +733,8 @@ impl Decoder {
         let thr = s.ire.sync / 2.0;
         let start = field.stream_line(0);
         let line_time = s.line_time() as f64;
+        let lsf = ls as f64;
+        let (mut v, mut armed, mut v_last) = (self.v_int, self.v_armed, self.v_last);
         for i in 0..n_new {
             let line = field.line(i);
             let sl = start + i as u64;
@@ -725,36 +743,51 @@ impl Decoder {
             let clk = self.clk_v.step(&p.clocks.vertical, sl, line_time, CLOCK_VERTICAL);
             let period = nominal / (1.0 + clk.freq_err);
             let jitter = clk.jitter_s / line_time;
+            let min_gap = period * (1.0 - window);
+            // サンプル n の時刻。n について単調なので、時刻の条件は「n がしきい値以上」に置き換えられる
+            let t_at = |n: usize| base + n as f64 / lsf;
+            // cond(t_at(n)) を満たす最初の n (なければ ls)。approx はその時刻の目安
+            let first = |approx: f64, cond: &dyn Fn(f64) -> bool| {
+                let mut n = ((approx - base) * lsf).floor().clamp(0.0, lsf) as usize;
+                while n > 0 && cond(t_at(n - 1)) {
+                    n -= 1;
+                }
+                while n < ls && !cond(t_at(n)) {
+                    n += 1;
+                }
+                n
+            };
             // 自走のトリガがこのラインの中に来るか
-            let mut free_at = (self.v_last + period + jitter).max(self.v_free_hold);
+            let mut free_at = (v_last + period + jitter).max(self.v_free_hold);
+            let mut free_n = first(free_at, &|t| t >= free_at);
+            let mut sync_n = first(v_last + min_gap, &|t| t - v_last >= min_gap);
             for (n, &x) in line.iter().enumerate() {
-                self.v_int += alpha * ((x < thr) as u8 as f32 - self.v_int);
-                let t = base + n as f64 / ls as f64;
-                if self.v_int < V_REARM {
-                    self.v_armed = true;
+                v += alpha * ((x < thr) as u8 as f32 - v);
+                if v < V_REARM {
+                    armed = true;
                 }
-                if self.v_armed && self.v_int > V_TRIGGER && t - self.v_last >= period * (1.0 - window) {
+                if armed && v > V_TRIGGER && n >= sync_n {
                     // 同期によるトリガ
-                    self.v_armed = false;
-                    self.v_last = t;
-                    self.push_retrace(t - delay);
-                    free_at = self.v_last + period + jitter;
-                } else if t >= free_at {
+                    let t = t_at(n);
+                    armed = false;
+                    v_last = t;
+                    push_retrace(&mut self.retraces, t - delay);
+                    free_at = v_last + period + jitter;
+                } else if n >= free_n {
                     // 自走 (同期が来ない・窓の外)
-                    self.v_last = free_at;
-                    self.push_retrace(free_at - delay);
-                    free_at = self.v_last + period + jitter;
+                    v_last = free_at;
+                    push_retrace(&mut self.retraces, free_at - delay);
+                    free_at = v_last + period + jitter;
+                } else {
+                    continue;
                 }
+                free_n = first(free_at, &|t| t >= free_at);
+                sync_n = first(v_last + min_gap, &|t| t - v_last >= min_gap);
             }
         }
+        (self.v_int, self.v_armed, self.v_last) = (v, armed, v_last);
     }
 
-    fn push_retrace(&mut self, r: f64) {
-        self.retraces.push_back(r);
-        while self.retraces.len() > 8 {
-            self.retraces.pop_front();
-        }
-    }
 
     /// バーストからラインごとの基準位相・PAL スイッチ・色のゲインを決める。
     ///
@@ -903,6 +936,200 @@ fn quantize_line(buf: &mut [f32], bits: u32, lv: &Levels) {
     }
 }
 
+/// 同期検波で書き出す範囲 (ラインの位置と、色差ローパスの遅れぶん前へ出す量)
+struct DetGeom {
+    ls: usize,
+    active_start: usize,
+    active_end: usize,
+    lead_a: usize,
+    lead_b: usize,
+}
+
+/// 1 ラインの同期検波 + 色差ローパス (スカラー経路)。`da`・`db` は有効映像の幅
+#[allow(clippy::too_many_arguments)]
+fn detect_line(c: &[f32], cos_t: &[f32; 4], sin_t: &[f32; 4], mut alp: Cascade, mut blp: Cascade, g: &DetGeom, da: &mut [f32], db: &mut [f32]) {
+    let DetGeom { ls, active_start, active_end, lead_a, lead_b } = *g;
+    let (mut a, mut b) = (0.0, 0.0);
+    for n in 0..active_end + lead_a.max(lead_b) {
+        if n < ls {
+            a = alp.process(2.0 * c[n] * cos_t[n & 3]);
+            b = blp.process(2.0 * c[n] * sin_t[n & 3]);
+        }
+        // ラインの終わりを越えたぶんは最後の値を保つ
+        if n >= active_start + lead_a && n < active_end + lead_a {
+            da[n - active_start - lead_a] = a;
+        }
+        if n >= active_start + lead_b && n < active_end + lead_b {
+            db[n - active_start - lead_b] = b;
+        }
+    }
+}
+
+x8_kernel! {
+    /// 8 ラインの同期検波 (縦方向 SIMD)。`da`・`db` は 8 ラインが幅 `aw` おきに並ぶ。
+    /// 各レーンの演算は [`detect_line`] と同じ順序
+    #[allow(clippy::too_many_arguments)]
+    fn detect_x8<'a>(
+        c: &[&'a [f32]; LANES],
+        cos_t: &[F32x8; 4],
+        sin_t: &[F32x8; 4],
+        lp_a: &Cascade,
+        lp_b: &Cascade,
+        g: &DetGeom,
+        da: &mut [f32],
+        db: &mut [f32],
+        aw: usize,
+    ) {
+        let DetGeom { ls, active_start, active_end, lead_a, lead_b } = *g;
+        let c: [&[f32]; LANES] = c.map(|l| &l[..ls]);
+        let (mut da, mut db) = (simd::rows_mut(da, aw), simd::rows_mut(db, aw));
+        let (mut alp, mut blp) = (lp_a.lanes::<F32x8>(), lp_b.lanes::<F32x8>());
+        let two = F32x8::splat(2.0);
+        let (mut a, mut b) = (F32x8::splat(0.0), F32x8::splat(0.0));
+        for n in 0..active_end + lead_a.max(lead_b) {
+            if n < ls {
+                let cv = two * F32x8::gather(&c, n);
+                a = alp.process(cv * cos_t[n & 3]);
+                b = blp.process(cv * sin_t[n & 3]);
+            }
+            if n >= active_start + lead_a && n < active_end + lead_a {
+                a.scatter(&mut da, n - active_start - lead_a);
+            }
+            if n >= active_start + lead_b && n < active_end + lead_b {
+                b.scatter(&mut db, n - active_start - lead_b);
+            }
+        }
+    }
+}
+
+/// 1 ラインの Y/C 分離の方式
+#[derive(Clone, Copy)]
+enum YcLine<'a> {
+    /// S 映像: C の信号 (Y/C 分離は要らない)
+    Separate(&'a [f32]),
+    /// 3 次元: フレームメモリのライン (と、ラインくし形の相手)
+    Frame(&'a [f32], Option<&'a [f32]>),
+    /// ラインくし形: 相手のライン
+    Comb(&'a [f32]),
+    Notch,
+}
+
+/// 8 ライン同時の Y/C 分離の方式 (同じ方式の 8 ラインを束ねる)
+enum YcX8<'a> {
+    /// 8 ラインぶんの C の信号 (ライン長おきに並ぶ)
+    Separate(&'a [f32]),
+    Comb([&'a [f32]; LANES]),
+    Notch,
+}
+
+/// 1 ラインの Y/C 分離 (スカラー経路)。輝度のハイシェルフもここで掛ける
+#[allow(clippy::too_many_arguments)]
+fn yc_separate_line(
+    sep: YcLine,
+    x: &[f32],
+    y: &mut [f32],
+    c: &mut [f32],
+    notch: Cascade,
+    c_bp: Cascade,
+    shelf: Option<Biquad>,
+    motion_thr: Option<f32>,
+) {
+    let ls = x.len();
+    match sep {
+        YcLine::Separate(xc) => {
+            // S 映像: Y/C 分離は要らない (C は帯域外の雑音だけ落とす)
+            let mut bp = c_bp;
+            for n in 0..ls {
+                y[n] = x[n];
+                c[n] = bp.process(xc[n]);
+            }
+        }
+        YcLine::Frame(xf, prev) => separate_3d(x, xf, prev, y, c, c_bp, motion_thr),
+        YcLine::Comb(prev) => {
+            let mut bp = c_bp;
+            for n in 0..ls {
+                c[n] = bp.process(0.5 * (x[n] - prev[n]));
+                y[n] = x[n] - c[n];
+            }
+        }
+        YcLine::Notch => {
+            let (mut nf, mut bp) = (notch, c_bp);
+            for n in 0..ls {
+                y[n] = nf.process(x[n]);
+                c[n] = bp.process(x[n]);
+            }
+        }
+    }
+    if let Some(mut f) = shelf {
+        for v in y.iter_mut() {
+            *v = f.process(*v);
+        }
+    }
+}
+
+x8_kernel! {
+    /// 8 ラインの Y/C 分離 (縦方向 SIMD)。`x`・`y`・`c` は 8 ラインがライン長 `ls` おきに並ぶ。
+    /// 各レーンの演算は [`yc_separate_line`] と同じ順序なので、結果はビット単位で一致する
+    #[allow(clippy::too_many_arguments)]
+    fn yc_separate_x8<'a>(
+        mode: YcX8<'a>,
+        x: &[f32],
+        notch: &Cascade,
+        c_bp: &Cascade,
+        shelf: Option<&Biquad>,
+        y: &mut [f32],
+        c: &mut [f32],
+        ls: usize,
+    ) {
+        let x = simd::rows(x, ls);
+        let (mut y, mut c) = (simd::rows_mut(y, ls), simd::rows_mut(c, ls));
+        let mut bp = c_bp.lanes::<F32x8>();
+        let mut sh = shelf.map(|b| Cascade::new(&[*b]).lanes::<F32x8>());
+        let half = F32x8::splat(0.5);
+        match mode {
+            YcX8::Separate(xc) => {
+                let xc = simd::rows(xc, ls);
+                for n in 0..ls {
+                    let xv = F32x8::gather(&x, n);
+                    let yv = match &mut sh {
+                        Some(f) => f.process(xv),
+                        None => xv,
+                    };
+                    yv.scatter(&mut y, n);
+                    bp.process(F32x8::gather(&xc, n)).scatter(&mut c, n);
+                }
+            }
+            YcX8::Comb(prev) => {
+                let prev: [&[f32]; LANES] = prev.map(|p| &p[..ls]);
+                for n in 0..ls {
+                    let xv = F32x8::gather(&x, n);
+                    let cv = bp.process(half * (xv - F32x8::gather(&prev, n)));
+                    let yv = xv - cv;
+                    let yv = match &mut sh {
+                        Some(f) => f.process(yv),
+                        None => yv,
+                    };
+                    yv.scatter(&mut y, n);
+                    cv.scatter(&mut c, n);
+                }
+            }
+            YcX8::Notch => {
+                let mut nf = notch.lanes::<F32x8>();
+                for n in 0..ls {
+                    let xv = F32x8::gather(&x, n);
+                    let yv = nf.process(xv);
+                    let yv = match &mut sh {
+                        Some(f) => f.process(yv),
+                        None => yv,
+                    };
+                    yv.scatter(&mut y, n);
+                    bp.process(xv).scatter(&mut c, n);
+                }
+            }
+        }
+    }
+}
+
 /// 動き適応型 3 次元 Y/C 分離 (1 ライン)。
 ///
 /// - フレームくし形: 静止部分では `x - xf` が色だけの 2 倍になるので C = (x - xf) / 2、Y = (x + xf) / 2。
@@ -961,7 +1188,64 @@ fn separate_3d(
     }
 }
 
+/// 輝度・色差 → RGBA の変換条件
+struct RgbConv {
+    span: f32,
+    contrast: f32,
+    brightness: f32,
+    pal: bool,
+    /// NTSC の色差マトリクス
+    matrix: [[f32; 2]; 3],
+    /// ブラウン管のガンマの補正の指数 (1 なら None)
+    exp: Option<f32>,
+}
+
+/// 1 行ぶんを RGBA にする。分岐をループの外に出して、ループ本体を自動ベクトル化できる形にしてある
+#[inline(always)]
+fn rgb_row_impl(cv: &RgbConv, y: &[f32], u: &[f32], v: &[f32], dst: &mut [u8]) {
+    #[inline(always)]
+    fn run(y: &[f32], u: &[f32], v: &[f32], dst: &mut [u8], cv: &RgbConv, mat: impl Fn(f32, f32, f32) -> (f32, f32, f32)) {
+        let n = y.len();
+        let (u, v, dst) = (&u[..n], &v[..n], &mut dst[..4 * n]);
+        for (x, o) in dst.chunks_exact_mut(4).enumerate() {
+            let yy = y[x] / cv.span * cv.contrast + cv.brightness;
+            let (r, g, b) = mat(yy, u[x], v[x]);
+            o[0] = to_u8(r);
+            o[1] = to_u8(g);
+            o[2] = to_u8(b);
+            o[3] = 255;
+        }
+    }
+    let [mr, mg, mb] = cv.matrix;
+    let ntsc = |yy: f32, u: f32, v: f32| (yy + mr[0] * u + mr[1] * v, yy + mg[0] * u + mg[1] * v, yy + mb[0] * u + mb[1] * v);
+    let pal = |yy: f32, u: f32, v: f32| (yy + 1.140 * v, yy - 0.395 * u - 0.581 * v, yy + 2.032 * u);
+    match (cv.pal, cv.exp) {
+        (false, None) => run(y, u, v, dst, cv, ntsc),
+        (true, None) => run(y, u, v, dst, cv, pal),
+        (pal_sys, Some(e)) => {
+            let gamma = |(r, g, b): (f32, f32, f32)| (r.max(0.0).powf(e), g.max(0.0).powf(e), b.max(0.0).powf(e));
+            if pal_sys {
+                run(y, u, v, dst, cv, |a, b, c| gamma(pal(a, b, c)))
+            } else {
+                run(y, u, v, dst, cv, |a, b, c| gamma(ntsc(a, b, c)))
+            }
+        }
+    }
+}
+
+fn rgb_row(cv: &RgbConv, y: &[f32], u: &[f32], v: &[f32], dst: &mut [u8]) {
+    rgb_row_impl(cv, y, u, v, dst)
+}
+
+x8_kernel! {
+    /// [`rgb_row`] を AVX2 でコンパイルしたもの (横方向。演算は同じなので結果も同じ)
+    fn rgb_row_x8(cv: &RgbConv, y: &[f32], u: &[f32], v: &[f32], dst: &mut [u8]) {
+        rgb_row_impl(cv, y, u, v, dst)
+    }
+}
+
 #[inline(always)]
 fn to_u8(v: f32) -> u8 {
     (v * 255.0 + 0.5).clamp(0.0, 255.0) as u8
 }
+

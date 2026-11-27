@@ -29,6 +29,7 @@ pub mod raster;
 pub mod rawout;
 pub mod rf;
 pub mod rng;
+pub mod simd;
 pub mod tape;
 pub mod teletext;
 pub mod tbc;

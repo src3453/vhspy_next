@@ -95,3 +95,21 @@ fn golden_ntsc_tbc() {
     p.tbc.error_rate = 0.005;
     run("ntsc_tbc", p);
 }
+
+#[test]
+fn golden_ntsc_comb3d() {
+    let mut p = full();
+    p.decoder.yc_separation = vhs_core::params::YcSeparation::Comb3d;
+    p.decoder.luma_shelf_db = 3.0;
+    p.decoder.chroma_shelf_db = 2.0;
+    p.decoder.chroma_demod = vhs_core::params::ChromaDemod::IqWide;
+    run("ntsc_comb3d", p);
+}
+
+#[test]
+fn golden_ntsc_comb() {
+    let mut p = full();
+    p.decoder.yc_separation = vhs_core::params::YcSeparation::Comb;
+    p.decoder.gamma = 2.5;
+    run("ntsc_comb", p);
+}
