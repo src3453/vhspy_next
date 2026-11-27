@@ -238,6 +238,114 @@ impl MagneticTransfer {
     }
 }
 
+impl MagneticTransfer {
+    /// 8 本の信号列 (`buf` に長さ `len` おき) に、それぞれ新しい [`state`](Self::state) で
+    /// [`MagneticState::process`] を順に掛けたのと同じ結果を書く。
+    /// 表引きの J-A は 8 本を SIMD のレーンに並べて解く (縦方向)。それ以外はラインごとに回す
+    pub fn process_lines_x8(&self, buf: &mut [f32], len: usize) {
+        if self.model == MagneticModel::JilesAtherton && self.turn.is_some() && crate::simd::x8() {
+            ja_table_x8(self, buf, len);
+        } else {
+            for line in buf.chunks_exact_mut(len).take(crate::simd::LANES) {
+                let mut st = self.state();
+                for v in line {
+                    *v = st.process(*v);
+                }
+            }
+        }
+    }
+}
+
+crate::simd::x8_kernel! {
+    /// 表引きの J-A を 8 本同時に解く。各レーンは [`MagneticState::process`] と同じ演算・分岐をたどる:
+    /// 枝の折り返し ([`TurnState::begin`]) と表の範囲外 (RK4) はそのレーンだけスカラーで処理し、
+    /// 表の補間は gather で 8 本まとめて行う
+    fn ja_table_x8(t: &MagneticTransfer, buf: &mut [f32], len: usize) {
+        use crate::simd::{F32x8, LANES, gather4, rows_mut, trunc_index};
+        let st = t.state();
+        let ja = st.ja;
+        let tpl = st.turn.clone().expect("turn table");
+        let table = tpl.table.clone();
+        let (hmax, scale_h) = (tpl.hmax, tpl.scale_h);
+        let mut turns: [TurnState; LANES] = std::array::from_fn(|_| tpl.clone());
+        // 枝の状態をレーンごとの配列に写したもの (折り返しのときだけ更新する)
+        let mut dir = [0f32; LANES];
+        let mut row0 = [0i32; LANES];
+        let mut row1 = [0i32; LANES];
+        let mut row_frac = F32x8::splat(0.0);
+        let mut offset = F32x8::splat(0.0);
+        let mut exact = [false; LANES];
+        macro_rules! sync_lane {
+            ($l:expr) => {{
+                let ts = &turns[$l];
+                dir[$l] = ts.dir;
+                row0[$l] = ts.row0 as i32;
+                row1[$l] = ts.row1 as i32;
+                row_frac.0[$l] = ts.row_frac;
+                offset.0[$l] = ts.offset;
+                exact[$l] = ts.exact;
+            }};
+        }
+        for l in 0..LANES {
+            sync_lane!(l);
+        }
+        let mut rows = rows_mut(buf, len);
+        let fpu = F32x8::splat(st.field_per_unit);
+        let out_scale = F32x8::splat(st.out_scale);
+        let (mut m, mut prev) = (F32x8::splat(st.magnetization), F32x8::splat(st.previous_field));
+        let p_max = (TURN_NH - 1) as f32 - 1e-3;
+        let lerp = |x: F32x8, y: F32x8, t: F32x8| x + (y - x) * t;
+        for n in 0..len {
+            let h1 = F32x8::from_fn(|l| rows[l][n]) * fpu;
+            let h0 = prev;
+            // 磁界の向きが変わったレーンは、そこを折り返し点として枝を始め直す
+            let turn = (h1 - h0) * F32x8(dir);
+            let mut bits = lane_mask(|l| turn.0[l] < 0.0);
+            while bits != 0 {
+                let l = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let d = -turns[l].dir;
+                turns[l].begin(d, h0.0[l], m.0[l]);
+                sync_lane!(l);
+            }
+            let mut bits = lane_mask(|l| !exact[l] && h1.0[l].abs() > hmax);
+            while bits != 0 {
+                let l = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                turns[l].exact = true;
+                exact[l] = true;
+            }
+            // 表の補間 (TurnState::step と同じ式)
+            let p = F32x8::from_fn(|l| ((dir[l] * h1.0[l] + hmax) * scale_h).clamp(0.0, p_max));
+            let j = trunc_index(p, TURN_NH - 1);
+            let f = F32x8::from_fn(|l| p.0[l] - j[l] as f32);
+            let i0: [i32; LANES] = std::array::from_fn(|l| row0[l] + 2 * j[l]);
+            let i1: [i32; LANES] = std::array::from_fn(|l| row1[l] + 2 * j[l]);
+            let [a0, a1, a2, a3] = gather4(&table, &i0);
+            let [b0, b1, b2, b3] = gather4(&table, &i1);
+            let (ba, wa) = (lerp(a0, a2, f), lerp(a1, a3, f));
+            let (bb, wb) = (lerp(b0, b2, f), lerp(b1, b3, f));
+            let m_up = lerp(ba, bb, row_frac) + offset * lerp(wa, wb, row_frac);
+            let mut m_new = F32x8::from_fn(|l| (dir[l] * m_up.0[l]).clamp(-1.0, 1.0));
+            let mut bits = lane_mask(|l| exact[l]);
+            while bits != 0 {
+                let l = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                m_new.0[l] = ja_step(ja, m.0[l], h0.0[l], h1.0[l]);
+            }
+            m = m_new;
+            prev = h1;
+            (out_scale * m).scatter(&mut rows, n);
+        }
+    }
+}
+
+/// 条件を満たすレーンのビット列
+#[inline(always)]
+fn lane_mask(c: impl Fn(usize) -> bool) -> u32 {
+    (0..crate::simd::LANES).fold(0u32, |b, l| b | ((c(l) as u32) << l))
+}
+
 /// 1 本の信号列に沿った磁化履歴
 #[derive(Clone, Debug)]
 pub struct MagneticState {
@@ -635,6 +743,36 @@ fn fast_tanh(x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 8 本同時の表引き J-A は、1 本ずつ state().process を回すのとビット単位で一致する。
+    /// 表の範囲を超える (RK4 に切り替わる) 振幅と、小さな折り返しを含む信号で確かめる
+    #[test]
+    fn ja_lines_x8_match_scalar() {
+        use crate::simd::LANES;
+        let len = 3000;
+        for media in [MagneticMedia::Cobalt, MagneticMedia::MetalParticle] {
+            let t = MagneticTransfer::rf(MagneticModel::JilesAtherton, media, 1.0, 3.0, JaSolver::Table);
+            let buf: Vec<f32> = (0..LANES * len)
+                .map(|i| {
+                    let (l, n) = ((i / len) as f32, (i % len) as f32);
+                    // 振幅は 0.3〜2.1 (表の範囲は ±1.5)。細かい揺れで小さな折り返しも作る
+                    (0.3 + 0.25 * l) * (n * (0.21 + 0.01 * l)).cos() + 0.05 * (n * 1.7).sin()
+                })
+                .collect();
+            let mut want = buf.clone();
+            for line in want.chunks_exact_mut(len) {
+                let mut st = t.state();
+                for v in line {
+                    *v = st.process(*v);
+                }
+            }
+            let mut got = buf.clone();
+            t.process_lines_x8(&mut got, len);
+            for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "{media:?}: line {} n {}", i / len, i % len);
+            }
+        }
+    }
 
     /// ±3 Hc の主ループの (最大磁化, 残留磁化, 保磁力)
     fn major_loop(ja: JaCoeffs) -> (f32, f32, f32) {

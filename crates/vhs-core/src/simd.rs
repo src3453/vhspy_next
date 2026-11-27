@@ -87,6 +87,88 @@ pub fn table_lerp(table: &[f32], pos: F32x8, max_i: usize) -> F32x8 {
     })
 }
 
+/// レーンごとの `(pos as usize).min(max_i)` (NaN・負は 0、巨大な値は max_i)。
+/// x86_64 では AVX2 の命令を使うので、[`x8`] が真の経路からだけ呼ぶこと
+#[inline(always)]
+pub fn trunc_index(pos: F32x8, max_i: usize) -> [i32; LANES] {
+    assert!(max_i < i32::MAX as usize);
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: AVX2 は呼び出し側が保証する
+    unsafe {
+        use std::arch::x86_64::*;
+        let p = _mm256_loadu_ps(pos.0.as_ptr());
+        let mut j = _mm256_cvttps_epi32(p);
+        let big = _mm256_castps_si256(_mm256_cmp_ps::<_CMP_GE_OQ>(p, _mm256_set1_ps(2147483648.0)));
+        let maxv = _mm256_set1_epi32(max_i as i32);
+        j = _mm256_blendv_epi8(j, maxv, big);
+        j = _mm256_min_epi32(_mm256_max_epi32(j, _mm256_setzero_si256()), maxv);
+        let mut out = [0i32; LANES];
+        _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, j);
+        out
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    std::array::from_fn(|l| (pos.0[l] as usize).min(max_i) as i32)
+}
+
+/// レーンごとに `table[idx[l] + off]` を読む (範囲は確かめる)。
+/// x86_64 では AVX2 の gather を使うので、[`x8`] が真の経路からだけ呼ぶこと
+#[inline(always)]
+pub fn gather_idx(table: &[f32], idx: &[i32; LANES], off: usize) -> F32x8 {
+    check_idx(table, idx, off + 1);
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: 添字は上で確かめた。AVX2 は呼び出し側が保証する
+    unsafe {
+        use std::arch::x86_64::*;
+        let i = _mm256_loadu_si256(idx.as_ptr() as *const __m256i);
+        let v = _mm256_i32gather_ps::<4>(table.as_ptr().add(off), i);
+        let mut out = F32x8::splat(0.0);
+        _mm256_storeu_ps(out.0.as_mut_ptr(), v);
+        out
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    F32x8::from_fn(|l| table[idx[l] as usize + off])
+}
+
+/// 添字がどれも 0 以上で、`idx + n` までが表に収まるか確かめる
+#[inline(always)]
+fn check_idx(table: &[f32], idx: &[i32; LANES], n: usize) {
+    let (lo, hi) = idx.iter().fold((i32::MAX, i32::MIN), |(a, b), &i| (a.min(i), b.max(i)));
+    assert!(lo >= 0 && hi as usize + n <= table.len() && table.len() < i32::MAX as usize);
+}
+
+/// レーンごとに連続する 4 個 `table[idx[l]..idx[l] + 4]` を読み、k 番目どうしを束ねた 4 つを返す (範囲は確かめる)。
+/// x86_64 では AVX2 の命令を使うので、[`x8`] が真の経路からだけ呼ぶこと
+#[inline(always)]
+pub fn gather4(table: &[f32], idx: &[i32; LANES]) -> [F32x8; 4] {
+    check_idx(table, idx, 4);
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: 添字は上で確かめた。AVX2 は呼び出し側が保証する
+    unsafe {
+        use std::arch::x86_64::*;
+        let p = table.as_ptr();
+        // 下半分にレーン k、上半分にレーン k + 4 の 4 個を置き、128bit ごとに 4×4 を転置する
+        let row = |k: usize| {
+            _mm256_set_m128(_mm_loadu_ps(p.add(idx[k + 4] as usize)), _mm_loadu_ps(p.add(idx[k] as usize)))
+        };
+        let (r0, r1, r2, r3) = (row(0), row(1), row(2), row(3));
+        let (t0, t1) = (_mm256_unpacklo_ps(r0, r1), _mm256_unpackhi_ps(r0, r1));
+        let (t2, t3) = (_mm256_unpacklo_ps(r2, r3), _mm256_unpackhi_ps(r2, r3));
+        let c = [
+            _mm256_shuffle_ps::<0x44>(t0, t2),
+            _mm256_shuffle_ps::<0xEE>(t0, t2),
+            _mm256_shuffle_ps::<0x44>(t1, t3),
+            _mm256_shuffle_ps::<0xEE>(t1, t3),
+        ];
+        let mut out = [F32x8::splat(0.0); 4];
+        for k in 0..4 {
+            _mm256_storeu_ps(out[k].0.as_mut_ptr(), c[k]);
+        }
+        out
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    std::array::from_fn(|k| F32x8::from_fn(|l| table[idx[l] as usize + k]))
+}
+
 /// `buf` にライン長 `ls` おきに並んだ 8 本のライン (長さはちょうど `ls`)
 #[inline(always)]
 pub fn rows(buf: &[f32], ls: usize) -> [&[f32]; LANES] {
@@ -257,6 +339,27 @@ mod tests {
                 let i = (p[l] as usize).min(max_i);
                 let want = table[i] + (table[i + 1] - table[i]) * (p[l] - i as f32);
                 assert_eq!(got.0[l].to_bits(), want.to_bits(), "pos {}", p[l]);
+            }
+        }
+    }
+
+    x8_kernel! {
+        fn gather4_x8(table: &[f32], idx: &[i32; LANES]) -> [F32x8; 4] {
+            gather4(table, idx)
+        }
+    }
+
+    #[test]
+    fn gather4_reads_four_per_lane() {
+        if !x8() {
+            return;
+        }
+        let table: Vec<f32> = (0..100).map(|i| i as f32 * 1.5).collect();
+        let idx = [0, 7, 3, 96, 50, 1, 42, 13];
+        let g = gather4_x8(&table, &idx);
+        for k in 0..4 {
+            for l in 0..LANES {
+                assert_eq!(g[k].0[l], table[idx[l] as usize + k]);
             }
         }
     }
