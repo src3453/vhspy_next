@@ -17,6 +17,118 @@ use vhs_core::audio::AudioProcessor;
 use vhs_core::rawout::{RawChannel, RawOptions, RawWriter, SampleFormat, describe};
 use vhs_core::{Params, Pipeline, RgbFrame, Standard};
 
+#[cfg(windows)]
+use crate::procaudio::{LiveAudio, WavSink};
+/// ウィンドウの音声の取り込みは Windows のみ
+#[cfg(not(windows))]
+pub struct LiveAudio;
+
+/// 録画中のファイル。ライブ音声があるときは映像を一時ファイルに書き、終わりに音声と多重化する
+struct Recording {
+    rec: Recorder,
+    #[cfg(windows)]
+    mux: Option<Mux>,
+}
+
+#[cfg(windows)]
+struct Mux {
+    output: PathBuf,
+    video: PathBuf,
+    sink: Arc<Mutex<Option<WavSink>>>,
+    kbps: u32,
+    mono: bool,
+}
+
+#[cfg(windows)]
+fn temp_path(tag: &str, ext: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::env::temp_dir().join(format!("vhs_{tag}_{}_{nanos}.{ext}", std::process::id()))
+}
+
+impl Recording {
+    fn start(
+        path: PathBuf,
+        tv: &Standard,
+        square: Option<(u32, u32)>,
+        audio: Option<&LiveAudio>,
+        params: &Params,
+    ) -> Result<Self, String> {
+        #[cfg(windows)]
+        if let Some(a) = audio {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("mp4")
+                .to_string();
+            let video = temp_path("rec", &ext);
+            let wav = WavSink::create(temp_path("rec_audio", "wav"))?;
+            let rec = Recorder::start(&video, None, tv, square)?;
+            *a.sink.lock().unwrap() = Some(wav);
+            return Ok(Self {
+                rec,
+                mux: Some(Mux {
+                    output: path,
+                    video,
+                    sink: a.sink.clone(),
+                    kbps: params.audio.codec_kbps,
+                    mono: params.audio.mono,
+                }),
+            });
+        }
+        let _ = (audio, params);
+        Ok(Self {
+            rec: Recorder::start(&path, None, tv, square)?,
+            #[cfg(windows)]
+            mux: None,
+        })
+    }
+
+    fn display_path(&self) -> String {
+        #[cfg(windows)]
+        if let Some(m) = &self.mux {
+            return m.output.display().to_string();
+        }
+        self.rec.path.display().to_string()
+    }
+
+    fn finish(self) -> Result<(), String> {
+        let r = self.rec.finish();
+        #[cfg(windows)]
+        if let Some(m) = self.mux {
+            let wav = m.sink.lock().unwrap().take();
+            let wav = match wav.map(WavSink::finish).transpose() {
+                Ok(w) => w.flatten(),
+                Err(e) => {
+                    let _ = std::fs::rename(&m.video, &m.output);
+                    return r.and(Err(e));
+                }
+            };
+            if let Err(e) = r {
+                let _ = std::fs::remove_file(&m.video);
+                if let Some(w) = wav {
+                    let _ = std::fs::remove_file(w);
+                }
+                return Err(e);
+            }
+            let res = match &wav {
+                Some(w) => crate::ffmpeg::mux_audio(&m.video, w, &m.output, m.kbps, m.mono),
+                None => std::fs::copy(&m.video, &m.output)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string()),
+            };
+            let _ = std::fs::remove_file(&m.video);
+            if let Some(w) = wav {
+                let _ = std::fs::remove_file(w);
+            }
+            return res;
+        }
+        r
+    }
+}
+
 /// 1 フィールドの時間 (NTSC なら 1001/60000 s)
 fn field_period(tv: &Standard) -> Duration {
     let (n, d) = tv.field_rate_ratio;
@@ -78,6 +190,13 @@ pub struct Shared {
     pub scope: Mutex<ScopeRing>,
 }
 
+impl Shared {
+    /// パラメータを変えるたびに増える
+    pub(crate) fn params_version(&self) -> u64 {
+        self.params_version.load(Ordering::Acquire)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum SourceSpec {
     Pattern,
@@ -132,8 +251,37 @@ fn source_name(spec: &SourceSpec) -> String {
     }
 }
 
+/// ウィンドウキャプチャならそのアプリの音声も取り込む (失敗しても映像は使う)
+#[cfg(windows)]
+fn open_audio(spec: &SourceSpec, shared: &Arc<Shared>) -> Option<LiveAudio> {
+    let SourceSpec::Stream(StreamSpec::Window {
+        title,
+        hwnd,
+        capture_audio: true,
+        monitor_audio,
+        ..
+    }) = spec
+    else {
+        return None;
+    };
+    let r = crate::wgc::resolve_window(title, *hwnd)
+        .and_then(|h| LiveAudio::start(crate::wgc::window_pid(h), *monitor_audio, shared.clone()));
+    match r {
+        Ok(a) => Some(a),
+        Err(e) => {
+            shared.stats.lock().unwrap().error = Some(e);
+            None
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn open_audio(_: &SourceSpec, _: &Arc<Shared>) -> Option<LiveAudio> {
+    None
+}
+
 /// 入力を開く。画像サイズ・フィールド周波数はテレビ方式 `tv` に合わせる
-fn open_source(spec: &SourceSpec, tv: &Standard) -> Result<Source, String> {
+fn open_source(spec: &SourceSpec, tv: &'static Standard) -> Result<Source, String> {
     Ok(match spec {
         SourceSpec::Pattern => Source::Still(vhs_core::pattern::color_bars(tv)),
         SourceSpec::SmpteBars => Source::YiqPattern(vhs_core::pattern::color_bar_signal(
@@ -440,6 +588,25 @@ fn export_raw(
     writer.into_inner().flush().map_err(|e| e.to_string())
 }
 
+/// 音声の取り込みを止める。音声付きで録画中なら録画も終える
+fn stop_audio(audio: &mut Option<LiveAudio>, recorder: &mut Option<Recording>, shared: &Shared) {
+    if audio.is_none() {
+        return;
+    }
+    #[cfg(windows)]
+    if recorder.as_ref().is_some_and(|r| r.mux.is_some()) {
+        let r = recorder.take().unwrap().finish();
+        let mut st = shared.stats.lock().unwrap();
+        st.recording = None;
+        st.error = Some(match r {
+            Ok(()) => "入力が変わったため録画を停止しました".into(),
+            Err(e) => e,
+        });
+    }
+    let _ = (recorder, shared);
+    *audio = None;
+}
+
 fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
     let mut pipeline = Pipeline::new(shared.params.lock().unwrap().clone());
     let mut crt_params = shared.params.lock().unwrap().crt.clone();
@@ -452,7 +619,8 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
     let mut spec = SourceSpec::Pattern;
     let mut source = Source::Still(vhs_core::pattern::color_bars(tv));
     shared.stats.lock().unwrap().source = source_name(&SourceSpec::Pattern);
-    let mut recorder: Option<Recorder> = None;
+    let mut recorder: Option<Recording> = None;
+    let mut audio: Option<LiveAudio> = None;
     let mut next_deadline = Instant::now();
     let mut frame_id = 0u64;
     let (mut window_start, mut window_count) = (Instant::now(), 0u32);
@@ -470,8 +638,11 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     // 先に古いソースを閉じる (同じカメラを開き直す場合のため)
                     source = Source::Still(vhs_core::pattern::color_bars(tv));
                     spec = SourceSpec::Pattern;
+                    // 録画中に音声の取り込みを差し替えられないので、音声付きの録画は止める
+                    stop_audio(&mut audio, &mut recorder, &shared);
                     let r = open_source(&new_spec, tv).map(|s| {
                         source = s;
+                        audio = open_audio(&new_spec, &shared);
                         let mut st = shared.stats.lock().unwrap();
                         st.source = source_name(&new_spec);
                         st.error = None;
@@ -487,10 +658,11 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     let square = crt
                         .active(&crt_params)
                         .then(|| Crt::output_size(crt_params.height));
-                    let r = Recorder::start(&path, None, tv, square).map(|r| {
-                        shared.stats.lock().unwrap().recording = Some(r.path.display().to_string());
-                        recorder = Some(r);
-                    });
+                    let r = Recording::start(path, tv, square, audio.as_ref(), pipeline.params())
+                        .map(|r| {
+                            shared.stats.lock().unwrap().recording = Some(r.display_path());
+                            recorder = Some(r);
+                        });
                     let _ = reply.send(r);
                 }
                 Cmd::StopRecording(reply) => {
@@ -529,8 +701,12 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                 // 画像は方式に合わせて毎フィールド配置し直すので開き直さなくてよい
                 if !matches!(source, Source::Image(_)) {
                     source = Source::Still(vhs_core::pattern::color_bars(tv));
+                    audio = None;
                     match open_source(&spec, tv) {
-                        Ok(s) => source = s,
+                        Ok(s) => {
+                            source = s;
+                            audio = open_audio(&spec, &shared);
+                        }
                         Err(e) => {
                             let mut st = shared.stats.lock().unwrap();
                             st.error = Some(e);
@@ -582,6 +758,7 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     st.error = Some("入力が終了しました (ffmpeg のログを確認してください)".into());
                     st.source = source_name(&SourceSpec::Pattern);
                     drop(st);
+                    stop_audio(&mut audio, &mut recorder, &shared);
                     source = Source::Still(vhs_core::pattern::color_bars(tv));
                     spec = SourceSpec::Pattern;
                     continue;
@@ -603,7 +780,7 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
         // 録画中は録画の大きさ、そうでなければプレビュー画面の大きさで描く
         let vh = shared.viewport_height.load(Ordering::Relaxed);
         let height = match &recorder {
-            Some(r) => r.size.1,
+            Some(r) => r.rec.size.1,
             None if vh > 0 => vh,
             None => crt_params.height,
         };
@@ -630,9 +807,9 @@ fn run(shared: Arc<Shared>, rx: Receiver<Cmd>) {
             }
         }
         if let Some(r) = &recorder {
-            let err = if r.size != (dw, dh) {
+            let err = if r.rec.size != (dw, dh) {
                 Some("CRT シェーダーの切り替えで画像の大きさが変わったため録画を停止しました")
-            } else if !r.push(dpx) {
+            } else if !r.rec.push(dpx) {
                 Some("録画が中断されました")
             } else {
                 None
@@ -766,6 +943,74 @@ mod tests {
         p.crt.enabled = false;
         engine.set_params(p);
         assert_eq!(wait_size(&engine, (754, 480)), (754, 480));
+    }
+
+    /// ウィンドウ (タイトルに日本語) を映像と音声ごと取り込んで録画できる。
+    /// 表示のある Windows と ffplay が必要: `cargo test -p vhs-next window_recording -- --ignored --nocapture`
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn window_recording_has_audio() {
+        let title = "VHSテスト窓";
+        let mut player = std::process::Command::new("ffplay")
+            .args([
+                "-loglevel",
+                "quiet",
+                "-window_title",
+                title,
+                "-volume",
+                "5",
+                "-f",
+                "lavfi",
+            ])
+            .arg("testsrc=size=640x480:rate=30[out0];sine=frequency=440[out1]")
+            .spawn()
+            .expect("ffplay");
+        std::thread::sleep(Duration::from_secs(2));
+        let engine = Engine::start();
+        let spec = SourceSpec::Stream(StreamSpec::Window {
+            title: title.into(),
+            hwnd: None,
+            capture_audio: true,
+            monitor_audio: false,
+            crop_x: 0,
+            crop_y: 0,
+            crop_width: 0,
+            crop_height: 0,
+            scaling: Default::default(),
+        });
+        let r = engine.open(spec);
+        let out = std::env::temp_dir().join("vhs_test_window_rec.mp4");
+        let rec = r.and_then(|_| {
+            std::thread::sleep(Duration::from_millis(500));
+            engine.start_recording(out.clone())?;
+            std::thread::sleep(Duration::from_secs(3));
+            engine.stop_recording()
+        });
+        let stats = engine.shared.stats.lock().unwrap().clone();
+        let _ = player.kill();
+        rec.unwrap();
+        println!("{} fps, error {:?}", stats.fields_per_sec, stats.error);
+        assert_eq!(stats.error, None);
+        assert!(stats.fields_per_sec > 50.0, "{}", stats.fields_per_sec);
+        let probe = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type,duration",
+                "-of",
+                "compact",
+            ])
+            .arg(&out)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&probe.stdout);
+        println!("{text}");
+        assert!(
+            text.contains("codec_type=video") && text.contains("codec_type=audio"),
+            "{text}"
+        );
     }
 
     /// GUI から送られる JSON (snake_case) で PAL を受け取れる

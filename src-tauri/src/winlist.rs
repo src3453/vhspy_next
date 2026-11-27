@@ -3,7 +3,9 @@
 #[derive(serde::Serialize)]
 pub struct WindowInfo {
     pub title: String,
-    /// クライアント領域の大きさ (gdigrab がキャプチャする範囲)
+    /// ウィンドウハンドル (キャプチャを開くときに渡す)
+    pub hwnd: u64,
+    /// クライアント領域の大きさ (キャプチャする範囲)
     pub width: i32,
     pub height: i32,
 }
@@ -57,7 +59,8 @@ pub fn list_windows() -> Vec<WindowInfo> {
             }
             // 別の仮想デスクトップや UWP の隠れたウィンドウ
             let mut cloaked = 0u32;
-            if DwmGetWindowAttribute(h, DWMWA_CLOAKED, &mut cloaked as *mut u32 as *mut c_void, 4) == 0
+            if DwmGetWindowAttribute(h, DWMWA_CLOAKED, &mut cloaked as *mut u32 as *mut c_void, 4)
+                == 0
                 && cloaked != 0
             {
                 return 1;
@@ -83,7 +86,12 @@ pub fn list_windows() -> Vec<WindowInfo> {
             if width <= 0 || height <= 0 {
                 return 1;
             }
-            out.push(WindowInfo { title, width, height });
+            out.push(WindowInfo {
+                title,
+                hwnd: h as usize as u64,
+                width,
+                height,
+            });
         }
         1
     }

@@ -5519,6 +5519,8 @@ dependencies = [
  "tauri-plugin-opener",
  "vhs-core",
  "wgpu",
+ "windows",
+ "windows-core",
 ]
 
 [[package]]

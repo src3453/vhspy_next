@@ -1,9 +1,13 @@
 mod crt;
 mod engine;
 mod ffmpeg;
+#[cfg(windows)]
+mod procaudio;
 mod scope;
 mod still;
 mod syncview;
+#[cfg(windows)]
+mod wgc;
 mod winlist;
 
 use engine::{Engine, SourceSpec, Stats};
@@ -30,6 +34,12 @@ enum OpenRequest {
     },
     Window {
         title: String,
+        #[serde(default)]
+        hwnd: Option<u64>,
+        #[serde(default = "yes")]
+        capture_audio: bool,
+        #[serde(default = "yes")]
+        monitor_audio: bool,
         crop_x: u32,
         crop_y: u32,
         crop_width: u32,
@@ -41,6 +51,10 @@ enum OpenRequest {
     File {
         path: PathBuf,
     },
+}
+
+fn yes() -> bool {
+    true
 }
 
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "bmp", "webp", "exr"];
@@ -98,6 +112,9 @@ async fn open_source(engine: State<'_, Engine>, req: OpenRequest) -> Result<(), 
         }),
         OpenRequest::Window {
             title,
+            hwnd,
+            capture_audio,
+            monitor_audio,
             crop_x,
             crop_y,
             crop_width,
@@ -105,6 +122,9 @@ async fn open_source(engine: State<'_, Engine>, req: OpenRequest) -> Result<(), 
             scaling,
         } => SourceSpec::Stream(StreamSpec::Window {
             title,
+            hwnd,
+            capture_audio,
+            monitor_audio,
             crop_x,
             crop_y,
             crop_width,
@@ -188,7 +208,15 @@ async fn get_sync_view(
         1 => syncview::Anchor::Field2,
         _ => syncview::Anchor::Either,
     };
-    let req = syncview::SyncViewReq { width, phase, frame, anchor, sync, pre_lines, hold };
+    let req = syncview::SyncViewReq {
+        width,
+        phase,
+        frame,
+        anchor,
+        sync,
+        pre_lines,
+        hold,
+    };
     Ok(Response::new(
         syncview::render(&fields, &req).map_or_else(Vec::new, |i| i.to_bytes()),
     ))

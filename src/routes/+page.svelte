@@ -32,7 +32,7 @@
   type CrtInfo = { preset: string; loading: boolean; error: string | null; gpu: string | null; params: ShaderParam[] };
   type ExportProgress = { done: number; total: number | null; finished: boolean; error: string | null };
   type PerformanceSegment = { key: string; label: string; ms: number };
-  type WindowInfo = { title: string; width: number; height: number };
+  type WindowInfo = { title: string; hwnd: number; width: number; height: number };
 
   let params = $state<Params | null>(null);
   let defaults = $state.raw<Params | null>(null);
@@ -41,6 +41,9 @@
   let camera = $state("");
   let cameraScaling = $state("area");
   let windowTitle = $state("");
+  let windowHwnd = $state<number | null>(null);
+  let windowAudio = $state(true);
+  let windowMonitor = $state(true);
   let windows = $state<WindowInfo[]>([]);
   let windowsLoading = $state(false);
   /** false ならウィンドウ全体をキャプチャする */
@@ -154,7 +157,7 @@
     }
   }
 
-  function openWindow(title = windowTitle) {
+  function openWindow(title = windowTitle, hwnd = windowHwnd) {
     if (!title) {
       message = "キャプチャするウィンドウを選んでください";
       return;
@@ -164,11 +167,24 @@
       return;
     }
     windowTitle = title;
+    windowHwnd = hwnd;
     // 幅・高さ 0 はクロップなし (ウィンドウ全体)
     const crop = windowCrop
       ? { crop_x: windowCropX, crop_y: windowCropY, crop_width: windowCropWidth, crop_height: windowCropHeight }
       : { crop_x: 0, crop_y: 0, crop_width: 0, crop_height: 0 };
-    run(() => invoke("open_source", { req: { kind: "window", title, ...crop, scaling: windowScaling } }));
+    run(() =>
+      invoke("open_source", {
+        req: {
+          kind: "window",
+          title,
+          hwnd,
+          capture_audio: windowAudio,
+          monitor_audio: windowMonitor,
+          ...crop,
+          scaling: windowScaling,
+        },
+      }),
+    );
   }
 
   function openPattern(kind: string) {
@@ -494,7 +510,7 @@
           </div>
           <div class="list">
             {#each windows as w, i (i)}
-              <button class="item" class:current={w.title === windowTitle} title={w.title} onclick={() => { close(); openWindow(w.title); }}>
+              <button class="item" class:current={w.title === windowTitle} title={w.title} onclick={() => { close(); openWindow(w.title, w.hwnd); }}>
                 <span class="title">{w.title}</span><span class="sub">{w.width}×{w.height}</span>
               </button>
             {:else}
@@ -502,6 +518,14 @@
             {/each}
           </div>
           <div class="sep"></div>
+          <label class="field" title="ウィンドウのアプリ (と子プロセス) の音声を取り込み、テープの音声処理に通して録画にも入れる">
+            <input type="checkbox" bind:checked={windowAudio} /> 音声も取り込む
+          </label>
+          {#if windowAudio}
+            <label class="field" title="処理した音声を既定の出力デバイスで鳴らす。元の音と重なるときは、アプリの出力先を別のデバイスにするか、こちらを切る">
+              <input type="checkbox" bind:checked={windowMonitor} /> 処理した音をスピーカーで鳴らす
+            </label>
+          {/if}
           <label class="field"><input type="checkbox" bind:checked={windowCrop} /> 範囲を切り抜く</label>
           {#if windowCrop}
             <div class="field crop">

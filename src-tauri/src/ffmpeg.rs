@@ -34,7 +34,7 @@ fn ffprobe_path() -> PathBuf {
     }
 }
 
-fn command(program: &Path) -> Command {
+pub(crate) fn command(program: &Path) -> Command {
     let mut c = Command::new(program);
     #[cfg(windows)]
     {
@@ -101,6 +101,15 @@ pub enum StreamSpec {
     },
     Window {
         title: String,
+        /// 一覧で選んだウィンドウのハンドル (なければタイトルで探す)
+        #[serde(default)]
+        hwnd: Option<u64>,
+        /// ウィンドウのアプリの音声も取り込む
+        #[serde(default = "yes")]
+        capture_audio: bool,
+        /// 取り込んだ音声を (処理して) 既定の出力デバイスで鳴らす
+        #[serde(default = "yes")]
+        monitor_audio: bool,
         crop_x: u32,
         crop_y: u32,
         crop_width: u32,
@@ -129,7 +138,7 @@ pub enum ScalingMethod {
 }
 
 impl ScalingMethod {
-    fn ffmpeg_flags(self) -> &'static str {
+    pub(crate) fn ffmpeg_flags(self) -> &'static str {
         match self {
             Self::Nearest => "neighbor",
             Self::Bilinear => "bilinear",
@@ -146,15 +155,48 @@ fn yes() -> bool {
 
 /// ffmpeg からフレームを読み出すストリーム
 pub struct FrameStream {
-    child: Child,
+    child: Option<Child>,
     pub rx: Receiver<RgbFrame>,
-    _reader: JoinHandle<()>,
+    _reader: Option<JoinHandle<()>>,
+    /// 入力を止めるためのもの (ウィンドウキャプチャ)。捨てると止まる
+    _guard: Option<Box<dyn Send>>,
 }
 
 impl FrameStream {
     /// `lossy` = true なら処理が追いつかないとき古いフレームを捨てる (ライブ向け)。
     /// フレームはテレビ方式 `tv` のフィールド周波数・画像サイズに変換して読み出す。
-    pub fn open(spec: &StreamSpec, lossy: bool, tv: &Standard) -> Result<Self, String> {
+    /// ffmpeg 以外で作った入力から
+    pub(crate) fn from_parts(rx: Receiver<RgbFrame>, guard: Box<dyn Send>) -> Self {
+        Self {
+            child: None,
+            rx,
+            _reader: None,
+            _guard: Some(guard),
+        }
+    }
+
+    pub fn open(spec: &StreamSpec, lossy: bool, tv: &'static Standard) -> Result<Self, String> {
+        #[cfg(windows)]
+        if let StreamSpec::Window {
+            title,
+            hwnd,
+            crop_x,
+            crop_y,
+            crop_width,
+            crop_height,
+            scaling,
+            ..
+        } = spec
+        {
+            let h = crate::wgc::resolve_window(title, *hwnd)?;
+            return crate::wgc::open_stream(
+                h,
+                (*crop_x, *crop_y, *crop_width, *crop_height),
+                *scaling,
+                lossy,
+                tv,
+            );
+        }
         let (iw, ih) = tv.image_size();
         let mut cmd = command(&ffmpeg_path());
         cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
@@ -184,21 +226,9 @@ impl FrameStream {
                 }
                 cmd.arg("-i").arg(format!("video={device}"));
             }
-            StreamSpec::Window { title, .. } => {
-                #[cfg(not(windows))]
+            // Windows では上で WGC に回している
+            StreamSpec::Window { .. } => {
                 return Err("ウィンドウキャプチャは Windows でのみ利用できます".into());
-                #[cfg(windows)]
-                {
-                    cmd.args([
-                        "-f",
-                        "gdigrab",
-                        "-framerate",
-                        &field_rate_arg(tv),
-                        "-draw_mouse",
-                        "1",
-                    ]);
-                    cmd.arg("-i").arg(format!("title={title}"));
-                }
             }
             StreamSpec::File {
                 path,
@@ -218,28 +248,8 @@ impl FrameStream {
             StreamSpec::Camera { scaling, .. } | StreamSpec::Window { scaling, .. } => *scaling,
             StreamSpec::File { .. } => ScalingMethod::Area,
         };
-        let crop = match spec {
-            StreamSpec::Window {
-                crop_x,
-                crop_y,
-                crop_width,
-                crop_height,
-                ..
-            } => {
-                // 幅・高さとも 0 ならクロップしない (ウィンドウ全体)
-                if *crop_width == 0 && *crop_height == 0 {
-                    String::new()
-                } else if *crop_width == 0 || *crop_height == 0 {
-                    return Err("クロップ幅と高さは 1 以上にしてください".into());
-                } else {
-                    format!("crop={crop_width}:{crop_height}:{crop_x}:{crop_y},")
-                }
-            }
-            _ => String::new(),
-        };
         let vf = format!(
-            "{}fps={},scale={iw}:{ih}:flags={}",
-            crop,
+            "fps={},scale={iw}:{ih}:flags={}",
             field_rate_arg(tv),
             scaling.ffmpeg_flags()
         );
@@ -287,17 +297,20 @@ impl FrameStream {
             }
         });
         Ok(Self {
-            child,
+            child: Some(child),
             rx,
-            _reader: reader,
+            _reader: Some(reader),
+            _guard: None,
         })
     }
 }
 
 impl Drop for FrameStream {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(c) = &mut self.child {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
     }
 }
 
@@ -406,7 +419,7 @@ pub fn process_audio(
 }
 
 /// 2ch / 32 bit float の WAV ヘッダ
-fn write_wav_header(w: &mut impl Write, data_bytes: u64) -> std::io::Result<()> {
+pub(crate) fn write_wav_header(w: &mut impl Write, data_bytes: u64) -> std::io::Result<()> {
     let data = data_bytes.min(u32::MAX as u64 - 64) as u32;
     let (ch, bits) = (2u16, 32u16);
     let block = ch * bits / 8;
@@ -422,6 +435,50 @@ fn write_wav_header(w: &mut impl Write, data_bytes: u64) -> std::io::Result<()> 
     w.write_all(&bits.to_le_bytes())?;
     w.write_all(b"data")?;
     w.write_all(&data.to_le_bytes())
+}
+
+/// 映像だけのファイル `video` に音声 `audio` を多重化して `output` に書く (映像は再エンコードしない)
+pub fn mux_audio(
+    video: &Path,
+    audio: &Path,
+    output: &Path,
+    kbps: u32,
+    mono: bool,
+) -> Result<(), String> {
+    let mut cmd = command(&ffmpeg_path());
+    cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i"])
+        .arg(video)
+        .arg("-i")
+        .arg(audio)
+        .args([
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            &format!("{}k", kbps.clamp(8, 512)),
+            "-shortest",
+        ]);
+    if mono {
+        cmd.args(["-ac", "1"]);
+    }
+    let out = cmd
+        .arg(output)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("ffmpeg を起動できません: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "音声の多重化に失敗しました: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
 }
 
 /// 録画ファイルに多重化する音声
